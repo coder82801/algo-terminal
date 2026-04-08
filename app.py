@@ -1,5 +1,5 @@
 import os
-import gc  # Çöp Toplayıcı (Garbage Collector) - RAM'i temizlemek için eklendi
+import gc
 import streamlit as st
 import alpaca_trade_api as tradeapi
 import pandas as pd
@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.5 - Optimizasyonlu)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.6 - Premium Arayüz)")
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
 env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -39,7 +39,6 @@ with tab1:
     with col_btn:
         refresh_btn = st.button("🔄 Manuel Yenile", key="btn_refresh_1")
     with col_chk:
-        # RAM Şişmesini önlemek için varsayılan olarak FALSE (Kapalı) yapıldı
         auto_refresh = st.checkbox("⚡ 15 Saniyede Bir Otomatik Yenile", value=False)
 
     if auto_refresh:
@@ -86,7 +85,7 @@ with tab1:
         st.info("Veri bekleniyor...")
 
 # ==========================================
-# SEKME 2: KURUMSAL SWING RADAR (RAM DOSTU OPTİMİZASYON)
+# SEKME 2: KURUMSAL SWING RADAR
 # ==========================================
 with tab2:
     st.write("Profesyonel filtrelere göre 'Ertesi Gün' (Swing) potansiyeli yüksek adaylar:")
@@ -105,7 +104,6 @@ with tab2:
         with st.spinner("1. Aşama: TradingView üzerinden hisse taranıyor..."):
             try:
                 url = "https://scanner.tradingview.com/america/scan"
-                
                 base_filters = [
                     {"left": "close", "operation": "greater", "right": 2.00},
                     {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
@@ -129,9 +127,8 @@ with tab2:
                     "filter": base_filters + algo_filters,
                     "options": {"lang": "en"}, "markets": ["america"],
                     "symbols": {"query": {"types": ["stock"]}, "tickers": []},
-                    "columns": ["name"], 
-                    "sort": {"sortBy": sort_field, "sortOrder": "desc"},
-                    "range": [0, 40] # RAM koruması için 40'a indirdik, en kaliteliler ilk 40'tadır zaten
+                    "columns": ["name"], "sort": {"sortBy": sort_field, "sortOrder": "desc"},
+                    "range": [0, 40] 
                 }
                 
                 res = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -141,10 +138,7 @@ with tab2:
                     st.warning("Bu ağır şartlara uyan hisse bulunamadı.")
                 else:
                     st.write("2. Aşama: Hafıza dostu algoritmik testler uygulanıyor...")
-                    
                     tickers_to_download = tickers + ["SPY"]
-                    
-                    # RAM PATLAMASINI ÖNLEYEN KOD: threads=False eklendi
                     yf_data = yf.download(tickers_to_download, period="60d", progress=False, threads=False)
                     
                     try:
@@ -174,24 +168,19 @@ with tab2:
                             last_low = df['Low'].iloc[-1]
                             
                             daily_vwap = (last_high + last_low + last_close) / 3
-                            
                             daily_range = last_high - last_low
                             closing_strength = (last_close - last_low) / daily_range if daily_range > 0 else 0
-                            
                             stock_ret_10d = (last_close - df['Close'].iloc[-10]) / df['Close'].iloc[-10]
                             rs_positive = stock_ret_10d > spy_ret_10d
-                            
                             high_20d = df['High'].rolling(20).max().iloc[-1]
                             breakout_dist = (high_20d - last_close) / last_close if high_20d > last_close else 0
                             
                             if "A)" in algo_choice:
                                 if closing_strength >= 0.75 and last_close > daily_vwap and rs_positive and breakout_dist <= 0.02:
                                     final_candidates.append({'Hisse': ticker, 'Durum': 'Kusursuz Breakout ✅', 'Fiyat': round(last_close, 2)})
-                            
                             elif "B)" in algo_choice:
                                 if last_close > daily_vwap and closing_strength >= 0.70:
                                     final_candidates.append({'Hisse': ticker, 'Durum': 'İkinci Gün Potansiyeli ✅', 'Fiyat': round(last_close, 2)})
-                                    
                             elif "C)" in algo_choice:
                                 sma200 = df['Close'].rolling(window=50).mean().iloc[-1] 
                                 up_vol = df[df['Close'] > df['Open']]['Volume'].tail(15).mean()
@@ -203,10 +192,8 @@ with tab2:
                                 if up_vol > down_vol * 1.2 and atr5 < atr20:
                                     final_candidates.append({'Hisse': ticker, 'Durum': 'Kurumsal Birikim ✅', 'Fiyat': round(last_close, 2)})
 
-                        except Exception as e:
-                            continue
+                        except Exception: continue
                             
-                    # HAFIZAYI (RAM) TEMİZLEME ZAMANI
                     del yf_data
                     gc.collect() 
                             
@@ -222,26 +209,38 @@ with tab2:
 st.write("---")
 
 # ==========================================
-# ORTAK MODÜL: ANALİZ VE ALPACA EMİR SİSTEMİ
+# ORTAK MODÜL: ANALİZ VE ALPACA EMİR SİSTEMİ (GÖRSEL DÜZELTİLDİ)
 # ==========================================
 st.subheader("Hedef/Stop Emir Merkezi")
 
-ticker_input = st.text_input("İşlem Yapılacak Hisse Sembolü (Örn: CAR)", "").upper()
+ticker_input = st.text_input("İşlem Yapılacak Hisse Sembolü (Örn: SPIR)", "").upper()
 
 if ticker_input:
     if st.button(f"🔍 {ticker_input} İçin VWAP Analizi Yap"):
-        try:
-            stock = yf.Ticker(ticker_input)
-            df_vwap = stock.history(period='1d', interval='5m', prepost=True)
-            if not df_vwap.empty:
-                df_vwap['Typical_Price'] = (df_vwap['High'] + df_vwap['Low'] + df_vwap['Close']) / 3
-                df_vwap['VP'] = df_vwap['Typical_Price'] * df_vwap['Volume']
-                vwap_price = round((df_vwap['VP'].cumsum() / df_vwap['Volume'].cumsum()).iloc[-1], 2)
+        with st.spinner("Grafikler inceleniyor ve seviyeler hesaplanıyor..."):
+            try:
+                stock = yf.Ticker(ticker_input)
+                df_vwap = stock.history(period='1d', interval='5m', prepost=True)
                 
-                st.info(f"📊 **Analiz:** Güncel Fiyat: ${round(df_vwap['Close'].iloc[-1], 2)} | **VWAP (Referans): ${vwap_price}**")
-            else:
-                st.warning("Analiz için veri bulunamadı.")
-        except: pass
+                if not df_vwap.empty:
+                    df_vwap['Typical_Price'] = (df_vwap['High'] + df_vwap['Low'] + df_vwap['Close']) / 3
+                    df_vwap['VP'] = df_vwap['Typical_Price'] * df_vwap['Volume']
+                    vwap_price = round((df_vwap['VP'].cumsum() / df_vwap['Volume'].cumsum()).iloc[-1], 2)
+                    
+                    current_price = round(df_vwap['Close'].iloc[-1], 2)
+                    day_high = round(df_vwap['High'].max(), 2)
+                    
+                    st.info("### 📊 Analiz Raporu")
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Güncel Fiyat (Pre/Post Market Dahil)", f"${current_price}")
+                    col_b.metric("Gün İçi Zirve", f"${day_high}")
+                    col_c.metric("VWAP (Referans)", f"${vwap_price}")
+                    
+                    st.success(f"**Önerilen Strateji:** Rastgele piyasa emri girmeyin. Fiyatın **${vwap_price}** seviyesindeki VWAP desteğine çekilmesini bekleyin. Limit alış emrinizi bu seviyeye (veya çok yakınına) kurun.")
+                else:
+                    st.warning("Analiz için veri bulunamadı.")
+            except Exception as e:
+                st.error(f"Analiz sırasında bir hata oluştu: {e}")
 
 if api_key and secret_key:
     try:
@@ -250,7 +249,8 @@ if api_key and secret_key:
             col1, col2 = st.columns(2)
             with col1:
                 qty = st.number_input("Adet", min_value=1, value=100)
-                limit_price = st.number_input("Alış Limit Fiyatı ($)", min_value=0.01, value=1.00, step=0.01)
+                # Buraya manuel olarak yukarıda çıkan VWAP referans değerini girebilirsin
+                limit_price = st.number_input("Alış Limit Fiyatı ($) - VWAP'a yakın tutun", min_value=0.01, value=1.00, step=0.01)
             with col2:
                 take_profit_price = st.number_input("Kar-Al Fiyatı ($) -> %15 Hedef", min_value=0.01, value=limit_price * 1.15, step=0.01)
                 stop_loss_price = st.number_input("Zarar-Kes Fiyatı ($) -> %5 Risk", min_value=0.01, value=limit_price * 0.95, step=0.01)
