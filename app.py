@@ -7,7 +7,7 @@ import yfinance as yf
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.3)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.4)")
 
 # Render'ın güvenli kasasından şifreleri çekiyoruz
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -37,9 +37,9 @@ def get_top_gainers():
         payload = {
             "filter": [
                 {"left": "type", "operation": "equal", "right": "stock"},
-                {"left": "volume", "operation": "greater", "right": 50000},
-                {"left": "close", "operation": "greater_equal", "right": 0.50},
-                {"left": "exchange", "operation": "in", "right": ["NASDAQ", "NYSE", "AMEX"]}
+                {"left": "volume", "operation": "greater", "right": 50000}, # En az 50 bin hacim
+                {"left": "close", "operation": "greater_equal", "right": 0.50}, # Fiyat 0.50$ ve üzeri
+                {"left": "exchange", "operation": "in", "right": ["NASDAQ", "NYSE", "AMEX"]} # OTC'yi çöpe at
             ],
             "options": {"lang": "en"},
             "markets": ["america"],
@@ -48,8 +48,18 @@ def get_top_gainers():
             "sort": {"sortBy": "change", "sortOrder": "desc"},
             "range": [0, 20] # İlk 20 hisse
         }
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        # BOTA BENZEMEMEK İÇİN DETAYLI TARAYICI KİMLİĞİ VE REFERANS (STEALTH HEADERS)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Origin": "https://www.tradingview.com",
+            "Referer": "https://www.tradingview.com/"
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        response.raise_for_status() # Hata varsa gizleme, fırlat
+        
         data = response.json()
 
         results = []
@@ -66,6 +76,8 @@ def get_top_gainers():
             
         return pd.DataFrame(results)
     except Exception as e:
+        # Sorun çıkarsa hatanın ne olduğunu kırmızı ekranda göster
+        st.error(f"Sistem Hatası (Log): {e}")
         return pd.DataFrame()
 
 if st.button("Piyasayı Tara / Güncelle"):
