@@ -4,10 +4,11 @@ import alpaca_trade_api as tradeapi
 import pandas as pd
 import requests
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.7)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.8 - Canlı Mod)")
 
 # Render'ın güvenli kasasından şifreleri çekiyoruz
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -28,12 +29,21 @@ def get_api(api_key, secret_key):
 
 # --- MODÜL 1: CANLI MARKET MOVERS (YFINANCE HİBRİT) ---
 st.subheader("1. Aşama: Canlı Piyasa Tarayıcı (Top Gainers)")
-st.write("Hedefler TradingView'dan, CANLI fiyatlar yfinance motorundan çekiliyor:")
 
-@st.cache_data(ttl=30) # Veriyi 30 saniyede bir yenile
+col_btn, col_chk = st.columns([1, 3])
+with col_btn:
+    refresh_btn = st.button("🔄 Manuel Yenile")
+with col_chk:
+    # Otomatik yenileme kutucuğu (Seçilirse aktif olur)
+    auto_refresh = st.checkbox("⚡ 15 Saniyede Bir Otomatik Yenile (Canlı Mod)")
+
+# Eğer kutucuk işaretliyse sayfayı her 15.000 milisaniyede (15 sn) bir arka planda yenile
+if auto_refresh:
+    st_autorefresh(interval=15000, key="auto_refresh_gainers")
+
+@st.cache_data(ttl=15) # Veri ömrünü 15 saniyeye düşürdük ki hep güncel kalsın
 def get_top_gainers():
     try:
-        # ADIM 1: TradingView'dan hisse listesini süz (Tarama)
         url_tv = "https://scanner.tradingview.com/america/scan"
         payload = {
             "filter": [
@@ -58,7 +68,6 @@ def get_top_gainers():
         if not tickers:
             return pd.DataFrame()
 
-        # ADIM 2: yfinance ile hisselerin %100 canlı fiyatlarını çek (Bot engeline takılmaz)
         yf_tickers = yf.Tickers(" ".join(tickers))
         results = []
         
@@ -70,15 +79,12 @@ def get_top_gainers():
             tv_hacim = item['d'][4]
             
             try:
-                # Canlı fiyatı yfinance üzerinden güvenle almaya çalış
                 t_info = yf_tickers.tickers[ticker].fast_info
                 fiyat = t_info.last_price
                 prev_close = t_info.previous_close
-                # Eğer yfinance canlı değişimi hesaplayabilirse onu kullan, yoksa TV'nin değişimini kullan
                 degisim = ((fiyat - prev_close) / prev_close) * 100 if prev_close else tv_degisim
                 hacim = t_info.last_volume if t_info.last_volume else tv_hacim
             except Exception:
-                # Hata olursa çökmek yerine TradingView verisiyle (15 dk gecikmeli) devam et
                 fiyat = tv_fiyat
                 degisim = tv_degisim
                 hacim = tv_hacim
@@ -98,16 +104,15 @@ def get_top_gainers():
         return df
 
     except Exception as e:
-        st.error(f"Sistem Hatası (Log): {e}")
         return pd.DataFrame()
 
-if st.button("Piyasayı Tara / Güncelle"):
-    with st.spinner("Piyasa taranıyor ve canlı fiyatlar çekiliyor..."):
-        df_gainers = get_top_gainers()
-        if not df_gainers.empty:
-            st.dataframe(df_gainers, use_container_width=True)
-        else:
-            st.warning("Şu an veri çekilemedi. Piyasa kapalı olabilir veya bağlantı sorunu var.")
+# Tablonun Ekrana Yazdırılması
+with st.spinner("Piyasa verileri çekiliyor..."):
+    df_gainers = get_top_gainers()
+    if not df_gainers.empty:
+        st.dataframe(df_gainers, use_container_width=True)
+    else:
+        st.warning("Şu an veri çekilemedi. Piyasa kapalı olabilir veya bağlantı sorunu var.")
 
 st.divider()
 
