@@ -7,7 +7,7 @@ import yfinance as yf
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.5)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.6)")
 
 # Render'ın güvenli kasasından şifreleri çekiyoruz
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -26,15 +26,15 @@ def get_api(api_key, secret_key):
         api_version='v2'
     )
 
-# --- MODÜL 1: CANLI MARKET MOVERS (TRADINGVIEW API) ---
+# --- MODÜL 1: CANLI MARKET MOVERS (ÇİFT MOTORLU HİBRİT RADAR) ---
 st.subheader("1. Aşama: Canlı Piyasa Tarayıcı (Top Gainers)")
-st.write("NASDAQ, NYSE ve AMEX borsalarında, fiyatı 0.50$ üzeri ve hacimli olan hareketli hisseler:")
+st.write("Hedefler TradingView'dan, CANLI fiyatlar Yahoo'dan çekiliyor:")
 
-@st.cache_data(ttl=60) # Veriyi 60 saniyede bir yenile
+@st.cache_data(ttl=30) # Canlılık için yenileme süresini 30 saniyeye indirdik
 def get_top_gainers():
     try:
-        url = "https://scanner.tradingview.com/america/scan"
-        # TradingView'ın kabul ettiği kesin sözdizimi
+        # ADIM 1: TradingView'dan sadece hisse sembollerini bul (Tarama)
+        url_tv = "https://scanner.tradingview.com/america/scan"
         payload = {
             "filter": [
                 {"left": "volume", "operation": "greater", "right": 50000}, 
@@ -44,40 +44,58 @@ def get_top_gainers():
             "options": {"lang": "en"},
             "markets": ["america"],
             "symbols": {"query": {"types": ["stock"]}, "tickers": []},
-            "columns": ["name", "description", "close", "change", "volume"],
+            "columns": ["name"], # Sadece isimleri istiyoruz
             "sort": {"sortBy": "change", "sortOrder": "desc"},
             "range": [0, 20] 
         }
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        headers_tv = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Content-Type": "application/json"
         }
         
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status() 
-        
-        data = response.json()
+        res_tv = requests.post(url_tv, json=payload, headers=headers_tv, timeout=10)
+        res_tv.raise_for_status() 
+        tv_data = res_tv.json()
 
+        # Sembolleri bir listeye al (Örn: ['UCAR', 'CAR', 'AEHR'])
+        tickers = [item['d'][0] for item in tv_data.get('data', [])]
+        
+        if not tickers:
+            return pd.DataFrame()
+
+        # ADIM 2: Bulunan sembollerin %100 CANLI fiyatlarını Yahoo Finance'tan çek
+        tickers_str = ",".join(tickers)
+        url_yf = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={tickers_str}"
+        headers_yf = {'User-Agent': 'Mozilla/5.0'}
+        
+        res_yf = requests.get(url_yf, headers=headers_yf, timeout=10)
+        yf_data = res_yf.json()
+        
         results = []
-        for item in data.get('data', []):
-            d = item['d']
-            fiyat = round(d[2], 4) if d[2] < 1 else round(d[2], 2)
+        for quote in yf_data['quoteResponse']['result']:
+            fiyat = quote.get('regularMarketPrice', 0)
+            fiyat_format = round(fiyat, 4) if fiyat < 1 else round(fiyat, 2)
+            
             results.append({
-                'Hisse': d[0],
-                'Şirket': d[1],
-                'Son Fiyat ($)': fiyat,
-                'Artış (%)': round(d[3], 2),
-                'Hacim': f"{int(d[4]):,}"
+                'Hisse': quote.get('symbol', ''),
+                'Şirket': quote.get('shortName', ''),
+                'Son Fiyat ($)': fiyat_format,
+                'Artış (%)': round(quote.get('regularMarketChangePercent', 0), 2),
+                'Hacim': f"{int(quote.get('regularMarketVolume', 0)):,}"
             })
             
-        return pd.DataFrame(results)
+        # Tabloyu artış yüzdesine göre yeniden büyükten küçüğe sırala
+        df = pd.DataFrame(results)
+        df = df.sort_values(by='Artış (%)', ascending=False).reset_index(drop=True)
+        return df
+
     except Exception as e:
         st.error(f"Sistem Hatası (Log): {e}")
         return pd.DataFrame()
 
 if st.button("Piyasayı Tara / Güncelle"):
-    with st.spinner("Piyasa taranıyor..."):
+    with st.spinner("Piyasa taranıyor ve canlı fiyatlar çekiliyor..."):
         df_gainers = get_top_gainers()
         if not df_gainers.empty:
             st.dataframe(df_gainers, use_container_width=True)
@@ -89,7 +107,7 @@ st.divider()
 # --- MODÜL 2: TEKNİK ANALİZ (VWAP) ---
 st.subheader("2. Aşama: Akıllı Analiz ve İşlem")
 
-ticker = st.text_input("İşlem Yapılacak Hisse Sembolü (Örn: CAR)", "").upper()
+ticker = st.text_input("İşlem Yapılacak Hisse Sembolü (Örn: UCAR)", "").upper()
 
 if ticker:
     if st.button(f"🔍 {ticker} İçin VWAP Analizi Yap"):
