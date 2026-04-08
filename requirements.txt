@@ -4,3 +4,4 @@ pandas
 requests
 yfinance
 lxml
+streamlit-autorefresh
