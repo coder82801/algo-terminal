@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.6 - Premium Arayüz)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.7 - Akıllı Emir)")
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
 env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -85,7 +85,7 @@ with tab1:
         st.info("Veri bekleniyor...")
 
 # ==========================================
-# SEKME 2: KURUMSAL SWING RADAR
+# SEKME 2: KURUMSAL SWING RADAR 
 # ==========================================
 with tab2:
     st.write("Profesyonel filtrelere göre 'Ertesi Gün' (Swing) potansiyeli yüksek adaylar:")
@@ -209,7 +209,7 @@ with tab2:
 st.write("---")
 
 # ==========================================
-# ORTAK MODÜL: ANALİZ VE ALPACA EMİR SİSTEMİ (GÖRSEL DÜZELTİLDİ)
+# ORTAK MODÜL: AKILLI EMİR SİSTEMİ (ALTYAPI DÜZELTİLDİ)
 # ==========================================
 st.subheader("Hedef/Stop Emir Merkezi")
 
@@ -243,24 +243,39 @@ if ticker_input:
                 st.error(f"Analiz sırasında bir hata oluştu: {e}")
 
 if api_key and secret_key:
-    try:
-        api = get_api(api_key, secret_key)
-        with st.form("bracket_order_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                qty = st.number_input("Adet", min_value=1, value=100)
-                # Buraya manuel olarak yukarıda çıkan VWAP referans değerini girebilirsin
-                limit_price = st.number_input("Alış Limit Fiyatı ($) - VWAP'a yakın tutun", min_value=0.01, value=1.00, step=0.01)
-            with col2:
-                take_profit_price = st.number_input("Kar-Al Fiyatı ($) -> %15 Hedef", min_value=0.01, value=limit_price * 1.15, step=0.01)
-                stop_loss_price = st.number_input("Zarar-Kes Fiyatı ($) -> %5 Risk", min_value=0.01, value=limit_price * 0.95, step=0.01)
+    api = get_api(api_key, secret_key)
+    with st.form("bracket_order_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            qty = st.number_input("Adet", min_value=1, value=100)
+            limit_price = st.number_input("Alış Limit Fiyatı ($) - VWAP'a yakın tutun", min_value=0.01, value=1.00, step=0.01)
+            # YENİ: Alpaca'nın Kuralı İçin Seçenek
+            ext_hours = st.checkbox("🌙 Genişletilmiş Saatlerde (After-Hours) Çalışsın", value=False)
+        with col2:
+            take_profit_price = st.number_input("Kar-Al Fiyatı ($) -> %15 Hedef", min_value=0.01, value=limit_price * 1.15, step=0.01)
+            stop_loss_price = st.number_input("Zarar-Kes Fiyatı ($) -> %5 Risk", min_value=0.01, value=limit_price * 0.95, step=0.01)
 
-            if st.form_submit_button("🚀 Emri Piyasaya Gönder") and ticker_input:
-                api.submit_order(
-                    symbol=ticker_input, qty=qty, side='buy', type='limit', time_in_force='day',
-                    limit_price=limit_price, extended_hours=True, order_class='bracket',
-                    take_profit=dict(limit_price=round(take_profit_price, 2)),
-                    stop_loss=dict(stop_price=round(stop_loss_price, 2), limit_price=round(stop_loss_price - 0.02, 2))
-                )
-                st.success(f"İşlem Başarılı! {ticker_input} için {limit_price}$ seviyesinden Bracket emir iletildi.")
-    except: pass
+        submit_button = st.form_submit_button("🚀 Emri Piyasaya Gönder")
+
+        if submit_button and ticker_input:
+            try:
+                if ext_hours:
+                    # After-Hours Seçilirse: Sadece basit limit emir gider (Alpaca kuralı gereği kar-al/zarar-kes iptal edilir)
+                    api.submit_order(
+                        symbol=ticker_input, qty=qty, side='buy', type='limit', time_in_force='day',
+                        limit_price=limit_price, extended_hours=True
+                    )
+                    st.success(f"✅ İşlem Başarılı! {ticker_input} için {limit_price}$ seviyesinden After-Hours Limit emri iletildi. (Not: Alpaca kuralları gereği mesai dışında Kar-Al/Zarar-Kes zinciri desteklenmez, bu yüzden stopsuz gönderildi).")
+                else:
+                    # Normal Seans Seçilirse: Kusursuz Bracket (Zincir) Emir gider
+                    api.submit_order(
+                        symbol=ticker_input, qty=qty, side='buy', type='limit', time_in_force='day',
+                        limit_price=limit_price, extended_hours=False, order_class='bracket',
+                        take_profit=dict(limit_price=round(take_profit_price, 2)),
+                        stop_loss=dict(stop_price=round(stop_loss_price, 2), limit_price=round(stop_loss_price - 0.02, 2))
+                    )
+                    st.success(f"✅ İşlem Başarılı! {ticker_input} için {limit_price}$ seviyesinden Bracket (Hedefli/Stoplu) emir iletildi.")
+            
+            except Exception as e:
+                # ARTIK HATALARI SAKLAMIYORUZ
+                st.error(f"❌ Alpaca Emir Hatası: {e}")
