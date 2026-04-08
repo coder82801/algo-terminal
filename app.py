@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import alpaca_trade_api as tradeapi
 import pandas as pd
@@ -6,21 +7,27 @@ import yfinance as yf
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.0)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.1)")
+
+# Render'ın güvenli kasasından şifreleri çekmeye çalışıyoruz
+env_api_key = os.getenv("ALPACA_API_KEY", "")
+env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
 
 # --- YAN MENÜ: API GİRİŞİ ---
 st.sidebar.header("Alpaca API (Paper)")
-api_key = st.sidebar.text_input("API Key ID", type="password")
-secret_key = st.sidebar.text_input("Secret Key", type="password")
-
+# Kutucukların "value" kısmına sistemden gelen şifreleri atıyoruz
+api_key = st.sidebar.text_input("API Key ID", value=env_api_key, type="password")
+secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="password")
 
 def get_api(api_key, secret_key):
     return tradeapi.REST(
-        key_id=api_key,
-        secret_key=secret_key,
-        base_url='https://paper-api.alpaca.markets',
+        key_id=api_key, 
+        secret_key=secret_key, 
+        base_url='https://paper-api.alpaca.markets', 
         api_version='v2'
     )
+
+# ... (Kodun geri kalanı aynı şekilde devam edecek) ...
 
 
 # --- MODÜL 1: CANLI MARKET MOVERS (YAHOO JSON API) ---
