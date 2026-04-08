@@ -9,7 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.2)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.3)")
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
 env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -84,7 +84,7 @@ with tab1:
         st.info("Veri bekleniyor...")
 
 # ==========================================
-# SEKME 2: KURUMSAL SWING RADAR (GÜÇLENDİRİLMİŞ PYTHON MOTORU)
+# SEKME 2: KURUMSAL SWING RADAR (GENİŞLETİLMİŞ EVREN)
 # ==========================================
 with tab2:
     st.write("Profesyonel filtrelere göre 'Ertesi Gün' (Swing) potansiyeli yüksek adaylar:")
@@ -99,19 +99,19 @@ with tab2:
     )
     
     if st.button("🚀 Kurumsal Taramayı Başlat (Zaman Alabilir)"):
-        with st.spinner("1. Aşama: Piyasadan hacimli hisseler toplanıyor..."):
+        with st.spinner("1. Aşama: Piyasadan hacimli 250 hisse toplanıyor (Evren Genişletildi)..."):
             try:
                 url = "https://scanner.tradingview.com/america/scan"
                 payload = {
                     "filter": [
                         {"left": "close", "operation": "greater", "right": 2.00},
                         {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-                        {"left": "volume", "operation": "greater", "right": 500000}
+                        {"left": "volume", "operation": "greater", "right": 300000} # Hacim barajını biraz indirdik ki daha çok hisse taransın
                     ],
                     "options": {"lang": "en"}, "markets": ["america"],
                     "symbols": {"query": {"types": ["stock"]}, "tickers": []},
                     "columns": ["name"], "sort": {"sortBy": "change", "sortOrder": "desc"},
-                    "range": [0, 80] 
+                    "range": [0, 250] # Havuzu 80'den 250'ye çıkardık
                 }
                 res = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                 tickers = [item['d'][0] for item in res.json().get('data', [])]
@@ -119,13 +119,11 @@ with tab2:
                 if not tickers:
                     st.warning("Hisse çekilemedi.")
                 else:
-                    st.write(f"2. Aşama: {len(tickers)} hisse üzerinde zorlu algoritmik testler uygulanıyor...")
+                    st.write(f"2. Aşama: {len(tickers)} hisse üzerinde o zorlu 'Keskin Nişancı' algoritmik testleri uygulanıyor...")
                     
-                    # RS hesaplaması için listeye SPY'ı da ekliyoruz
                     tickers_to_download = tickers + ["SPY"]
                     yf_data = yf.download(tickers_to_download, period="60d", progress=False)
                     
-                    # SPY (Endeks) Getirisi (RS karşılaştırması için son 10 gün)
                     try:
                         spy_close = yf_data['Close']['SPY'].dropna()
                         spy_ret_10d = (spy_close.iloc[-1] - spy_close.iloc[-10]) / spy_close.iloc[-10]
@@ -153,27 +151,21 @@ with tab2:
                             last_low = df['Low'].iloc[-1]
                             last_vol = df['Volume'].iloc[-1]
                             
-                            # VWAP (Günlük Proxy: Typical Price)
                             daily_vwap = (last_high + last_low + last_close) / 3
                             
-                            # Göreceli Hacim (RVOL)
                             avg_vol_10d = df['Volume'].rolling(10).mean().iloc[-2] 
                             rvol = last_vol / avg_vol_10d if avg_vol_10d > 0 else 0
                             
-                            # Closing Strength (Range'in neresinde kapattı)
                             daily_range = last_high - last_low
                             closing_strength = (last_close - last_low) / daily_range if daily_range > 0 else 0
                             
-                            # Relative Strength (RS) - Endekse Göre Güç
                             stock_ret_10d = (last_close - df['Close'].iloc[-10]) / df['Close'].iloc[-10]
                             rs_positive = stock_ret_10d > spy_ret_10d
                             
-                            # Breakout Mesafesi (Son 20 günün zirvesine uzaklık)
                             high_20d = df['High'].rolling(20).max().iloc[-1]
                             breakout_dist = (high_20d - last_close) / last_close if high_20d > last_close else 0
                             
                             if "A)" in algo_choice:
-                                # YENİ ZORLU ŞARTLAR
                                 cond_rvol = rvol >= 1.5
                                 cond_close_str = closing_strength > 0.75
                                 cond_vwap = last_close > daily_vwap
@@ -183,7 +175,7 @@ with tab2:
                                 if cond_rvol and cond_close_str and cond_vwap and cond_rs and cond_breakout:
                                     final_candidates.append({
                                         'Hisse': ticker, 
-                                        'Puan/Durum': 'Kusursuz Breakout Adayı (RS+, VWAP Üstü, Zirvede)', 
+                                        'Durum': 'Keskin Nişancı Onayı ✅', 
                                         'Fiyat': round(last_close, 2),
                                         'RVOL': round(rvol, 2)
                                     })
@@ -191,7 +183,7 @@ with tab2:
                             elif "B)" in algo_choice:
                                 gap = (df['Open'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
                                 if gap > 2.0 and rvol > 3.0 and closing_strength >= 0.70:
-                                    final_candidates.append({'Hisse': ticker, 'Puan/Durum': 'Gap-Up ve İkinci Gün Potansiyeli', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
+                                    final_candidates.append({'Hisse': ticker, 'Durum': 'İkinci Gün Potansiyeli', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
                                     
                             elif "C)" in algo_choice:
                                 sma200 = df['Close'].rolling(window=50).mean().iloc[-1] 
@@ -203,7 +195,7 @@ with tab2:
                                 atr20 = df['TR'].rolling(20).mean().iloc[-1]
                                 
                                 if last_close > sma200 and up_vol > down_vol * 1.2 and atr5 < atr20:
-                                    final_candidates.append({'Hisse': ticker, 'Puan/Durum': 'Kurumsal Birikim Sinyali', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
+                                    final_candidates.append({'Hisse': ticker, 'Durum': 'Kurumsal Birikim', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
 
                         except Exception as e:
                             continue
@@ -212,7 +204,7 @@ with tab2:
                         st.success(f"Tüm Otorite Testlerini Geçen Adaylar ({len(final_candidates)} Adet)")
                         st.table(pd.DataFrame(final_candidates))
                     else:
-                        st.warning("Piyasada bugün senin keskin nişancı kurallarına (RVOL>1.5, Kapanış Gücü>%75, RS+, VWAP Üstü) uyan tek bir hisse bile bulunamadı. Nakitte beklemek de bir pozisyondur.")
+                        st.warning("Piyasada bugün 250 hisse taranmasına rağmen, senin kurallarına (RVOL>1.5, Kapanış Gücü>%75, RS+, VWAP Üstü, Kırılıma <%2) uyan tek bir hisse bile bulunamadı. Nakitte beklemek de kârlı bir pozisyondur.")
             
             except Exception as e:
                 st.error(f"Tarama Hatası: {e}")
