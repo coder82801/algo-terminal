@@ -9,7 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.1)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.2)")
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
 env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -92,7 +92,7 @@ with tab2:
     algo_choice = st.selectbox(
         "Kullanılacak Algoritmayı Seçin:",
         [
-            "A) Ertesi Gün Breakout (Fiyat>20EMA>50EMA, Top %30 Kapanış, RVOL>1.5, Sıkışma)",
+            "A) Keskin Nişancı Breakout (RVOL≥1.5, Kapanış>%75, VWAP Üstü, Pozitif RS, Kırılıma <%2)",
             "B) İkinci Gün Koşusu (Gap-Up, RVOL>3, VWAP Üstü Kapanış)",
             "C) Kurumsal Birikim (200MA Üstü, Hacimli Alışlar, Sıkışma)"
         ]
@@ -101,7 +101,6 @@ with tab2:
     if st.button("🚀 Kurumsal Taramayı Başlat (Zaman Alabilir)"):
         with st.spinner("1. Aşama: Piyasadan hacimli hisseler toplanıyor..."):
             try:
-                # Sadece hacimli ve fiyatı uygun 80 hisseyi al (Filtreyi Python yapacak)
                 url = "https://scanner.tradingview.com/america/scan"
                 payload = {
                     "filter": [
@@ -120,8 +119,18 @@ with tab2:
                 if not tickers:
                     st.warning("Hisse çekilemedi.")
                 else:
-                    st.write(f"2. Aşama: {len(tickers)} hisse üzerinde algoritmik matematik testi yapılıyor...")
-                    yf_data = yf.download(tickers, period="60d", progress=False)
+                    st.write(f"2. Aşama: {len(tickers)} hisse üzerinde zorlu algoritmik testler uygulanıyor...")
+                    
+                    # RS hesaplaması için listeye SPY'ı da ekliyoruz
+                    tickers_to_download = tickers + ["SPY"]
+                    yf_data = yf.download(tickers_to_download, period="60d", progress=False)
+                    
+                    # SPY (Endeks) Getirisi (RS karşılaştırması için son 10 gün)
+                    try:
+                        spy_close = yf_data['Close']['SPY'].dropna()
+                        spy_ret_10d = (spy_close.iloc[-1] - spy_close.iloc[-10]) / spy_close.iloc[-10]
+                    except:
+                        spy_ret_10d = 0
                     
                     final_candidates = []
                     
@@ -139,49 +148,60 @@ with tab2:
                             
                             if len(df) < 50: continue
                             
-                            # Gösterge Hesaplamaları (Tümü Python'da yapılıyor)
-                            ema20 = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-                            ema50 = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
-                            sma200 = df['Close'].rolling(window=50).mean().iloc[-1] # 60 günlük veride 50MA'yı proxy olarak kullanıyoruz
-                            
                             last_close = df['Close'].iloc[-1]
                             last_high = df['High'].iloc[-1]
                             last_low = df['Low'].iloc[-1]
                             last_vol = df['Volume'].iloc[-1]
                             
-                            avg_vol_10d = df['Volume'].rolling(10).mean().iloc[-2] # Bugünü hariç tutarak son 10 gün ortalaması
+                            # VWAP (Günlük Proxy: Typical Price)
+                            daily_vwap = (last_high + last_low + last_close) / 3
+                            
+                            # Göreceli Hacim (RVOL)
+                            avg_vol_10d = df['Volume'].rolling(10).mean().iloc[-2] 
                             rvol = last_vol / avg_vol_10d if avg_vol_10d > 0 else 0
                             
+                            # Closing Strength (Range'in neresinde kapattı)
                             daily_range = last_high - last_low
-                            close_position = (last_close - last_low) / daily_range if daily_range > 0 else 0
+                            closing_strength = (last_close - last_low) / daily_range if daily_range > 0 else 0
                             
-                            df['TR'] = df[['High', 'Low', 'Close']].max(axis=1) - df[['High', 'Low', 'Close']].min(axis=1)
-                            atr5 = df['TR'].rolling(5).mean().iloc[-1]
-                            atr20 = df['TR'].rolling(20).mean().iloc[-1]
+                            # Relative Strength (RS) - Endekse Göre Güç
+                            stock_ret_10d = (last_close - df['Close'].iloc[-10]) / df['Close'].iloc[-10]
+                            rs_positive = stock_ret_10d > spy_ret_10d
+                            
+                            # Breakout Mesafesi (Son 20 günün zirvesine uzaklık)
+                            high_20d = df['High'].rolling(20).max().iloc[-1]
+                            breakout_dist = (high_20d - last_close) / last_close if high_20d > last_close else 0
                             
                             if "A)" in algo_choice:
-                                # TESTLER
-                                cond1 = last_close > ema20 > ema50  # Trend şartı
-                                cond2 = rvol > 1.5                  # Hacim şartı (2.5 çok nadirdir, 1.5'e çektik)
-                                cond3 = close_position >= 0.70      # Zirveye yakın kapanış (Top %30)
-                                cond4 = atr5 <= atr20 * 1.2         # Daralma şartı (Patlama gününde ATR hafif artabileceği için esnetildi)
+                                # YENİ ZORLU ŞARTLAR
+                                cond_rvol = rvol >= 1.5
+                                cond_close_str = closing_strength > 0.75
+                                cond_vwap = last_close > daily_vwap
+                                cond_rs = rs_positive
+                                cond_breakout = breakout_dist <= 0.02
                                 
-                                if cond1 and cond2 and cond3 and cond4:
+                                if cond_rvol and cond_close_str and cond_vwap and cond_rs and cond_breakout:
                                     final_candidates.append({
                                         'Hisse': ticker, 
-                                        'Puan/Durum': 'Breakout Adayı (RVOL, Top %30 Kap.)', 
+                                        'Puan/Durum': 'Kusursuz Breakout Adayı (RS+, VWAP Üstü, Zirvede)', 
                                         'Fiyat': round(last_close, 2),
                                         'RVOL': round(rvol, 2)
                                     })
                             
                             elif "B)" in algo_choice:
                                 gap = (df['Open'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
-                                if gap > 2.0 and rvol > 3.0 and close_position >= 0.70:
+                                if gap > 2.0 and rvol > 3.0 and closing_strength >= 0.70:
                                     final_candidates.append({'Hisse': ticker, 'Puan/Durum': 'Gap-Up ve İkinci Gün Potansiyeli', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
                                     
                             elif "C)" in algo_choice:
+                                sma200 = df['Close'].rolling(window=50).mean().iloc[-1] 
                                 up_vol = df[df['Close'] > df['Open']]['Volume'].tail(15).mean()
                                 down_vol = df[df['Close'] < df['Open']]['Volume'].tail(15).mean()
+                                
+                                df['TR'] = df[['High', 'Low', 'Close']].max(axis=1) - df[['High', 'Low', 'Close']].min(axis=1)
+                                atr5 = df['TR'].rolling(5).mean().iloc[-1]
+                                atr20 = df['TR'].rolling(20).mean().iloc[-1]
+                                
                                 if last_close > sma200 and up_vol > down_vol * 1.2 and atr5 < atr20:
                                     final_candidates.append({'Hisse': ticker, 'Puan/Durum': 'Kurumsal Birikim Sinyali', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
 
@@ -189,10 +209,10 @@ with tab2:
                             continue
                             
                     if final_candidates:
-                        st.success(f"Zorlu Testleri Geçen Kurumsal Adaylar ({len(final_candidates)} Adet)")
+                        st.success(f"Tüm Otorite Testlerini Geçen Adaylar ({len(final_candidates)} Adet)")
                         st.table(pd.DataFrame(final_candidates))
                     else:
-                        st.warning("Piyasada bugün bu zorlu (RVOL, EMA, Kapanış Yeri) matematiksel kuralların tümünü aynı anda sağlayan bir setup (kurulum) oluşmadı. Profesyoneller gibi sabredin, zorlama işlem yapmayın.")
+                        st.warning("Piyasada bugün senin keskin nişancı kurallarına (RVOL>1.5, Kapanış Gücü>%75, RS+, VWAP Üstü) uyan tek bir hisse bile bulunamadı. Nakitte beklemek de bir pozisyondur.")
             
             except Exception as e:
                 st.error(f"Tarama Hatası: {e}")
