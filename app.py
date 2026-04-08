@@ -9,7 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.3)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v6.4 - Tam Evren)")
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
 env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
@@ -84,7 +84,7 @@ with tab1:
         st.info("Veri bekleniyor...")
 
 # ==========================================
-# SEKME 2: KURUMSAL SWING RADAR (GENİŞLETİLMİŞ EVREN)
+# SEKME 2: KURUMSAL SWING RADAR (TÜM PİYASA TARAMASI)
 # ==========================================
 with tab2:
     st.write("Profesyonel filtrelere göre 'Ertesi Gün' (Swing) potansiyeli yüksek adaylar:")
@@ -93,33 +93,53 @@ with tab2:
         "Kullanılacak Algoritmayı Seçin:",
         [
             "A) Keskin Nişancı Breakout (RVOL≥1.5, Kapanış>%75, VWAP Üstü, Pozitif RS, Kırılıma <%2)",
-            "B) İkinci Gün Koşusu (Gap-Up, RVOL>3, VWAP Üstü Kapanış)",
+            "B) İkinci Gün Koşusu (Gap-Up, RVOL>2, VWAP Üstü Kapanış)",
             "C) Kurumsal Birikim (200MA Üstü, Hacimli Alışlar, Sıkışma)"
         ]
     )
     
-    if st.button("🚀 Kurumsal Taramayı Başlat (Zaman Alabilir)"):
-        with st.spinner("1. Aşama: Piyasadan hacimli 250 hisse toplanıyor (Evren Genişletildi)..."):
+    if st.button("🚀 Kurumsal Taramayı Başlat (Tüm ABD Piyasası)"):
+        with st.spinner("1. Aşama: TradingView üzerinden 7000+ hisse taranıp ön filtreleme yapılıyor..."):
             try:
                 url = "https://scanner.tradingview.com/america/scan"
+                
+                # Temel Kurallar (Her Strateji İçin Geçerli)
+                base_filters = [
+                    {"left": "close", "operation": "greater", "right": 2.00},
+                    {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
+                    {"left": "volume", "operation": "greater", "right": 250000}
+                ]
+                
+                # Stratejiye Özel Ön Filtreler (TV'ye yaptırıyoruz ki binlerce çöp hisse elensin)
+                if "A)" in algo_choice:
+                    algo_filters = [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.5}]
+                    sort_field = "relative_volume_10d_calc"
+                elif "B)" in algo_choice:
+                    algo_filters = [
+                        {"left": "gap", "operation": "greater", "right": 2.0},
+                        {"left": "relative_volume_10d_calc", "operation": "greater", "right": 2.0}
+                    ]
+                    sort_field = "gap"
+                else: # C Seçeneği
+                    algo_filters = [{"left": "close", "operation": "greater", "right": "SMA200"}]
+                    sort_field = "volume"
+                
                 payload = {
-                    "filter": [
-                        {"left": "close", "operation": "greater", "right": 2.00},
-                        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-                        {"left": "volume", "operation": "greater", "right": 300000} # Hacim barajını biraz indirdik ki daha çok hisse taransın
-                    ],
+                    "filter": base_filters + algo_filters,
                     "options": {"lang": "en"}, "markets": ["america"],
                     "symbols": {"query": {"types": ["stock"]}, "tickers": []},
-                    "columns": ["name"], "sort": {"sortBy": "change", "sortOrder": "desc"},
-                    "range": [0, 250] # Havuzu 80'den 250'ye çıkardık
+                    "columns": ["name"], 
+                    "sort": {"sortBy": sort_field, "sortOrder": "desc"},
+                    "range": [0, 50] # Artık rastgele 250 hisse değil, TÜM piyasada kurallara uyan EN İYİ 50 hisseyi çekiyoruz
                 }
+                
                 res = requests.post(url, json=payload, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
                 tickers = [item['d'][0] for item in res.json().get('data', [])]
                 
                 if not tickers:
-                    st.warning("Hisse çekilemedi.")
+                    st.warning("TradingView ana piyasa taramasında bu ağır ön şartlara (Örn: RVOL > 1.5) uyan hisse bulamadı.")
                 else:
-                    st.write(f"2. Aşama: {len(tickers)} hisse üzerinde o zorlu 'Keskin Nişancı' algoritmik testleri uygulanıyor...")
+                    st.write(f"2. Aşama: Bulunan {len(tickers)} potansiyel aday Sniper (VWAP, RS, ATR) testlerine sokuluyor...")
                     
                     tickers_to_download = tickers + ["SPY"]
                     yf_data = yf.download(tickers_to_download, period="60d", progress=False)
@@ -149,12 +169,8 @@ with tab2:
                             last_close = df['Close'].iloc[-1]
                             last_high = df['High'].iloc[-1]
                             last_low = df['Low'].iloc[-1]
-                            last_vol = df['Volume'].iloc[-1]
                             
                             daily_vwap = (last_high + last_low + last_close) / 3
-                            
-                            avg_vol_10d = df['Volume'].rolling(10).mean().iloc[-2] 
-                            rvol = last_vol / avg_vol_10d if avg_vol_10d > 0 else 0
                             
                             daily_range = last_high - last_low
                             closing_strength = (last_close - last_low) / daily_range if daily_range > 0 else 0
@@ -166,24 +182,20 @@ with tab2:
                             breakout_dist = (high_20d - last_close) / last_close if high_20d > last_close else 0
                             
                             if "A)" in algo_choice:
-                                cond_rvol = rvol >= 1.5
-                                cond_close_str = closing_strength > 0.75
-                                cond_vwap = last_close > daily_vwap
-                                cond_rs = rs_positive
-                                cond_breakout = breakout_dist <= 0.02
-                                
-                                if cond_rvol and cond_close_str and cond_vwap and cond_rs and cond_breakout:
+                                # RVOL testini TV yaptığı için biz sadece Sniper testlerini yapıyoruz
+                                if closing_strength >= 0.75 and last_close > daily_vwap and rs_positive and breakout_dist <= 0.02:
                                     final_candidates.append({
                                         'Hisse': ticker, 
-                                        'Durum': 'Keskin Nişancı Onayı ✅', 
+                                        'Durum': 'Kusursuz Breakout (Sniper Onaylı) ✅', 
                                         'Fiyat': round(last_close, 2),
-                                        'RVOL': round(rvol, 2)
+                                        'Kapanış Gücü': f"%{round(closing_strength*100)}",
+                                        'RS Durumu': 'Pozitif'
                                     })
                             
                             elif "B)" in algo_choice:
-                                gap = (df['Open'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
-                                if gap > 2.0 and rvol > 3.0 and closing_strength >= 0.70:
-                                    final_candidates.append({'Hisse': ticker, 'Durum': 'İkinci Gün Potansiyeli', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
+                                # Gap ve RVOL testini TV yaptı, biz VWAP ve trend devamı test ediyoruz
+                                if last_close > daily_vwap and closing_strength >= 0.70:
+                                    final_candidates.append({'Hisse': ticker, 'Durum': 'İkinci Gün Potansiyeli ✅', 'Fiyat': round(last_close, 2)})
                                     
                             elif "C)" in algo_choice:
                                 sma200 = df['Close'].rolling(window=50).mean().iloc[-1] 
@@ -194,17 +206,17 @@ with tab2:
                                 atr5 = df['TR'].rolling(5).mean().iloc[-1]
                                 atr20 = df['TR'].rolling(20).mean().iloc[-1]
                                 
-                                if last_close > sma200 and up_vol > down_vol * 1.2 and atr5 < atr20:
-                                    final_candidates.append({'Hisse': ticker, 'Durum': 'Kurumsal Birikim', 'Fiyat': round(last_close, 2), 'RVOL': round(rvol, 2)})
+                                if up_vol > down_vol * 1.2 and atr5 < atr20:
+                                    final_candidates.append({'Hisse': ticker, 'Durum': 'Kurumsal Birikim ✅', 'Fiyat': round(last_close, 2)})
 
                         except Exception as e:
                             continue
                             
                     if final_candidates:
-                        st.success(f"Tüm Otorite Testlerini Geçen Adaylar ({len(final_candidates)} Adet)")
+                        st.success(f"Tüm ABD Piyasasında (7000+ Hisse) Otorite Testlerini Geçen Elmas Adaylar ({len(final_candidates)} Adet)")
                         st.table(pd.DataFrame(final_candidates))
                     else:
-                        st.warning("Piyasada bugün 250 hisse taranmasına rağmen, senin kurallarına (RVOL>1.5, Kapanış Gücü>%75, RS+, VWAP Üstü, Kırılıma <%2) uyan tek bir hisse bile bulunamadı. Nakitte beklemek de kârlı bir pozisyondur.")
+                        st.warning("Tüm piyasa taranmasına rağmen, senin kurallarına (Sniper Onayı) uyan tek bir hisse bile bulunamadı. Bugün piyasada uygun bir 'setup' yok.")
             
             except Exception as e:
                 st.error(f"Tarama Hatası: {e}")
