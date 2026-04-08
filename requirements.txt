@@ -1,1 +1,6 @@
-
+streamlit
+alpaca-trade-api
+pandas
+requests
+yfinance
+lxml
