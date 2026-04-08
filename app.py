@@ -8,7 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.8 - Canlı Mod)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.9 - Canlı Mod)")
 
 # Render'ın güvenli kasasından şifreleri çekiyoruz
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -27,23 +27,22 @@ def get_api(api_key, secret_key):
         api_version='v2'
     )
 
-# --- MODÜL 1: CANLI MARKET MOVERS (YFINANCE HİBRİT) ---
+# --- MODÜL 1: CANLI MARKET MOVERS ---
 st.subheader("1. Aşama: Canlı Piyasa Tarayıcı (Top Gainers)")
 
 col_btn, col_chk = st.columns([1, 3])
 with col_btn:
     refresh_btn = st.button("🔄 Manuel Yenile")
 with col_chk:
-    # Otomatik yenileme kutucuğu (Seçilirse aktif olur)
-    auto_refresh = st.checkbox("⚡ 15 Saniyede Bir Otomatik Yenile (Canlı Mod)")
+    auto_refresh = st.checkbox("⚡ 15 Saniyede Bir Otomatik Yenile (Canlı Mod)", value=True)
 
-# Eğer kutucuk işaretliyse sayfayı her 15.000 milisaniyede (15 sn) bir arka planda yenile
 if auto_refresh:
     st_autorefresh(interval=15000, key="auto_refresh_gainers")
 
-@st.cache_data(ttl=15) # Veri ömrünü 15 saniyeye düşürdük ki hep güncel kalsın
+@st.cache_data(ttl=10) # Önbellek ömrünü 10 saniyeye çektik
 def get_top_gainers():
     try:
+        # ADIM 1: TradingView Radar
         url_tv = "https://scanner.tradingview.com/america/scan"
         payload = {
             "filter": [
@@ -68,9 +67,15 @@ def get_top_gainers():
         if not tickers:
             return pd.DataFrame()
 
-        yf_tickers = yf.Tickers(" ".join(tickers))
+        # ADIM 2: Pre/Post Market Dahil Toplu Canlı Veri İndirme (Yfinance Batch Download)
+        try:
+            # prepost=True sayesinde mesai dışı işlemleri (2.28$ gibi) yakalıyoruz
+            yf_data = yf.download(tickers, period="1d", interval="1m", prepost=True, progress=False)
+            closes = yf_data['Close']
+        except Exception:
+            closes = pd.DataFrame()
+
         results = []
-        
         for item in tv_data.get('data', []):
             ticker = item['d'][0]
             sirket = item['d'][1]
@@ -78,16 +83,17 @@ def get_top_gainers():
             tv_degisim = item['d'][3]
             tv_hacim = item['d'][4]
             
+            # Eğer Yahoo'dan canlı/mesai dışı veriyi alabildiysek onu kullan, yoksa TV verisiyle devam et
             try:
-                t_info = yf_tickers.tickers[ticker].fast_info
-                fiyat = t_info.last_price
-                prev_close = t_info.previous_close
-                degisim = ((fiyat - prev_close) / prev_close) * 100 if prev_close else tv_degisim
-                hacim = t_info.last_volume if t_info.last_volume else tv_hacim
+                if not closes.empty:
+                    if len(tickers) > 1:
+                        fiyat = float(closes[ticker].ffill().iloc[-1])
+                    else:
+                        fiyat = float(closes.ffill().iloc[-1])
+                else:
+                    fiyat = tv_fiyat
             except Exception:
                 fiyat = tv_fiyat
-                degisim = tv_degisim
-                hacim = tv_hacim
                 
             fiyat_format = round(fiyat, 4) if fiyat < 1 else round(fiyat, 2)
             
@@ -95,8 +101,8 @@ def get_top_gainers():
                 'Hisse': ticker,
                 'Şirket': sirket,
                 'Son Fiyat ($)': fiyat_format,
-                'Artış (%)': round(degisim, 2),
-                'Hacim': f"{int(hacim):,}"
+                'Artış (%)': round(tv_degisim, 2),
+                'Hacim': f"{int(tv_hacim):,}"
             })
             
         df = pd.DataFrame(results)
@@ -106,13 +112,12 @@ def get_top_gainers():
     except Exception as e:
         return pd.DataFrame()
 
-# Tablonun Ekrana Yazdırılması
-with st.spinner("Piyasa verileri çekiliyor..."):
+with st.spinner("Genişletilmiş saat (After-Hours) fiyatları çekiliyor..."):
     df_gainers = get_top_gainers()
     if not df_gainers.empty:
         st.dataframe(df_gainers, use_container_width=True)
     else:
-        st.warning("Şu an veri çekilemedi. Piyasa kapalı olabilir veya bağlantı sorunu var.")
+        st.warning("Veri çekilemedi.")
 
 st.divider()
 
@@ -126,6 +131,7 @@ if ticker:
         with st.spinner("Grafikler inceleniyor ve seviyeler hesaplanıyor..."):
             try:
                 stock = yf.Ticker(ticker)
+                # Analizde de prepost=True kullanılıyor, uyum sağlandı
                 df = stock.history(period='1d', interval='5m', prepost=True)
                 
                 if not df.empty:
@@ -139,11 +145,11 @@ if ticker:
                     
                     st.info("### 📊 Analiz Raporu")
                     col_a, col_b, col_c = st.columns(3)
-                    col_a.metric("Güncel Fiyat", f"${current_price}")
+                    col_a.metric("Güncel Fiyat (Pre/Post Market Dahil)", f"${current_price}")
                     col_b.metric("Gün İçi Zirve", f"${day_high}")
                     col_c.metric("VWAP (Referans)", f"${vwap_price}")
                     
-                    st.success(f"**Önerilen Strateji:** Rastgele piyasa emri girmeyin. Fiyatın **${vwap_price}** seviyesindeki VWAP desteğine çekilmesini bekleyin. Limit alış emrinizi bu seviyeye yakın kurun.")
+                    st.success(f"**Önerilen Strateji:** Fiyatın **${vwap_price}** seviyesindeki VWAP desteğine çekilmesini bekleyin. Limit alış emrinizi bu seviyeye yakın kurun.")
                 else:
                     st.warning("Bu hisse için gün içi grafik verisi bulunamadı.")
             except Exception as e:
