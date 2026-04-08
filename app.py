@@ -7,7 +7,7 @@ import yfinance as yf
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Algo-Trading Terminal", layout="wide")
-st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.6)")
+st.title("🎯 Hibrit Momentum & İşlem Terminali (v4.7)")
 
 # Render'ın güvenli kasasından şifreleri çekiyoruz
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -26,14 +26,14 @@ def get_api(api_key, secret_key):
         api_version='v2'
     )
 
-# --- MODÜL 1: CANLI MARKET MOVERS (ÇİFT MOTORLU HİBRİT RADAR) ---
+# --- MODÜL 1: CANLI MARKET MOVERS (YFINANCE HİBRİT) ---
 st.subheader("1. Aşama: Canlı Piyasa Tarayıcı (Top Gainers)")
-st.write("Hedefler TradingView'dan, CANLI fiyatlar Yahoo'dan çekiliyor:")
+st.write("Hedefler TradingView'dan, CANLI fiyatlar yfinance motorundan çekiliyor:")
 
-@st.cache_data(ttl=30) # Canlılık için yenileme süresini 30 saniyeye indirdik
+@st.cache_data(ttl=30) # Veriyi 30 saniyede bir yenile
 def get_top_gainers():
     try:
-        # ADIM 1: TradingView'dan sadece hisse sembollerini bul (Tarama)
+        # ADIM 1: TradingView'dan hisse listesini süz (Tarama)
         url_tv = "https://scanner.tradingview.com/america/scan"
         payload = {
             "filter": [
@@ -44,48 +44,55 @@ def get_top_gainers():
             "options": {"lang": "en"},
             "markets": ["america"],
             "symbols": {"query": {"types": ["stock"]}, "tickers": []},
-            "columns": ["name"], # Sadece isimleri istiyoruz
+            "columns": ["name", "description", "close", "change", "volume"],
             "sort": {"sortBy": "change", "sortOrder": "desc"},
             "range": [0, 20] 
         }
-        
-        headers_tv = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/json"
-        }
+        headers_tv = {"User-Agent": "Mozilla/5.0"}
         
         res_tv = requests.post(url_tv, json=payload, headers=headers_tv, timeout=10)
         res_tv.raise_for_status() 
         tv_data = res_tv.json()
 
-        # Sembolleri bir listeye al (Örn: ['UCAR', 'CAR', 'AEHR'])
         tickers = [item['d'][0] for item in tv_data.get('data', [])]
-        
         if not tickers:
             return pd.DataFrame()
 
-        # ADIM 2: Bulunan sembollerin %100 CANLI fiyatlarını Yahoo Finance'tan çek
-        tickers_str = ",".join(tickers)
-        url_yf = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={tickers_str}"
-        headers_yf = {'User-Agent': 'Mozilla/5.0'}
-        
-        res_yf = requests.get(url_yf, headers=headers_yf, timeout=10)
-        yf_data = res_yf.json()
-        
+        # ADIM 2: yfinance ile hisselerin %100 canlı fiyatlarını çek (Bot engeline takılmaz)
+        yf_tickers = yf.Tickers(" ".join(tickers))
         results = []
-        for quote in yf_data['quoteResponse']['result']:
-            fiyat = quote.get('regularMarketPrice', 0)
+        
+        for item in tv_data.get('data', []):
+            ticker = item['d'][0]
+            sirket = item['d'][1]
+            tv_fiyat = item['d'][2]
+            tv_degisim = item['d'][3]
+            tv_hacim = item['d'][4]
+            
+            try:
+                # Canlı fiyatı yfinance üzerinden güvenle almaya çalış
+                t_info = yf_tickers.tickers[ticker].fast_info
+                fiyat = t_info.last_price
+                prev_close = t_info.previous_close
+                # Eğer yfinance canlı değişimi hesaplayabilirse onu kullan, yoksa TV'nin değişimini kullan
+                degisim = ((fiyat - prev_close) / prev_close) * 100 if prev_close else tv_degisim
+                hacim = t_info.last_volume if t_info.last_volume else tv_hacim
+            except Exception:
+                # Hata olursa çökmek yerine TradingView verisiyle (15 dk gecikmeli) devam et
+                fiyat = tv_fiyat
+                degisim = tv_degisim
+                hacim = tv_hacim
+                
             fiyat_format = round(fiyat, 4) if fiyat < 1 else round(fiyat, 2)
             
             results.append({
-                'Hisse': quote.get('symbol', ''),
-                'Şirket': quote.get('shortName', ''),
+                'Hisse': ticker,
+                'Şirket': sirket,
                 'Son Fiyat ($)': fiyat_format,
-                'Artış (%)': round(quote.get('regularMarketChangePercent', 0), 2),
-                'Hacim': f"{int(quote.get('regularMarketVolume', 0)):,}"
+                'Artış (%)': round(degisim, 2),
+                'Hacim': f"{int(hacim):,}"
             })
             
-        # Tabloyu artış yüzdesine göre yeniden büyükten küçüğe sırala
         df = pd.DataFrame(results)
         df = df.sort_values(by='Artış (%)', ascending=False).reset_index(drop=True)
         return df
