@@ -1,7 +1,7 @@
-streamlit
-alpaca-trade-api
-pandas
-requests
-yfinance
-lxml
-streamlit-autorefresh
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.40
+requests>=2.31.0
+alpaca-trade-api>=3.0.0
+streamlit-autorefresh>=0.0.1
