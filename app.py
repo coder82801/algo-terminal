@@ -4,6 +4,7 @@ import time
 import math
 import traceback
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 import numpy as np
@@ -18,7 +19,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + VWAP Karar Merkezi)")
+st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + Çoklu Seans VWAP)")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -72,22 +73,12 @@ def get_api(api_key_value, secret_key_value):
 
 
 def normalize_symbol_for_yahoo(symbol: str) -> str:
-    """
-    TradingView / piyasa sembollerini Yahoo uyumlu hale getirmeye çalışır.
-    Örn:
-    BRK.B -> BRK-B
-    BF.B  -> BF-B
-    """
     if not symbol:
         return symbol
     return symbol.replace(".", "-")
 
 
 def is_likely_non_common_stock(symbol: str, description: str = "") -> bool:
-    """
-    ETF / ETN / Fund / Trust / Preferred / ADR vb. kaba eleme.
-    Mükemmel değildir ama önemli ölçüde gürültüyü azaltır.
-    """
     text = f"{symbol} {description}".upper()
 
     bad_keywords = [
@@ -95,10 +86,6 @@ def is_likely_non_common_stock(symbol: str, description: str = "") -> bool:
         " ULTRA", " INVERSE", " 2X", " 3X", " LEVERAGED",
         " PREFERRED", " PREF", " ADR", " SPAC", " WARRANT", " RIGHTS"
     ]
-
-    if symbol.endswith(("W", "R", "P")) and len(symbol) > 4:
-        # kaba bir ek kontrol, çok agresif filtrelememek için tek başına yeterli değil
-        pass
 
     return any(k in text for k in bad_keywords)
 
@@ -108,37 +95,12 @@ def calc_true_range(df: pd.DataFrame) -> pd.Series:
     tr1 = df["High"] - df["Low"]
     tr2 = (df["High"] - prev_close).abs()
     tr3 = (df["Low"] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = calc_true_range(df)
     return tr.rolling(period).mean()
-
-
-def calc_session_vwap(intraday_df: pd.DataFrame) -> float:
-    """
-    Gerçek session VWAP = cumulative(Typical Price * Volume) / cumulative(Volume)
-    """
-    if intraday_df.empty or "Volume" not in intraday_df.columns:
-        return np.nan
-
-    temp = intraday_df.copy()
-    temp = temp.dropna(subset=["High", "Low", "Close", "Volume"])
-    if temp.empty:
-        return np.nan
-
-    temp["Typical_Price"] = (temp["High"] + temp["Low"] + temp["Close"]) / 3
-    temp["VP"] = temp["Typical_Price"] * temp["Volume"]
-
-    vol_sum = temp["Volume"].cumsum()
-    vp_sum = temp["VP"].cumsum()
-
-    if vol_sum.iloc[-1] == 0:
-        return np.nan
-
-    return float((vp_sum / vol_sum).iloc[-1])
 
 
 def calc_closing_strength(last_close: float, last_low: float, last_high: float) -> float:
@@ -149,9 +111,6 @@ def calc_closing_strength(last_close: float, last_low: float, last_high: float) 
 
 
 def dynamic_stop_limit(stop_price: float) -> float:
-    """
-    Stop-limit için dinamik offset.
-    """
     if stop_price <= 0:
         return stop_price
 
@@ -166,10 +125,6 @@ def dynamic_stop_limit(stop_price: float) -> float:
 
 
 def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: float, stop: float) -> dict:
-    """
-    Risk bazlı adet hesaplama.
-    Örn 2000$ hesap, %2 risk -> 40$ max zarar.
-    """
     if entry <= 0 or stop <= 0 or entry <= stop:
         return {"shares": 0, "dollar_size": 0, "risk_dollars": 0}
 
@@ -187,13 +142,105 @@ def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: fl
 
 
 # ============================================================
-# VWAP KARAR MOTORU
+# ÇOKLU SEANS VWAP FONKSİYONLARI
 # ============================================================
+def split_sessions(intraday_df: pd.DataFrame):
+    """
+    5 dakikalık veriyi ET saatine göre üçe ayırır:
+    - premarket: 04:00 - 09:30
+    - regular:   09:30 - 16:00
+    - afterhours:16:00 - 20:00
+    """
+    if intraday_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = intraday_df.copy()
+
+    idx = df.index
+    try:
+        et_times = idx.tz_convert("America/New_York")
+    except Exception:
+        try:
+            et_times = idx.tz_localize("America/New_York")
+        except Exception:
+            et_times = idx
+
+    df["et_dt"] = et_times
+    df["et_time"] = et_times.time
+
+    premarket = df[
+        (df["et_time"] >= pd.to_datetime("04:00").time()) &
+        (df["et_time"] < pd.to_datetime("09:30").time())
+    ].copy()
+
+    regular = df[
+        (df["et_time"] >= pd.to_datetime("09:30").time()) &
+        (df["et_time"] < pd.to_datetime("16:00").time())
+    ].copy()
+
+    afterhours = df[
+        (df["et_time"] >= pd.to_datetime("16:00").time()) &
+        (df["et_time"] <= pd.to_datetime("20:00").time())
+    ].copy()
+
+    return premarket, regular, afterhours
+
+
+def calc_session_vwap(df: pd.DataFrame) -> float:
+    if df.empty:
+        return np.nan
+
+    temp = df.dropna(subset=["High", "Low", "Close", "Volume"]).copy()
+    if temp.empty:
+        return np.nan
+
+    temp["Typical_Price"] = (temp["High"] + temp["Low"] + temp["Close"]) / 3
+    temp["VP"] = temp["Typical_Price"] * temp["Volume"]
+
+    vol_sum = temp["Volume"].sum()
+    if vol_sum == 0:
+        return np.nan
+
+    return float(temp["VP"].sum() / vol_sum)
+
+
+def session_summary(df: pd.DataFrame):
+    if df.empty:
+        return {
+            "price": np.nan,
+            "vwap": np.nan,
+            "high": np.nan,
+            "low": np.nan,
+            "volume": 0,
+        }
+
+    return {
+        "price": float(df["Close"].iloc[-1]),
+        "vwap": calc_session_vwap(df),
+        "high": float(df["High"].max()),
+        "low": float(df["Low"].min()),
+        "volume": int(df["Volume"].sum()),
+    }
+
+
+def get_active_session_et():
+    now_et = datetime.now(ZoneInfo("America/New_York")).time()
+
+    if pd.to_datetime("04:00").time() <= now_et < pd.to_datetime("09:30").time():
+        return "premarket"
+    elif pd.to_datetime("09:30").time() <= now_et < pd.to_datetime("16:00").time():
+        return "regular"
+    elif pd.to_datetime("16:00").time() <= now_et <= pd.to_datetime("20:00").time():
+        return "afterhours"
+    else:
+        return "closed"
+
+
 def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
     """
-    Çıktı:
+    Aktif seansa göre karar:
     - AL (VWAP DESTEK)
-    - BEKLE (Breakout retest / çok uzak)
+    - BEKLE
     - UZAK DUR
     """
     if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
@@ -203,7 +250,7 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
             "stop": None,
             "tp1": None,
             "tp2": None,
-            "comment": "Veri eksik.",
+            "comment": "Veri eksik."
         }
 
     if vwap <= 0:
@@ -213,7 +260,7 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
             "stop": None,
             "tp1": None,
             "tp2": None,
-            "comment": "VWAP hesaplanamadı.",
+            "comment": "VWAP hesaplanamadı."
         }
 
     distance = (price - vwap) / vwap
@@ -226,7 +273,6 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
     if pd.isna(atr14) or atr14 <= 0:
         atr14 = max((high - low) * 0.5, price * 0.02)
 
-    # 1) VWAP destek - al
     if price > vwap and abs(distance) <= 0.01 and close_strength >= 0.6:
         entry = round(vwap * 1.002, 4)
         stop = round(max(vwap - 1.1 * atr14, vwap * 0.98), 4)
@@ -240,10 +286,9 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
             "stop": stop,
             "tp1": tp1,
             "tp2": tp2,
-            "comment": "Fiyat VWAP üstünde ve VWAP'a yakın. Pullback destekli giriş düşünülebilir.",
+            "comment": "Fiyat ilgili seansın VWAP üstünde ve VWAP'a yakın. Kontrollü giriş düşünülebilir."
         }
 
-    # 2) Breakout sonrası fazla uzak - bekle
     if price > vwap and distance > 0.03:
         entry = round(breakout_level, 4) if breakout_level and breakout_level > 0 else round(vwap * 1.01, 4)
         stop = round(max(entry - 1.2 * atr14, entry * 0.97), 4)
@@ -257,10 +302,9 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
             "stop": stop,
             "tp1": tp1,
             "tp2": tp2,
-            "comment": "Fiyat VWAP'tan uzaklaşmış. Geri çekilme veya breakout retest beklemek daha sağlıklı.",
+            "comment": "Fiyat ilgili seans VWAP'ından fazla uzaklaşmış. Geri çekilme veya retest beklemek daha doğru."
         }
 
-    # 3) VWAP altı - uzak dur
     if price < vwap:
         return {
             "signal": "UZAK DUR",
@@ -268,7 +312,7 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
             "stop": None,
             "tp1": None,
             "tp2": None,
-            "comment": "Fiyat VWAP altında. Yapı zayıf, acele giriş uygun değil.",
+            "comment": "Fiyat ilgili seans VWAP altında. Yapı zayıf."
         }
 
     return {
@@ -277,7 +321,7 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
         "stop": None,
         "tp1": None,
         "tp2": None,
-        "comment": "Net bir giriş avantajı görünmüyor. İzlemeye devam.",
+        "comment": "Net sinyal yok. İzlemeye devam."
     }
 
 
@@ -480,10 +524,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 # YFINANCE VERİ İNDİRME
 # ============================================================
 @st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "260d", chunk_size: int = 100, pause: float = 1.0):
-    """
-    Yahoo rate-limit azaltmak için chunk'lı indirme.
-    """
+def download_daily_data_chunked(tickers: list[str], period: str = "260d", chunk_size: int = 75, pause: float = 1.0):
     if not tickers:
         return {}
 
@@ -517,7 +558,6 @@ def download_daily_data_chunked(tickers: list[str], period: str = "260d", chunk_
                     except Exception:
                         continue
             else:
-                # tek sembol
                 if len(chunk) == 1:
                     sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
                     if not sub.empty:
@@ -623,11 +663,12 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             obv_slope_10 = df["OBV"].iloc[-1] - df["OBV"].iloc[-10]
 
             intraday = get_intraday_session_data(yahoo_symbol)
-            session_vwap = calc_session_vwap(intraday) if not intraday.empty else np.nan
-            if pd.isna(session_vwap):
-                session_vwap = (last_high + last_low + last_close) / 3
+            _, regular_df, _ = split_sessions(intraday)
+            regular_vwap = calc_session_vwap(regular_df) if not regular_df.empty else np.nan
+            if pd.isna(regular_vwap):
+                regular_vwap = (last_high + last_low + last_close) / 3
 
-            close_above_vwap = last_close > session_vwap
+            close_above_vwap = last_close > regular_vwap
 
             score = 0
             notes = []
@@ -743,7 +784,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
                         "Close_Strength": round(closing_strength, 2) if pd.notna(closing_strength) else np.nan,
                         "Dist_to_High_%": round(breakout_dist * 100, 2),
-                        "VWAP": round(session_vwap, 4 if session_vwap < 1 else 2),
+                        "VWAP_Regular": round(regular_vwap, 4 if regular_vwap < 1 else 2),
                         "Above_VWAP": bool(close_above_vwap),
                         "RS_10d_minus_SPY_%": round(rs_spread * 100, 2),
                         "ATR14": round(atr14, 4 if pd.notna(atr14) and atr14 < 1 else 2) if pd.notna(atr14) else np.nan,
@@ -751,7 +792,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
                         "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
                         "OBV_Positive": bool(obv_slope_10 > 0),
-                        "Entry_Idea": round(session_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4),
+                        "Entry_Idea": round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4),
                         "Stop_Price": stop_price,
                         "Stop_Limit_Price": stop_limit_price,
                         "TP1": tp1,
@@ -772,7 +813,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
 
 
 # ============================================================
-# TOP 10 -> EN İYİ 3 RANKING MOTORU
+# TOP 10 -> EN İYİ 3
 # ============================================================
 def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     if candidates_df.empty:
@@ -780,23 +821,14 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
 
     df = candidates_df.copy()
 
-    # normalize
     df["rvol_score"] = np.minimum(df["RVOL"].fillna(0) / 3.0, 1.0)
     df["close_strength_score"] = df["Close_Strength"].fillna(0).clip(0, 1)
     df["vwap_score"] = np.where(df["Above_VWAP"] == True, 1.0, 0.0)
     df["breakout_score"] = 1 - np.minimum(df["Dist_to_High_%"].fillna(999) / 3.0, 1.0)
-
-    # compression proxy
-    # burada tam ATR5/ATR20 yoksa Score alanına güveniyoruz; yine de kaba bir kalite katmanı ekliyoruz
     df["compression_score"] = np.where(df["Dist_to_High_%"].fillna(99) <= 2.0, 0.8, 0.5)
-
-    # RS score
     df["rs_score"] = np.clip(df["RS_10d_minus_SPY_%"].fillna(0) / 10.0, 0, 1)
-
-    # temiz chart approx
     df["clean_chart"] = np.where(df["Close_Strength"].fillna(0) >= 0.7, 1.0, 0.5)
 
-    # final weighted score
     df["final_score"] = (
         0.25 * df["rvol_score"] +
         0.20 * df["close_strength_score"] +
@@ -807,7 +839,6 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         0.05 * df["clean_chart"]
     )
 
-    # fake breakout eleme
     df = df[
         (df["RVOL"].fillna(0) >= 1.5) &
         (df["Close_Strength"].fillna(0) >= 0.6) &
@@ -815,13 +846,11 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         (df["Dist_to_High_%"].fillna(999) <= 3)
     ]
 
-    # entry-ready
     df = df[
         (df["Close_Strength"].fillna(0) >= 0.7) &
         (df["RS_10d_minus_SPY_%"].fillna(-999) > 0)
     ]
 
-    # çok spekülatif düşük fiyatlıları hafif cezalandır
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
     df["final_score"] = df["final_score"] + df["stability_bonus"]
 
@@ -842,7 +871,7 @@ tab1, tab2, tab3 = st.tabs(
 
 
 # ============================================================
-# TAB 1
+# TAB 1 - CANLI GÜN İÇİ RADAR
 # ============================================================
 with tab1:
     session_choice = st.radio(
@@ -871,10 +900,10 @@ with tab1:
 
 
 # ============================================================
-# TAB 2
+# TAB 2 - SWING RADAR
 # ============================================================
 with tab2:
-    st.write("Profesyonel filtrelere göre 'ertesi gün' potansiyeli yüksek adaylar:")
+    st.write("Profesyonel filtrelere göre ertesi gün potansiyeli yüksek adaylar:")
 
     algo_choice = st.selectbox(
         "Algoritma:",
@@ -936,7 +965,7 @@ with tab2:
                     if not top3_df.empty:
                         st.dataframe(top3_df, use_container_width=True)
                     else:
-                        st.warning("Top 10 içinden 'entry-ready' 3 hisse çıkmadı.")
+                        st.warning("Top 10 içinden entry-ready 3 hisse çıkmadı.")
 
                     csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
@@ -969,7 +998,7 @@ with tab2:
 
 
 # ============================================================
-# TAB 3 - VWAP + EMİR MERKEZİ
+# TAB 3 - ÇOKLU SEANS VWAP + EMİR MERKEZİ
 # ============================================================
 with tab3:
     st.subheader("📊 VWAP Analizi ve Emir Merkezi")
@@ -979,44 +1008,74 @@ with tab3:
     risk_pct = st.number_input("Trade başına risk (%)", min_value=0.1, max_value=10.0, value=2.0, step=0.1) / 100
 
     if ticker_input:
-        if st.button(f"🔍 {ticker_input} için VWAP analizi yap"):
-            with st.spinner("Veriler çekiliyor ve analiz yapılıyor..."):
+        if st.button(f"🔍 {ticker_input} için çoklu seans VWAP analizi yap"):
+            with st.spinner("Veriler çekiliyor ve seans bazlı VWAP hesaplanıyor..."):
                 try:
                     yahoo_symbol = normalize_symbol_for_yahoo(ticker_input)
 
-                    intraday = get_intraday_session_data(yahoo_symbol)
+                    stock = yf.Ticker(yahoo_symbol)
+                    intraday = stock.history(period="1d", interval="5m", prepost=True, auto_adjust=False)
+
                     daily_dict = download_daily_data_chunked([yahoo_symbol], period="260d", chunk_size=1, pause=0)
                     daily_df = daily_dict.get(yahoo_symbol, pd.DataFrame())
 
                     if intraday.empty or daily_df.empty:
                         st.warning("Analiz için yeterli veri bulunamadı.")
                     else:
-                        current_price = float(intraday["Close"].iloc[-1])
-                        day_high = float(intraday["High"].max())
-                        day_low = float(intraday["Low"].min())
-                        vwap_price = calc_session_vwap(intraday)
+                        premarket_df, regular_df, afterhours_df = split_sessions(intraday)
+
+                        premarket_info = session_summary(premarket_df)
+                        regular_info = session_summary(regular_df)
+                        afterhours_info = session_summary(afterhours_df)
 
                         daily_df = daily_df.copy()
                         daily_df["ATR14"] = calc_atr(daily_df, 14)
                         atr14 = float(daily_df["ATR14"].iloc[-1]) if not pd.isna(daily_df["ATR14"].iloc[-1]) else np.nan
                         breakout_level = daily_df["High"].shift(1).rolling(20).max().iloc[-1]
 
+                        active_session = get_active_session_et()
+
+                        if active_session == "premarket":
+                            active_info = premarket_info
+                            session_name = "Pre-Market"
+                        elif active_session == "regular":
+                            active_info = regular_info
+                            session_name = "Regular Session"
+                        elif active_session == "afterhours":
+                            active_info = afterhours_info
+                            session_name = "After-Hours"
+                        else:
+                            active_info = regular_info
+                            session_name = "Market Closed (referans: Regular Session)"
+
                         result = vwap_decision_engine(
-                            price=current_price,
-                            vwap=vwap_price,
-                            high=day_high,
-                            low=day_low,
+                            price=active_info["price"],
+                            vwap=active_info["vwap"],
+                            high=active_info["high"],
+                            low=active_info["low"],
                             atr14=atr14,
-                            breakout_level=breakout_level,
+                            breakout_level=breakout_level
                         )
 
-                        st.markdown("### 📌 VWAP Karar Motoru")
+                        st.markdown("### 📌 Çoklu Seans VWAP Paneli")
+                        st.info(f"Aktif seans: **{session_name}**")
 
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Güncel Fiyat", f"${format_price(current_price)}")
-                        c2.metric("Session VWAP", f"${format_price(vwap_price)}")
-                        c3.metric("Gün İçi Zirve", f"${format_price(day_high)}")
-                        c4.metric("ATR14", f"${format_price(atr14)}")
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Pre-Market VWAP", format_price(premarket_info["vwap"]))
+                        c2.metric("Regular VWAP", format_price(regular_info["vwap"]))
+                        c3.metric("After-Hours VWAP", format_price(afterhours_info["vwap"]))
+
+                        c4, c5, c6 = st.columns(3)
+                        c4.metric("Pre-Market Hacim", f"{premarket_info['volume']:,}")
+                        c5.metric("Regular Hacim", f"{regular_info['volume']:,}")
+                        c6.metric("After-Hours Hacim", f"{afterhours_info['volume']:,}")
+
+                        c7, c8, c9 = st.columns(3)
+                        c7.metric("Pre-Market Son Fiyat", format_price(premarket_info["price"]))
+                        c8.metric("Regular Son Fiyat", format_price(regular_info["price"]))
+                        c9.metric("After-Hours Son Fiyat", format_price(afterhours_info["price"]))
+
+                        st.markdown("### 🎯 Aktif Seans Kararı")
 
                         if result["signal"].startswith("AL"):
                             st.success(result["signal"])
@@ -1037,24 +1096,25 @@ with tab3:
                                 stop=result["stop"],
                             )
 
-                            plan_df = pd.DataFrame(
-                                [{
-                                    "Ticker": ticker_input,
-                                    "Signal": result["signal"],
-                                    "Entry": result["entry"],
-                                    "Stop": result["stop"],
-                                    "TP1": result["tp1"],
-                                    "TP2": result["tp2"],
-                                    "Önerilen Adet": pos["shares"],
-                                    "Pozisyon Büyüklüğü ($)": pos["dollar_size"],
-                                    "Risk ($)": pos["risk_dollars"],
-                                }]
-                            )
+                            plan_df = pd.DataFrame([{
+                                "Ticker": ticker_input,
+                                "Aktif Seans": session_name,
+                                "Signal": result["signal"],
+                                "Entry": result["entry"],
+                                "Stop": result["stop"],
+                                "TP1": result["tp1"],
+                                "TP2": result["tp2"],
+                                "Önerilen Adet": pos["shares"],
+                                "Pozisyon Büyüklüğü ($)": pos["dollar_size"],
+                                "Risk ($)": pos["risk_dollars"],
+                            }])
+
                             st.dataframe(plan_df, use_container_width=True)
 
                             st.info(
                                 f"Öneri: {ticker_input} için yaklaşık {pos['shares']} adet, "
-                                f"${result['entry']} giriş, ${result['stop']} stop."
+                                f"${format_price(result['entry'])} giriş, "
+                                f"${format_price(result['stop'])} stop."
                             )
 
                 except Exception as exc:
@@ -1063,7 +1123,6 @@ with tab3:
                         st.code(traceback.format_exc())
 
     st.write("---")
-
     st.markdown("### 🚀 Emir Gönder")
 
     if api_key and secret_key:
