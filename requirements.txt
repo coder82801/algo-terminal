@@ -3,5 +3,4 @@ pandas==2.1.4
 numpy==1.26.4
 yfinance==0.2.37
 requests==2.31.0
-alpaca-trade-api==3.0.0
-streamlit-autorefresh==0.0.1
+streamlit-autorefresh==1.0.1
