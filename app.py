@@ -66,8 +66,6 @@ def get_api(api_key_value, secret_key_value):
     # Alpaca import'unu buraya taşıdık.
     # Böylece paket eksik olsa bile tüm uygulama çökmez;
     # sadece emir gönderme kısmı hata verir.
-    import alpaca_trade_api as tradeapi
-
     return tradeapi.REST(
         key_id=api_key_value,
         secret_key=secret_key_value,
