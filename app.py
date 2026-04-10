@@ -64,9 +64,6 @@ def format_price(x: float) -> str:
 
 
 def get_api(api_key_value, secret_key_value):
-    # Alpaca import'unu buraya taşıdık.
-    # Böylece paket eksik olsa bile tüm uygulama çökmez;
-    # sadece emir gönderme kısmı hata verir.
     return tradeapi.REST(
         key_id=api_key_value,
         secret_key=secret_key_value,
@@ -240,12 +237,6 @@ def get_active_session_et():
 
 
 def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
-    """
-    Aktif seansa göre karar:
-    - AL (VWAP DESTEK)
-    - BEKLE
-    - UZAK DUR
-    """
     if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
         return {
             "signal": "NÖTR",
@@ -770,11 +761,26 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 ):
                     category = "Accumulation"
 
+            # ---------------------------------------------------------
+            # DÜZELTME: RİSK YÖNETİMİ PARADOKSU (ENTRY BAZLI HESAPLAMA)
+            # ---------------------------------------------------------
             if category:
-                stop_price = round(max(last_close - 1.2 * atr14, last_close * 0.95), 4) if pd.notna(atr14) else round(last_close * 0.95, 4)
+                # 1. Önce Giriş Fiyatını (Entry Idea) hesapla
+                entry_idea = round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4)
+
+                # 2. Stop ve Hedefleri 'Son Kapanışa' göre değil, 'Giriş Fiyatına' göre hesapla!
+                if pd.notna(atr14):
+                    stop_price = round(max(entry_idea - 1.2 * atr14, entry_idea * 0.95), 4)
+                else:
+                    stop_price = round(entry_idea * 0.95, 4)
+                
                 stop_limit_price = dynamic_stop_limit(stop_price)
-                tp1 = round(last_close + (last_close - stop_price), 4)
-                tp2 = round(last_close + 2 * (last_close - stop_price), 4)
+                
+                # Risk = Giriş - Stop
+                risk = max(entry_idea - stop_price, 0.01)
+                
+                tp1 = round(entry_idea + risk, 4)
+                tp2 = round(entry_idea + 2 * risk, 4)
 
                 final_candidates.append(
                     {
@@ -794,7 +800,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
                         "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
                         "OBV_Positive": bool(obv_slope_10 > 0),
-                        "Entry_Idea": round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4),
+                        "Entry_Idea": entry_idea,
                         "Stop_Price": stop_price,
                         "Stop_Limit_Price": stop_limit_price,
                         "TP1": tp1,
