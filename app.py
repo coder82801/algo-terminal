@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import alpaca_trade_api as tradeapi
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -523,10 +524,10 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 
 
 # ============================================================
-# YFINANCE VERİ İNDİRME
+# YFINANCE VERİ İNDİRME (Anti-Bot Hayalet Modu)
 # ============================================================
 @st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 100, pause: float = 0.15):
+def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 50, pause: float = 1.0):
     if not tickers:
         return {}
 
@@ -539,7 +540,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                 tickers=chunk,
                 period=period,
                 progress=False,
-                threads=True,
+                threads=False, # DÜZELTME: Bulut banını engellemek için paralel indirmeyi kapattık
                 auto_adjust=False,
                 group_by="ticker",
             )
@@ -663,21 +664,10 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             df["OBV"] = pd.Series(obv, index=df.index).cumsum()
             obv_slope_10 = df["OBV"].iloc[-1] - df["OBV"].iloc[-10]
 
-            # HIZLANDIRILMIŞ VWAP REFERANSI
-            # Intraday veri çağrısı yok; son 10 günlük hacim ağırlıklı tipik fiyat kullanılıyor.
-            recent_vwap_window = df.tail(10).copy()
-            recent_vwap_window["Typical"] = (
-                recent_vwap_window["High"] +
-                recent_vwap_window["Low"] +
-                recent_vwap_window["Close"]
-            ) / 3
-
-            vol_sum = recent_vwap_window["Volume"].sum()
-            if vol_sum > 0:
-                regular_vwap = float(
-                    (recent_vwap_window["Typical"] * recent_vwap_window["Volume"]).sum() / vol_sum
-                )
-            else:
+            intraday = get_intraday_session_data(yahoo_symbol)
+            _, regular_df, _ = split_sessions(intraday)
+            regular_vwap = calc_session_vwap(regular_df) if not regular_df.empty else np.nan
+            if pd.isna(regular_vwap):
                 regular_vwap = (last_high + last_low + last_close) / 3
 
             close_above_vwap = last_close > regular_vwap
@@ -952,8 +942,8 @@ with tab2:
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
-                        chunk_size=100,
-                        pause=0.15,
+                        chunk_size=50,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
+                        pause=1.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
