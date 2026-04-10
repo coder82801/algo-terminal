@@ -314,6 +314,174 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
 
 
 # ============================================================
+# LIVE PULLBACK ENTRY DETECTOR
+# ============================================================
+def compute_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    x = df.copy()
+
+    x["Typical_Price"] = (x["High"] + x["Low"] + x["Close"]) / 3
+    x["VP"] = x["Typical_Price"] * x["Volume"]
+    x["Cum_VP"] = x["VP"].cumsum()
+    x["Cum_Vol"] = x["Volume"].replace(0, np.nan).cumsum()
+    x["VWAP"] = x["Cum_VP"] / x["Cum_Vol"]
+
+    x["EMA9"] = x["Close"].ewm(span=9, adjust=False).mean()
+    x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
+
+    prev_close = x["Close"].shift(1)
+    tr1 = x["High"] - x["Low"]
+    tr2 = (x["High"] - prev_close).abs()
+    tr3 = (x["Low"] - prev_close).abs()
+    x["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    x["ATR5_INTRA"] = x["TR"].rolling(5).mean()
+
+    x["Rolling_High_10"] = x["High"].rolling(10, min_periods=1).max()
+    x["Rolling_Low_10"] = x["Low"].rolling(10, min_periods=1).min()
+
+    return x
+
+
+def live_pullback_entry_detector(intraday_df: pd.DataFrame):
+    if intraday_df.empty or len(intraday_df) < 8:
+        return {
+            "LIVE_SIGNAL": "BEKLE",
+            "LIVE_ENTRY_TYPE": "NO_DATA",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_COMMENT": "Yeterli intraday veri yok."
+        }
+
+    df = compute_intraday_indicators(intraday_df)
+    if df.empty or len(df) < 8:
+        return {
+            "LIVE_SIGNAL": "BEKLE",
+            "LIVE_ENTRY_TYPE": "NO_DATA",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_COMMENT": "İntraday gösterge verisi oluşmadı."
+        }
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    current_price = float(last["Close"])
+    current_vwap = float(last["VWAP"]) if pd.notna(last["VWAP"]) else np.nan
+    current_ema9 = float(last["EMA9"]) if pd.notna(last["EMA9"]) else np.nan
+    current_ema20 = float(last["EMA20"]) if pd.notna(last["EMA20"]) else np.nan
+    atr_intra = float(last["ATR5_INTRA"]) if pd.notna(last["ATR5_INTRA"]) else np.nan
+
+    day_open = float(df["Open"].iloc[0])
+    day_high = float(df["High"].max())
+    day_low = float(df["Low"].min())
+
+    if pd.isna(atr_intra) or atr_intra <= 0:
+        atr_intra = max((day_high - day_low) * 0.15, current_price * 0.015)
+
+    intraday_move_pct = ((current_price - day_open) / day_open) * 100 if day_open > 0 else 0
+    drawdown_from_high_pct = ((day_high - current_price) / day_high) * 100 if day_high > 0 else 0
+
+    above_vwap = pd.notna(current_vwap) and current_price > current_vwap
+    above_ema9 = pd.notna(current_ema9) and current_price > current_ema9
+    above_ema20 = pd.notna(current_ema20) and current_price > current_ema20
+
+    spike_detected = intraday_move_pct >= 8
+
+    too_extended = (
+        pd.notna(current_vwap) and
+        current_price > current_vwap * 1.08 and
+        drawdown_from_high_pct < 2
+    )
+
+    healthy_pullback = (
+        spike_detected and
+        3 <= drawdown_from_high_pct <= 12 and
+        above_vwap
+    )
+
+    bounce_confirmed = (
+        (prev["Close"] <= prev["EMA9"]) if pd.notna(prev["EMA9"]) else False
+    ) and (
+        (current_price > current_ema9) if pd.notna(current_ema9) else False
+    )
+
+    reclaim_confirmed = (
+        current_price > float(last["Open"]) and
+        above_vwap
+    )
+
+    if too_extended:
+        return {
+            "LIVE_SIGNAL": "UZAK DUR",
+            "LIVE_ENTRY_TYPE": "CHASE_RISK",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_COMMENT": "Hisse çok uzamış; spike kovalamak riskli."
+        }
+
+    if healthy_pullback and (bounce_confirmed or reclaim_confirmed):
+        entry_price = round(current_price, 4)
+        stop_price = round(max(current_vwap, current_ema20) - 0.8 * atr_intra, 4) if above_vwap else round(current_price - 1.2 * atr_intra, 4)
+
+        if stop_price >= entry_price:
+            stop_price = round(entry_price * 0.97, 4)
+
+        risk = max(entry_price - stop_price, 0.01)
+        tp1 = round(entry_price + 1.5 * risk, 4)
+        tp2 = round(entry_price + 2.5 * risk, 4)
+
+        return {
+            "LIVE_SIGNAL": "ŞİMDİ GİR",
+            "LIVE_ENTRY_TYPE": "PULLBACK_RECLAIM",
+            "LIVE_ENTRY_PRICE": entry_price,
+            "LIVE_STOP": stop_price,
+            "LIVE_TP1": tp1,
+            "LIVE_TP2": tp2,
+            "LIVE_COMMENT": "İlk güçlü spike sonrası sağlıklı geri çekilme ve yeniden yukarı dönüş tespit edildi."
+        }
+
+    if spike_detected and above_vwap and above_ema9 and drawdown_from_high_pct < 3:
+        return {
+            "LIVE_SIGNAL": "BEKLE",
+            "LIVE_ENTRY_TYPE": "WAIT_PULLBACK",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_COMMENT": "Momentum güçlü ama henüz geri çekilme gelmemiş. İlk pullback beklenmeli."
+        }
+
+    if (not above_vwap) and drawdown_from_high_pct > 10:
+        return {
+            "LIVE_SIGNAL": "UZAK DUR",
+            "LIVE_ENTRY_TYPE": "FAILED_SPIKE",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_COMMENT": "Spike başarısız olmuş görünüyor; VWAP altı yapı zayıf."
+        }
+
+    return {
+        "LIVE_SIGNAL": "BEKLE",
+        "LIVE_ENTRY_TYPE": "NO_TRIGGER",
+        "LIVE_ENTRY_PRICE": None,
+        "LIVE_STOP": None,
+        "LIVE_TP1": None,
+        "LIVE_TP2": None,
+        "LIVE_COMMENT": "Henüz temiz bir canlı giriş sinyali oluşmadı."
+    }
+
+
+# ============================================================
 # YENİ MOTORLAR
 # ============================================================
 def close_enough(value: float, threshold: float) -> bool:
@@ -1196,6 +1364,55 @@ with tab1:
         st.dataframe(df_gainers, use_container_width=True)
     else:
         st.info("Veri bekleniyor veya uygun hisse bulunamadı.")
+
+    st.write("---")
+    st.subheader("⚡ Live Pullback Entry Detector")
+
+    live_symbol = st.text_input(
+        "Canlı pullback analizi için sembol gir",
+        value="",
+        key="live_pullback_symbol"
+    ).upper().strip()
+
+    if live_symbol:
+        if st.button(f"📡 {live_symbol} için LIVE PULLBACK analizi yap", key="live_pullback_btn"):
+            with st.spinner("Canlı intraday veri analiz ediliyor..."):
+                try:
+                    yahoo_symbol = normalize_symbol_for_yahoo(live_symbol)
+                    intraday_live = get_intraday_session_data(yahoo_symbol)
+
+                    if intraday_live.empty:
+                        st.warning("Canlı analiz için intraday veri bulunamadı.")
+                    else:
+                        live_result = live_pullback_entry_detector(intraday_live)
+
+                        st.markdown("### 🎯 Live Pullback Sonucu")
+
+                        if live_result["LIVE_SIGNAL"] == "ŞİMDİ GİR":
+                            st.success(live_result["LIVE_SIGNAL"])
+                        elif live_result["LIVE_SIGNAL"] == "BEKLE":
+                            st.warning(live_result["LIVE_SIGNAL"])
+                        else:
+                            st.error(live_result["LIVE_SIGNAL"])
+
+                        st.write(live_result["LIVE_COMMENT"])
+
+                        live_df = pd.DataFrame([{
+                            "Ticker": live_symbol,
+                            "Signal": live_result["LIVE_SIGNAL"],
+                            "Entry_Type": live_result["LIVE_ENTRY_TYPE"],
+                            "Entry": live_result["LIVE_ENTRY_PRICE"],
+                            "Stop": live_result["LIVE_STOP"],
+                            "TP1": live_result["LIVE_TP1"],
+                            "TP2": live_result["LIVE_TP2"],
+                        }])
+
+                        st.dataframe(live_df, use_container_width=True)
+
+                except Exception as exc:
+                    st.error(f"Live pullback analizi sırasında hata oluştu: {exc}")
+                    if DEBUG_MODE:
+                        st.code(traceback.format_exc())
 
 
 # ============================================================
