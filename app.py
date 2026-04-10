@@ -237,6 +237,12 @@ def get_active_session_et():
 
 
 def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
+    """
+    Aktif seansa göre karar:
+    - AL (VWAP DESTEK)
+    - BEKLE
+    - UZAK DUR
+    """
     if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
         return {
             "signal": "NÖTR",
@@ -317,6 +323,138 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
         "tp2": None,
         "comment": "Net sinyal yok. İzlemeye devam."
     }
+
+
+# ============================================================
+# YENİ: ENTRY TYPE + MOVE TYPE ENGINE
+# ============================================================
+def classify_entry_type(
+    close_above_vwap: bool,
+    breakout_dist: float,
+    rvol20: float,
+    gap_pct: float,
+    closing_strength: float,
+    atr5: float,
+    atr20: float,
+):
+    """
+    breakout_dist = prior_20d_high'a uzaklık (oran)
+    """
+    if not close_above_vwap:
+        return "WEAK"
+
+    atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.10
+
+    if breakout_dist <= 0.02 and rvol20 >= 2.0 and closing_strength >= 0.70:
+        return "BREAKOUT"
+
+    if 0.02 < breakout_dist <= 0.05 and rvol20 >= 1.5 and closing_strength >= 0.60:
+        return "MICRO_PULLBACK"
+
+    if breakout_dist > 0.05 and close_above_vwap and gap_pct >= 0:
+        return "VWAP_PULLBACK"
+
+    if close_above_vwap and (breakout_dist <= 0.02) and gap_pct >= 5 and atr_expanding:
+        return "BREAKOUT"
+
+    if close_above_vwap and breakout_dist < 0.01 and rvol20 >= 3:
+        return "BREAKOUT"
+
+    return "EXTENDED"
+
+
+def classify_move_type(
+    gap_pct: float,
+    rvol20: float,
+    closing_strength: float,
+    obv_slope_10: float,
+    breakout_dist: float,
+    atr5: float,
+    atr20: float,
+    last_close: float,
+    sma50: float,
+):
+    atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.15
+    trend_ok = pd.notna(sma50) and last_close > sma50
+
+    if gap_pct >= 3.0 and rvol20 >= 2.0 and closing_strength >= 0.75 and obv_slope_10 > 0:
+        return "NEWS_DRIVEN"
+
+    if rvol20 >= 4.0 and atr_expanding and closing_strength >= 0.70 and breakout_dist <= 0.03:
+        return "SHORT_SQUEEZE"
+
+    if close_enough(breakout_dist, 0.05) and rvol20 >= 1.5 and trend_ok and obv_slope_10 > 0:
+        return "TECHNICAL_MOMENTUM"
+
+    return "WEAK_MOVE"
+
+
+def close_enough(value: float, threshold: float) -> bool:
+    try:
+        return value <= threshold
+    except Exception:
+        return False
+
+
+def compute_confidence_score(
+    rvol20: float,
+    closing_strength: float,
+    close_above_vwap: bool,
+    rs_positive: bool,
+    breakout_dist: float,
+    move_type: str,
+    entry_type: str,
+):
+    score = 0
+
+    if pd.notna(rvol20):
+        if rvol20 >= 5:
+            score += 25
+        elif rvol20 >= 3:
+            score += 20
+        elif rvol20 >= 2:
+            score += 14
+        elif rvol20 >= 1.5:
+            score += 8
+
+    if pd.notna(closing_strength):
+        if closing_strength >= 0.9:
+            score += 20
+        elif closing_strength >= 0.75:
+            score += 15
+        elif closing_strength >= 0.60:
+            score += 8
+
+    if close_above_vwap:
+        score += 10
+
+    if rs_positive:
+        score += 10
+
+    if breakout_dist <= 0.02:
+        score += 12
+    elif breakout_dist <= 0.05:
+        score += 6
+
+    if move_type == "NEWS_DRIVEN":
+        score += 12
+    elif move_type == "SHORT_SQUEEZE":
+        score += 10
+    elif move_type == "TECHNICAL_MOMENTUM":
+        score += 8
+
+    if entry_type == "BREAKOUT":
+        score += 10
+    elif entry_type == "MICRO_PULLBACK":
+        score += 7
+    elif entry_type == "VWAP_PULLBACK":
+        score += 5
+    elif entry_type == "EXTENDED":
+        score -= 8
+    elif entry_type == "WEAK":
+        score -= 15
+
+    return max(0, min(100, int(round(score))))
 
 
 # ============================================================
@@ -515,7 +653,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 
 
 # ============================================================
-# YFINANCE VERİ İNDİRME (Anti-Bot Hayalet Modu)
+# YFINANCE VERİ İNDİRME
 # ============================================================
 @st.cache_data(ttl=900)
 def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 50, pause: float = 1.0):
@@ -531,7 +669,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                 tickers=chunk,
                 period=period,
                 progress=False,
-                threads=False, # DÜZELTME: Bulut banını engellemek için paralel indirmeyi kapattık
+                threads=False,
                 auto_adjust=False,
                 group_by="ticker",
             )
@@ -563,6 +701,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
         time.sleep(pause)
 
     return data_dict
+
 
 @st.cache_data(ttl=300)
 def get_intraday_session_data(ticker: str):
@@ -761,26 +900,80 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 ):
                     category = "Accumulation"
 
-            # ---------------------------------------------------------
-            # DÜZELTME: RİSK YÖNETİMİ PARADOKSU (ENTRY BAZLI HESAPLAMA)
-            # ---------------------------------------------------------
             if category:
-                # 1. Önce Giriş Fiyatını (Entry Idea) hesapla
-                entry_idea = round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4)
+                # ====================================================
+                # ENTRY TYPE + MOVE TYPE + CONFIDENCE
+                # ====================================================
+                entry_type = classify_entry_type(
+                    close_above_vwap=close_above_vwap,
+                    breakout_dist=breakout_dist,
+                    rvol20=rvol20 if pd.notna(rvol20) else 0,
+                    gap_pct=gap_pct,
+                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
+                    atr5=atr5,
+                    atr20=atr20,
+                )
 
-                # 2. Stop ve Hedefleri 'Son Kapanışa' göre değil, 'Giriş Fiyatına' göre hesapla!
+                move_type = classify_move_type(
+                    gap_pct=gap_pct,
+                    rvol20=rvol20 if pd.notna(rvol20) else 0,
+                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
+                    obv_slope_10=obv_slope_10,
+                    breakout_dist=breakout_dist,
+                    atr5=atr5,
+                    atr20=atr20,
+                    last_close=last_close,
+                    sma50=sma50,
+                )
+
+                confidence = compute_confidence_score(
+                    rvol20=rvol20 if pd.notna(rvol20) else 0,
+                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
+                    close_above_vwap=close_above_vwap,
+                    rs_positive=rs_positive,
+                    breakout_dist=breakout_dist,
+                    move_type=move_type,
+                    entry_type=entry_type,
+                )
+
+                # ====================================================
+                # ENTRY / STOP / TP — DÜZELTİLMİŞ RİSK MANTIĞI
+                # ====================================================
+                if entry_type == "BREAKOUT":
+                    entry_idea = round(max(last_close, prior_20d_high * 1.002), 4) if pd.notna(prior_20d_high) else round(last_close, 4)
+                elif entry_type == "MICRO_PULLBACK":
+                    entry_idea = round(max(regular_vwap * 1.01, last_close * 0.995), 4)
+                elif entry_type == "VWAP_PULLBACK":
+                    entry_idea = round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4)
+                elif entry_type == "EXTENDED":
+                    entry_idea = round(last_close, 4)
+                else:
+                    entry_idea = round(last_close, 4)
+
                 if pd.notna(atr14):
                     stop_price = round(max(entry_idea - 1.2 * atr14, entry_idea * 0.95), 4)
                 else:
                     stop_price = round(entry_idea * 0.95, 4)
-                
+
+                if stop_price >= entry_idea:
+                    stop_price = round(entry_idea * 0.95, 4)
+
                 stop_limit_price = dynamic_stop_limit(stop_price)
-                
-                # Risk = Giriş - Stop
+
                 risk = max(entry_idea - stop_price, 0.01)
-                
-                tp1 = round(entry_idea + risk, 4)
-                tp2 = round(entry_idea + 2 * risk, 4)
+
+                if entry_type == "BREAKOUT":
+                    tp1 = round(entry_idea + 1.5 * risk, 4)
+                    tp2 = round(entry_idea + 3.0 * risk, 4)
+                elif entry_type == "MICRO_PULLBACK":
+                    tp1 = round(entry_idea + 1.3 * risk, 4)
+                    tp2 = round(entry_idea + 2.6 * risk, 4)
+                elif entry_type == "VWAP_PULLBACK":
+                    tp1 = round(entry_idea + 1.2 * risk, 4)
+                    tp2 = round(entry_idea + 2.4 * risk, 4)
+                else:
+                    tp1 = round(entry_idea + risk, 4)
+                    tp2 = round(entry_idea + 2 * risk, 4)
 
                 final_candidates.append(
                     {
@@ -788,6 +981,9 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Yahoo_Symbol": yahoo_symbol,
                         "Description": description,
                         "Category": category,
+                        "Move_Type": move_type,
+                        "Entry_Type": entry_type,
+                        "Confidence": confidence,
                         "Close": round(last_close, 4 if last_close < 1 else 2),
                         "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
                         "Close_Strength": round(closing_strength, 2) if pd.notna(closing_strength) else np.nan,
@@ -816,7 +1012,11 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             rejected_log.append({"Hisse": symbol, "Neden": f"Hata: {str(exc)}"})
             log_debug(f"Evaluate error {symbol}: {exc}")
 
-    final_candidates = sorted(final_candidates, key=lambda x: x["Score"], reverse=True)
+    final_candidates = sorted(
+        final_candidates,
+        key=lambda x: (x["Confidence"], x["Score"]),
+        reverse=True
+    )
     return final_candidates, rejected_log
 
 
@@ -837,32 +1037,49 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df["rs_score"] = np.clip(df["RS_10d_minus_SPY_%"].fillna(0) / 10.0, 0, 1)
     df["clean_chart"] = np.where(df["Close_Strength"].fillna(0) >= 0.7, 1.0, 0.5)
 
+    entry_bonus_map = {
+        "BREAKOUT": 0.12,
+        "MICRO_PULLBACK": 0.08,
+        "VWAP_PULLBACK": 0.06,
+        "EXTENDED": -0.05,
+        "WEAK": -0.12,
+    }
+    df["entry_bonus"] = df["Entry_Type"].map(entry_bonus_map).fillna(0)
+
+    move_bonus_map = {
+        "NEWS_DRIVEN": 0.10,
+        "SHORT_SQUEEZE": 0.08,
+        "TECHNICAL_MOMENTUM": 0.06,
+        "WEAK_MOVE": -0.04,
+    }
+    df["move_bonus"] = df["Move_Type"].map(move_bonus_map).fillna(0)
+
+    df["confidence_score"] = np.clip(df["Confidence"].fillna(0) / 100.0, 0, 1)
+
     df["final_score"] = (
-        0.25 * df["rvol_score"] +
-        0.20 * df["close_strength_score"] +
-        0.15 * df["breakout_score"] +
-        0.15 * df["compression_score"] +
+        0.20 * df["rvol_score"] +
+        0.18 * df["close_strength_score"] +
+        0.12 * df["breakout_score"] +
+        0.10 * df["compression_score"] +
         0.10 * df["vwap_score"] +
         0.10 * df["rs_score"] +
-        0.05 * df["clean_chart"]
+        0.08 * df["clean_chart"] +
+        0.07 * df["confidence_score"] +
+        df["entry_bonus"] +
+        df["move_bonus"]
     )
 
     df = df[
         (df["RVOL"].fillna(0) >= 1.5) &
         (df["Close_Strength"].fillna(0) >= 0.6) &
         (df["Above_VWAP"] == True) &
-        (df["Dist_to_High_%"].fillna(999) <= 3)
-    ]
-
-    df = df[
-        (df["Close_Strength"].fillna(0) >= 0.7) &
         (df["RS_10d_minus_SPY_%"].fillna(-999) > 0)
     ]
 
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
     df["final_score"] = df["final_score"] + df["stability_bonus"]
 
-    df = df.sort_values(["final_score", "Score"], ascending=False)
+    df = df.sort_values(["final_score", "Confidence", "Score"], ascending=False)
     return df.head(3)
 
 
@@ -948,8 +1165,8 @@ with tab2:
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
-                        chunk_size=50,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
-                        pause=1.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
+                        chunk_size=50,
+                        pause=1.0,
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
