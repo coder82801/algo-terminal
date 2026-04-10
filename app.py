@@ -145,12 +145,6 @@ def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: fl
 # ÇOKLU SEANS VWAP FONKSİYONLARI
 # ============================================================
 def split_sessions(intraday_df: pd.DataFrame):
-    """
-    5 dakikalık veriyi ET saatine göre üçe ayırır:
-    - premarket: 04:00 - 09:30
-    - regular:   09:30 - 16:00
-    - afterhours:16:00 - 20:00
-    """
     if intraday_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -237,12 +231,6 @@ def get_active_session_et():
 
 
 def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
-    """
-    Aktif seansa göre karar:
-    - AL (VWAP DESTEK)
-    - BEKLE
-    - UZAK DUR
-    """
     if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
         return {
             "signal": "NÖTR",
@@ -326,8 +314,15 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
 
 
 # ============================================================
-# YENİ: ENTRY TYPE + MOVE TYPE ENGINE
+# YENİ MOTORLAR
 # ============================================================
+def close_enough(value: float, threshold: float) -> bool:
+    try:
+        return value <= threshold
+    except Exception:
+        return False
+
+
 def classify_entry_type(
     close_above_vwap: bool,
     breakout_dist: float,
@@ -337,9 +332,6 @@ def classify_entry_type(
     atr5: float,
     atr20: float,
 ):
-    """
-    breakout_dist = prior_20d_high'a uzaklık (oran)
-    """
     if not close_above_vwap:
         return "WEAK"
 
@@ -354,7 +346,7 @@ def classify_entry_type(
     if breakout_dist > 0.05 and close_above_vwap and gap_pct >= 0:
         return "VWAP_PULLBACK"
 
-    if close_above_vwap and (breakout_dist <= 0.02) and gap_pct >= 5 and atr_expanding:
+    if close_above_vwap and breakout_dist <= 0.02 and gap_pct >= 5 and atr_expanding:
         return "BREAKOUT"
 
     if close_above_vwap and breakout_dist < 0.01 and rvol20 >= 3:
@@ -389,11 +381,76 @@ def classify_move_type(
     return "WEAK_MOVE"
 
 
-def close_enough(value: float, threshold: float) -> bool:
-    try:
-        return value <= threshold
-    except Exception:
-        return False
+def classify_overnight_setup(
+    rvol20: float,
+    closing_strength: float,
+    close_above_vwap: bool,
+    rs_positive: bool,
+    breakout_dist: float,
+    gap_pct: float,
+    move_type: str,
+    entry_type: str,
+):
+    overnight_score = 0
+
+    if pd.notna(rvol20):
+        if rvol20 >= 5:
+            overnight_score += 30
+        elif rvol20 >= 3:
+            overnight_score += 24
+        elif rvol20 >= 2:
+            overnight_score += 18
+        elif rvol20 >= 1.5:
+            overnight_score += 10
+
+    if pd.notna(closing_strength):
+        if closing_strength >= 0.90:
+            overnight_score += 22
+        elif closing_strength >= 0.75:
+            overnight_score += 16
+        elif closing_strength >= 0.60:
+            overnight_score += 8
+
+    if close_above_vwap:
+        overnight_score += 10
+
+    if rs_positive:
+        overnight_score += 8
+
+    if breakout_dist <= 0.02:
+        overnight_score += 12
+    elif breakout_dist <= 0.05:
+        overnight_score += 6
+
+    if gap_pct < 0:
+        overnight_score -= 8
+
+    if move_type == "NEWS_DRIVEN":
+        overnight_score += 10
+    elif move_type == "SHORT_SQUEEZE":
+        overnight_score += 8
+    elif move_type == "TECHNICAL_MOMENTUM":
+        overnight_score += 5
+
+    if entry_type == "BREAKOUT":
+        overnight_score += 8
+    elif entry_type == "MICRO_PULLBACK":
+        overnight_score += 5
+    elif entry_type == "EXTENDED":
+        overnight_score -= 8
+    elif entry_type == "WEAK":
+        overnight_score -= 15
+
+    overnight_score = max(0, min(100, int(round(overnight_score))))
+
+    if overnight_score >= 80:
+        overnight_setup = "YES"
+    elif overnight_score >= 60:
+        overnight_setup = "MAYBE"
+    else:
+        overnight_setup = "NO"
+
+    return overnight_setup, overnight_score
 
 
 def compute_confidence_score(
@@ -404,6 +461,7 @@ def compute_confidence_score(
     breakout_dist: float,
     move_type: str,
     entry_type: str,
+    overnight_score: int,
 ):
     score = 0
 
@@ -453,6 +511,8 @@ def compute_confidence_score(
         score -= 8
     elif entry_type == "WEAK":
         score -= 15
+
+    score += min(10, int(round(overnight_score / 10)))
 
     return max(0, min(100, int(round(score))))
 
@@ -901,9 +961,6 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     category = "Accumulation"
 
             if category:
-                # ====================================================
-                # ENTRY TYPE + MOVE TYPE + CONFIDENCE
-                # ====================================================
                 entry_type = classify_entry_type(
                     close_above_vwap=close_above_vwap,
                     breakout_dist=breakout_dist,
@@ -926,6 +983,17 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     sma50=sma50,
                 )
 
+                overnight_setup, overnight_score = classify_overnight_setup(
+                    rvol20=rvol20 if pd.notna(rvol20) else 0,
+                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
+                    close_above_vwap=close_above_vwap,
+                    rs_positive=rs_positive,
+                    breakout_dist=breakout_dist,
+                    gap_pct=gap_pct,
+                    move_type=move_type,
+                    entry_type=entry_type,
+                )
+
                 confidence = compute_confidence_score(
                     rvol20=rvol20 if pd.notna(rvol20) else 0,
                     closing_strength=closing_strength if pd.notna(closing_strength) else 0,
@@ -934,11 +1002,9 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     breakout_dist=breakout_dist,
                     move_type=move_type,
                     entry_type=entry_type,
+                    overnight_score=overnight_score,
                 )
 
-                # ====================================================
-                # ENTRY / STOP / TP — DÜZELTİLMİŞ RİSK MANTIĞI
-                # ====================================================
                 if entry_type == "BREAKOUT":
                     entry_idea = round(max(last_close, prior_20d_high * 1.002), 4) if pd.notna(prior_20d_high) else round(last_close, 4)
                 elif entry_type == "MICRO_PULLBACK":
@@ -959,7 +1025,6 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     stop_price = round(entry_idea * 0.95, 4)
 
                 stop_limit_price = dynamic_stop_limit(stop_price)
-
                 risk = max(entry_idea - stop_price, 0.01)
 
                 if entry_type == "BREAKOUT":
@@ -983,6 +1048,8 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Category": category,
                         "Move_Type": move_type,
                         "Entry_Type": entry_type,
+                        "Overnight_Setup": overnight_setup,
+                        "Overnight_Score": overnight_score,
                         "Confidence": confidence,
                         "Close": round(last_close, 4 if last_close < 1 else 2),
                         "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
@@ -1014,7 +1081,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
 
     final_candidates = sorted(
         final_candidates,
-        key=lambda x: (x["Confidence"], x["Score"]),
+        key=lambda x: (x["Overnight_Score"], x["Confidence"], x["Score"]),
         reverse=True
     )
     return final_candidates, rejected_log
@@ -1055,18 +1122,22 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df["move_bonus"] = df["Move_Type"].map(move_bonus_map).fillna(0)
 
     df["confidence_score"] = np.clip(df["Confidence"].fillna(0) / 100.0, 0, 1)
+    df["overnight_score_norm"] = np.clip(df["Overnight_Score"].fillna(0) / 100.0, 0, 1)
+    df["overnight_bonus"] = np.where(df["Overnight_Setup"] == "YES", 0.12, np.where(df["Overnight_Setup"] == "MAYBE", 0.04, -0.08))
 
     df["final_score"] = (
-        0.20 * df["rvol_score"] +
-        0.18 * df["close_strength_score"] +
-        0.12 * df["breakout_score"] +
-        0.10 * df["compression_score"] +
-        0.10 * df["vwap_score"] +
-        0.10 * df["rs_score"] +
-        0.08 * df["clean_chart"] +
-        0.07 * df["confidence_score"] +
+        0.16 * df["rvol_score"] +
+        0.16 * df["close_strength_score"] +
+        0.10 * df["breakout_score"] +
+        0.08 * df["compression_score"] +
+        0.08 * df["vwap_score"] +
+        0.08 * df["rs_score"] +
+        0.06 * df["clean_chart"] +
+        0.10 * df["confidence_score"] +
+        0.10 * df["overnight_score_norm"] +
         df["entry_bonus"] +
-        df["move_bonus"]
+        df["move_bonus"] +
+        df["overnight_bonus"]
     )
 
     df = df[
@@ -1079,7 +1150,10 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
     df["final_score"] = df["final_score"] + df["stability_bonus"]
 
-    df = df.sort_values(["final_score", "Confidence", "Score"], ascending=False)
+    df = df.sort_values(
+        ["final_score", "Overnight_Score", "Confidence", "Score"],
+        ascending=False
+    )
     return df.head(3)
 
 
