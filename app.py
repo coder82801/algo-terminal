@@ -141,6 +141,13 @@ def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: fl
     }
 
 
+def close_enough(value: float, threshold: float) -> bool:
+    try:
+        return value <= threshold
+    except Exception:
+        return False
+
+
 # ============================================================
 # ÇOKLU SEANS VWAP FONKSİYONLARI
 # ============================================================
@@ -314,7 +321,7 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
 
 
 # ============================================================
-# LIVE PULLBACK ENTRY DETECTOR
+# LIVE PULLBACK ENTRY DETECTOR + SQUEEZE SCORE
 # ============================================================
 def compute_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -341,7 +348,97 @@ def compute_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["Rolling_High_10"] = x["High"].rolling(10, min_periods=1).max()
     x["Rolling_Low_10"] = x["Low"].rolling(10, min_periods=1).min()
 
+    x["Green_Bar"] = x["Close"] > x["Open"]
+    x["Bar_Change_%"] = np.where(x["Open"] > 0, ((x["Close"] - x["Open"]) / x["Open"]) * 100, 0.0)
+
     return x
+
+
+def compute_live_squeeze_score(df: pd.DataFrame):
+    if df.empty or len(df) < 8:
+        return 0, "NO_SETUP"
+
+    last = df.iloc[-1]
+    day_open = float(df["Open"].iloc[0])
+    day_high = float(df["High"].max())
+    current_price = float(last["Close"])
+    current_vwap = safe_float(last["VWAP"])
+    current_ema9 = safe_float(last["EMA9"])
+    current_ema20 = safe_float(last["EMA20"])
+    atr_intra = safe_float(last["ATR5_INTRA"])
+
+    if pd.isna(atr_intra) or atr_intra <= 0:
+        atr_intra = max((day_high - float(df["Low"].min())) * 0.15, current_price * 0.015)
+
+    intraday_move_pct = ((current_price - day_open) / day_open) * 100 if day_open > 0 else 0
+    drawdown_from_high_pct = ((day_high - current_price) / day_high) * 100 if day_high > 0 else 0
+
+    recent = df.tail(6).copy()
+    green_count = int(recent["Green_Bar"].sum())
+    avg_bar_change = float(recent["Bar_Change_%"].mean()) if not recent.empty else 0
+    momentum_bars = int((recent["Bar_Change_%"] >= 2.0).sum())
+
+    score = 0
+
+    if intraday_move_pct >= 30:
+        score += 28
+    elif intraday_move_pct >= 20:
+        score += 22
+    elif intraday_move_pct >= 12:
+        score += 15
+    elif intraday_move_pct >= 8:
+        score += 8
+
+    if green_count >= 5:
+        score += 18
+    elif green_count >= 4:
+        score += 12
+    elif green_count >= 3:
+        score += 6
+
+    if momentum_bars >= 3:
+        score += 12
+    elif momentum_bars >= 2:
+        score += 7
+
+    if avg_bar_change >= 3.0:
+        score += 10
+    elif avg_bar_change >= 1.5:
+        score += 5
+
+    if pd.notna(current_vwap) and current_price > current_vwap:
+        score += 10
+
+    if pd.notna(current_ema9) and current_price > current_ema9:
+        score += 6
+
+    if pd.notna(current_ema20) and current_price > current_ema20:
+        score += 6
+
+    if drawdown_from_high_pct <= 3:
+        score += 8
+    elif drawdown_from_high_pct <= 6:
+        score += 5
+    elif drawdown_from_high_pct > 12:
+        score -= 10
+
+    if atr_intra >= current_price * 0.02:
+        score += 8
+    elif atr_intra >= current_price * 0.012:
+        score += 4
+
+    score = max(0, min(100, int(round(score))))
+
+    if score >= 75:
+        state = "CONFIRMED_SQUEEZE_BEHAVIOR"
+    elif score >= 55:
+        state = "POTENTIAL_SQUEEZE"
+    elif score >= 35:
+        state = "MOMENTUM_BUT_NOT_SQUEEZE"
+    else:
+        state = "NO_SETUP"
+
+    return score, state
 
 
 def live_pullback_entry_detector(intraday_df: pd.DataFrame):
@@ -353,6 +450,8 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": None,
             "LIVE_TP1": None,
             "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": 0,
+            "LIVE_SQUEEZE_STATE": "NO_SETUP",
             "LIVE_COMMENT": "Yeterli intraday veri yok."
         }
 
@@ -365,8 +464,12 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": None,
             "LIVE_TP1": None,
             "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": 0,
+            "LIVE_SQUEEZE_STATE": "NO_SETUP",
             "LIVE_COMMENT": "İntraday gösterge verisi oluşmadı."
         }
+
+    squeeze_score, squeeze_state = compute_live_squeeze_score(df)
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -416,6 +519,13 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
         above_vwap
     )
 
+    possible_squeeze = (
+        squeeze_score >= 55 and
+        intraday_move_pct >= 10 and
+        above_vwap and
+        drawdown_from_high_pct < 8
+    )
+
     if too_extended:
         return {
             "LIVE_SIGNAL": "UZAK DUR",
@@ -424,7 +534,32 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": None,
             "LIVE_TP1": None,
             "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
             "LIVE_COMMENT": "Hisse çok uzamış; spike kovalamak riskli."
+        }
+
+    if possible_squeeze and healthy_pullback and (bounce_confirmed or reclaim_confirmed):
+        entry_price = round(current_price, 4)
+        stop_price = round(max(current_vwap, current_ema20) - 0.8 * atr_intra, 4) if above_vwap else round(current_price - 1.2 * atr_intra, 4)
+
+        if stop_price >= entry_price:
+            stop_price = round(entry_price * 0.97, 4)
+
+        risk = max(entry_price - stop_price, 0.01)
+        tp1 = round(entry_price + 1.5 * risk, 4)
+        tp2 = round(entry_price + 2.5 * risk, 4)
+
+        return {
+            "LIVE_SIGNAL": "ŞİMDİ GİR",
+            "LIVE_ENTRY_TYPE": "SQUEEZE_PULLBACK",
+            "LIVE_ENTRY_PRICE": entry_price,
+            "LIVE_STOP": stop_price,
+            "LIVE_TP1": tp1,
+            "LIVE_TP2": tp2,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
+            "LIVE_COMMENT": "Squeeze davranışı + sağlıklı geri çekilme + reclaim tespit edildi."
         }
 
     if healthy_pullback and (bounce_confirmed or reclaim_confirmed):
@@ -445,7 +580,22 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": stop_price,
             "LIVE_TP1": tp1,
             "LIVE_TP2": tp2,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
             "LIVE_COMMENT": "İlk güçlü spike sonrası sağlıklı geri çekilme ve yeniden yukarı dönüş tespit edildi."
+        }
+
+    if possible_squeeze and not healthy_pullback:
+        return {
+            "LIVE_SIGNAL": "BEKLE",
+            "LIVE_ENTRY_TYPE": "POTENTIAL_SQUEEZE",
+            "LIVE_ENTRY_PRICE": None,
+            "LIVE_STOP": None,
+            "LIVE_TP1": None,
+            "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
+            "LIVE_COMMENT": "Short squeeze ihtimali var. İlk pullback beklenmeli."
         }
 
     if spike_detected and above_vwap and above_ema9 and drawdown_from_high_pct < 3:
@@ -456,6 +606,8 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": None,
             "LIVE_TP1": None,
             "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
             "LIVE_COMMENT": "Momentum güçlü ama henüz geri çekilme gelmemiş. İlk pullback beklenmeli."
         }
 
@@ -467,6 +619,8 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
             "LIVE_STOP": None,
             "LIVE_TP1": None,
             "LIVE_TP2": None,
+            "LIVE_SQUEEZE_SCORE": squeeze_score,
+            "LIVE_SQUEEZE_STATE": squeeze_state,
             "LIVE_COMMENT": "Spike başarısız olmuş görünüyor; VWAP altı yapı zayıf."
         }
 
@@ -477,20 +631,15 @@ def live_pullback_entry_detector(intraday_df: pd.DataFrame):
         "LIVE_STOP": None,
         "LIVE_TP1": None,
         "LIVE_TP2": None,
+        "LIVE_SQUEEZE_SCORE": squeeze_score,
+        "LIVE_SQUEEZE_STATE": squeeze_state,
         "LIVE_COMMENT": "Henüz temiz bir canlı giriş sinyali oluşmadı."
     }
 
 
 # ============================================================
-# YENİ MOTORLAR
+# OVERNIGHT / ENTRY / MOVE TYPE MOTORLARI
 # ============================================================
-def close_enough(value: float, threshold: float) -> bool:
-    try:
-        return value <= threshold
-    except Exception:
-        return False
-
-
 def classify_entry_type(
     close_above_vwap: bool,
     breakout_dist: float,
@@ -1397,10 +1546,22 @@ with tab1:
 
                         st.write(live_result["LIVE_COMMENT"])
 
+                        sq_score = live_result["LIVE_SQUEEZE_SCORE"]
+                        sq_state = live_result["LIVE_SQUEEZE_STATE"]
+
+                        if sq_score >= 75:
+                            st.success(f"Squeeze Score: {sq_score} | {sq_state}")
+                        elif sq_score >= 55:
+                            st.warning(f"Squeeze Score: {sq_score} | {sq_state}")
+                        else:
+                            st.info(f"Squeeze Score: {sq_score} | {sq_state}")
+
                         live_df = pd.DataFrame([{
                             "Ticker": live_symbol,
                             "Signal": live_result["LIVE_SIGNAL"],
                             "Entry_Type": live_result["LIVE_ENTRY_TYPE"],
+                            "Squeeze_Score": live_result["LIVE_SQUEEZE_SCORE"],
+                            "Squeeze_State": live_result["LIVE_SQUEEZE_STATE"],
                             "Entry": live_result["LIVE_ENTRY_PRICE"],
                             "Stop": live_result["LIVE_STOP"],
                             "TP1": live_result["LIVE_TP1"],
