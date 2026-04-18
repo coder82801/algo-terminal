@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + Çoklu Seans VWAP)")
+st.title("🎯 NextDay Scanner Pro v4 (Best 1 First + Reward-Adjusted Continuation)")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -641,27 +641,29 @@ def get_intraday_gainers(session: str) -> pd.DataFrame:
 # SWING RADAR - AŞAMA 1
 # ============================================================
 @st.cache_data(ttl=600)
-def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd.DataFrame:
+def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap_top_n: int = 40) -> pd.DataFrame:
+    """Cheap prefilter first: TradingView metrikleri ile geniş evrenden küçük ve kaliteli bir havuz çıkar."""
     base_filters = [
-        {"left": "close", "operation": "greater", "right": 2.00},
+        {"left": "close", "operation": "greater", "right": 1.0},
+        {"left": "close", "operation": "less", "right": 80.0},
         {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-        {"left": "volume", "operation": "greater", "right": 250000},
+        {"left": "volume", "operation": "greater", "right": 150000},
     ]
 
     if "A)" in algo_choice:
         algo_filters = [
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.5},
+            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.25},
         ]
         sort_field = "relative_volume_10d_calc"
     elif "B)" in algo_choice:
         algo_filters = [
-            {"left": "gap", "operation": "greater", "right": 2.0},
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 2.0},
+            {"left": "gap", "operation": "greater", "right": 1.5},
+            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.5},
         ]
         sort_field = "gap"
     else:
         algo_filters = []
-        sort_field = "volume"
+        sort_field = "relative_volume_10d_calc"
 
     columns = [
         "name",
@@ -671,6 +673,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
         "relative_volume_10d_calc",
         "gap",
         "market_cap_basic",
+        "change",
     ]
 
     raw = tradingview_scan(
@@ -683,36 +686,56 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 
     rows = []
     seen = set()
-
     for item in raw:
         try:
             d = item["d"]
             symbol = d[0]
             description = d[1] or ""
-
             if not symbol or symbol in seen:
                 continue
-
             if is_likely_non_common_stock(symbol, description):
                 continue
-
             seen.add(symbol)
+            tv_close = safe_float(d[2], np.nan)
+            tv_volume = safe_float(d[3], np.nan) if len(d) > 3 else np.nan
+            tv_rvol = safe_float(d[4], np.nan) if len(d) > 4 else np.nan
+            tv_gap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
+            tv_market_cap = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
+            tv_change = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
+
+            # cheap prefilter score: hızlı ve ucuz metriklerle küçültme
+            rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 3.0, 0), 1.5)
+            gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 8.0, 0), 1.5)
+            change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 8.0, 0), 1.2)
+            vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 2_000_000, 0), 1.2)
+            price_penalty = 0.0 if pd.isna(tv_close) else (0.15 if tv_close > 40 else 0.0)
+            mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.15 if tv_market_cap > 8e9 else 0.0)
+            cheap_prefilter_score = round((0.38 * rvol_score) + (0.22 * gap_score) + (0.20 * change_score) + (0.20 * vol_score) - price_penalty - mcap_penalty, 3)
+
             rows.append(
                 {
                     "symbol": symbol,
                     "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
                     "description": description,
-                    "tv_close": safe_float(d[2], np.nan),
-                    "tv_volume": safe_float(d[3], np.nan) if len(d) > 3 else np.nan,
-                    "tv_rvol": safe_float(d[4], np.nan) if len(d) > 4 else np.nan,
-                    "tv_gap": safe_float(d[5], np.nan) if len(d) > 5 else np.nan,
-                    "tv_market_cap": safe_float(d[6], np.nan) if len(d) > 6 else np.nan,
+                    "tv_close": tv_close,
+                    "tv_volume": tv_volume,
+                    "tv_rvol": tv_rvol,
+                    "tv_gap": tv_gap,
+                    "tv_market_cap": tv_market_cap,
+                    "tv_change": tv_change,
+                    "cheap_prefilter_score": cheap_prefilter_score,
                 }
             )
         except Exception as exc:
             log_debug(f"Candidate parse error: {exc}")
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df = df.sort_values(["cheap_prefilter_score", "tv_rvol", "tv_gap"], ascending=[False, False, False])
+    top_n = min(max(20, cheap_top_n), len(df))
+    return df.head(top_n).reset_index(drop=True)
 
 
 # ============================================================
@@ -862,8 +885,8 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     rejected_log.append({"Hisse": symbol, "Neden": "Yahoo veri yok / Alpaca fallback başarısız"})
                     continue
 
-            if len(df) < 220:
-                rejected_log.append({"Hisse": symbol, "Neden": "Yetersiz günlük veri (<220)"})
+            if len(df) < 160:
+                rejected_log.append({"Hisse": symbol, "Neden": "Yetersiz günlük veri (<160)"})
                 continue
 
             last_close = float(df["Close"].iloc[-1])
@@ -1043,6 +1066,23 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     final_trade_status = "NO_TRADE_LOW_REWARD"
                     plan_note = "Getiri marjı düşük; zorlama aday değil"
 
+                continuation_quality = (
+                    0.28 * min((rvol20 if pd.notna(rvol20) else 0) / 3.0, 1.5)
+                    + 0.22 * max(min(closing_strength if pd.notna(closing_strength) else 0, 1), 0)
+                    + 0.12 * (1.0 if close_above_vwap else 0.0)
+                    + 0.14 * max(min((rs_spread * 100) / 10.0, 1.2), 0)
+                    + 0.12 * max(0.0, 1 - min((breakout_dist * 100) / 3.5, 1.2))
+                    + 0.12 * max(min((score if pd.notna(score) else 0) / 100.0, 1.2), 0)
+                )
+                reward_quality = 0.0
+                if reward_profile["reward_filter"] == "PASS":
+                    reward_quality = min((reward_profile["tp2_pct"] if pd.notna(reward_profile["tp2_pct"]) else 0) / 15.0, 1.4)
+                chase_penalty = 0.0
+                if pd.notna(trade_plan["distance_to_entry_pct"]):
+                    chase_penalty = max(trade_plan["distance_to_entry_pct"], 0) / 6.0
+                structure_penalty = 0.15 if pd.notna(gap_pct) and gap_pct > 18 else 0.0
+                final_ev_score = round(100 * (continuation_quality + 0.55 * reward_quality - 0.30 * chase_penalty - structure_penalty), 2)
+
                 final_candidates.append(
                     {
                         "Symbol": symbol,
@@ -1077,6 +1117,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Reward_Filter": reward_profile["reward_filter"],
                         "Top3_Reward_OK": reward_profile["top3_reward_ok"],
                         "Score": score,
+                        "Final_EV_Score": final_ev_score,
                         "Notes": ", ".join(notes[:5] + [plan_note]),
                     }
                 )
@@ -1087,68 +1128,45 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             rejected_log.append({"Hisse": symbol, "Neden": f"Hata: {str(exc)}"})
             log_debug(f"Evaluate error {symbol}: {exc}")
 
-    final_candidates = sorted(final_candidates, key=lambda x: x["Score"], reverse=True)
+    final_candidates = sorted(final_candidates, key=lambda x: (x.get("Final_EV_Score", 0), x.get("Score", 0)), reverse=True)
     return final_candidates, rejected_log
 
 
 # ============================================================
-# TOP 10 -> EN İYİ 3
+# BEST 1 + OPTIONAL BACKUPS
 # ============================================================
-def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
+def rank_best_candidates(candidates_df: pd.DataFrame):
     if candidates_df.empty:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        return empty, empty
 
     df = candidates_df.copy()
+    actionable = df[
+        (df["Trade_Status"].isin(["READY", "WAIT_RETEST"])) &
+        (df["Reward_Filter"] == "PASS")
+    ].copy()
 
-    df["rvol_score"] = np.minimum(df["RVOL"].fillna(0) / 3.0, 1.0)
-    df["close_strength_score"] = df["Close_Strength"].fillna(0).clip(0, 1)
-    df["vwap_score"] = np.where(df["Above_VWAP"] == True, 1.0, 0.0)
-    df["breakout_score"] = 1 - np.minimum(df["Dist_to_High_%"].fillna(999) / 3.0, 1.0)
-    df["compression_score"] = np.where(df["Dist_to_High_%"].fillna(99) <= 2.0, 0.8, 0.5)
-    df["rs_score"] = np.clip(df["RS_10d_minus_SPY_%"].fillna(0) / 10.0, 0, 1)
-    df["clean_chart"] = np.where(df["Close_Strength"].fillna(0) >= 0.7, 1.0, 0.5)
-    df["entry_quality_score"] = np.select(
-        [df["Trade_Status"] == "READY", df["Trade_Status"] == "WAIT_RETEST"],
-        [1.0, 0.65],
+    if actionable.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    actionable["status_bonus"] = np.select(
+        [actionable["Trade_Status"] == "READY", actionable["Trade_Status"] == "WAIT_RETEST"],
+        [12.0, 5.0],
         default=0.0,
     )
-    df["rr_score"] = np.clip(df["Risk_Reward"].fillna(0) / 2.0, 0, 1)
-    df["reward_score"] = np.where(df["Top3_Reward_OK"] == True, 1.0, 0.0)
-
-    df["final_score"] = (
-        0.22 * df["rvol_score"] +
-        0.18 * df["close_strength_score"] +
-        0.12 * df["breakout_score"] +
-        0.10 * df["compression_score"] +
-        0.10 * df["vwap_score"] +
-        0.10 * df["rs_score"] +
-        0.08 * df["clean_chart"] +
-        0.10 * df["entry_quality_score"] +
-        0.10 * df["reward_score"]
+    actionable["backup_penalty"] = np.where(actionable["Trade_Status"] == "WAIT_RETEST", 2.0, 0.0)
+    actionable["selection_score"] = (
+        actionable["Final_EV_Score"].fillna(0)
+        + actionable["status_bonus"]
+        + np.clip(actionable["TP2_%"].fillna(0), 0, 20) * 0.8
+        + np.clip(actionable["Risk_Reward"].fillna(0), 0, 3) * 4
+        - actionable["backup_penalty"]
     )
 
-    df = df[
-        (df["RVOL"].fillna(0) >= 1.5) &
-        (df["Close_Strength"].fillna(0) >= 0.6) &
-        (df["Above_VWAP"] == True) &
-        (df["Dist_to_High_%"].fillna(999) <= 3.5) &
-        (~df["Trade_Status"].isin(["NO_TRADE", "NO_TRADE_LOW_REWARD"])) &
-        (df["Reward_Filter"] == "PASS")
-    ]
-
-    df = df[
-        (df["Close_Strength"].fillna(0) >= 0.7) &
-        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0) &
-        (df["Top3_Reward_OK"] == True)
-    ]
-
-    df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
-    df["final_score"] = df["final_score"] + df["stability_bonus"] + (0.05 * df["rr_score"])
-
-    df = df.sort_values(["Trade_Status", "final_score", "Score"], ascending=[True, False, False])
-    status_order = pd.Categorical(df["Trade_Status"], categories=["READY", "WAIT_RETEST", "NO_TRADE_LOW_REWARD", "NO_TRADE"], ordered=True)
-    df = df.assign(_status_order=status_order).sort_values(["_status_order", "final_score", "Score"], ascending=[True, False, False]).drop(columns=["_status_order"])
-    return df.head(3)
+    actionable = actionable.sort_values(["selection_score", "Final_EV_Score", "Score"], ascending=[False, False, False])
+    best1 = actionable.head(1).copy()
+    backups = actionable.iloc[1:3].copy()
+    return best1, backups
 
 
 # ============================================================
@@ -1202,7 +1220,7 @@ if "swing_scan_error" not in st.session_state:
     st.session_state.swing_scan_error = None
 
 with tab2:
-    st.write("Profesyonel filtrelere göre ertesi gün potansiyeli yüksek adaylar:")
+    st.write("Profesyonel filtrelere göre ertesi gün devam etme olasılığı yüksek ama ödül açısından da anlamlı adaylar:")
 
     algo_choice = st.selectbox(
         "Algoritma:",
@@ -1214,11 +1232,12 @@ with tab2:
     )
 
     max_scan_records = st.slider(
-        "İlk tarama genişliği",
+        "Ucuz ön eleme evreni",
         min_value=100,
         max_value=1200,
-        value=500,
+        value=300,
         step=100,
+        help="Önce hızlı/ucuz filtreleme yapılır, sonra küçük havuza pahalı ranking uygulanır.",
     )
 
     if st.button("🚀 Tarayıcıyı Başlat"):
@@ -1226,13 +1245,16 @@ with tab2:
         st.session_state.swing_scan_results = None
 
         try:
-            with st.spinner("1. Aşama: TradingView adayları taranıyor..."):
-                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records)
+            with st.spinner("1. Aşama: Ucuz ön eleme yapılıyor..."):
+                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records, cheap_top_n=40)
 
             result_payload = {
                 "tv_count": 0,
+                "prefilter_count": 0,
                 "final_df": pd.DataFrame(),
-                "top3_df": pd.DataFrame(),
+                "best1_df": pd.DataFrame(),
+                "backups_df": pd.DataFrame(),
+                "low_reward_df": pd.DataFrame(),
                 "rejected_log": pd.DataFrame(),
                 "message_type": "info",
                 "message": "",
@@ -1246,7 +1268,7 @@ with tab2:
                 if "SPY" not in yahoo_tickers:
                     yahoo_tickers.append("SPY")
 
-                with st.spinner("2. Aşama: Günlük veriler chunk'lı indiriliyor..."):
+                with st.spinner("2. Aşama: Küçük havuz için günlük veriler çekiliyor..."):
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
@@ -1254,42 +1276,36 @@ with tab2:
                         pause=2.0,
                     )
 
-                with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
+                with st.spinner("3. Aşama: Pahalı ranking ve reward-adjusted continuation motoru çalışıyor..."):
                     final_candidates, rejected_log = evaluate_candidates(algo_choice, tv_df, data_dict, api_key, secret_key)
 
                 gc.collect()
 
                 final_df = pd.DataFrame(final_candidates)
-                top3_df = rank_top3(final_df.head(10)) if not final_df.empty else pd.DataFrame()
+                low_reward_df = final_df[final_df["Trade_Status"] == "NO_TRADE_LOW_REWARD"].copy() if not final_df.empty else pd.DataFrame()
+                actionable_df = final_df[final_df["Trade_Status"].isin(["READY", "WAIT_RETEST"])].copy() if not final_df.empty else pd.DataFrame()
+                best1_df, backups_df = rank_best_candidates(final_df) if not final_df.empty else (pd.DataFrame(), pd.DataFrame())
                 rej_df = pd.DataFrame(rejected_log)
 
-                result_payload["tv_count"] = len(tv_df)
+                result_payload["tv_count"] = int(max_scan_records)
+                result_payload["prefilter_count"] = len(tv_df)
                 result_payload["final_df"] = final_df
-                result_payload["top3_df"] = top3_df
+                result_payload["best1_df"] = best1_df
+                result_payload["backups_df"] = backups_df
+                result_payload["low_reward_df"] = low_reward_df
                 result_payload["rejected_log"] = rej_df
 
-                yahoo_fail_count = 0
-                if not rej_df.empty and "Neden" in rej_df.columns:
-                    yahoo_fail_count = rej_df["Neden"].astype(str).str.contains("Yahoo veri yok", na=False).sum()
-                yahoo_fail_ratio = (yahoo_fail_count / max(len(tv_df), 1)) * 100
-                result_payload["yahoo_fail_count"] = int(yahoo_fail_count)
-                result_payload["yahoo_fail_ratio"] = round(yahoo_fail_ratio, 1)
-
-                if final_df.empty:
-                    result_payload["message_type"] = "warning"
-                    if yahoo_fail_ratio >= 40:
-                        result_payload["message"] = (
-                            f"Kurallara uyan aday çıkmadı. Veri katmanında sorun olabilir: "
-                            f"{yahoo_fail_count}/{len(tv_df)} adayda Yahoo/Alpaca günlük veri alınamadı."
-                        )
+                if best1_df.empty and backups_df.empty:
+                    if not low_reward_df.empty:
+                        result_payload["message_type"] = "warning"
+                        result_payload["message"] = "Bu gece continuation adayları var ama ödül/getiri marjı düşük. No Trade daha doğru."
                     else:
-                        result_payload["message"] = "Kurallara uyan aday çıkmadı."
+                        result_payload["message_type"] = "warning"
+                        result_payload["message"] = "Best 1 için uygun continuation adayı çıkmadı."
                 else:
+                    n_backups = len(backups_df)
                     result_payload["message_type"] = "success"
-                    suffix = ""
-                    if yahoo_fail_ratio >= 20:
-                        suffix = f" | Veri uyarısı: {yahoo_fail_count}/{len(tv_df)} adayda Yahoo/Alpaca veri sorunu"
-                    result_payload["message"] = f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}{suffix}"
+                    result_payload["message"] = f"Best 1 hazır. Opsiyonel backup sayısı: {n_backups}."
 
             st.session_state.swing_scan_results = result_payload
 
@@ -1302,39 +1318,40 @@ with tab2:
     if st.session_state.swing_scan_results is not None:
         result_payload = st.session_state.swing_scan_results
 
-        if result_payload["tv_count"] > 0:
-            st.info(f"İlk aşamada bulunan aday sayısı: {result_payload['tv_count']}")
-            yahoo_fail_ratio = result_payload.get("yahoo_fail_ratio", 0)
-            yahoo_fail_count = result_payload.get("yahoo_fail_count", 0)
-            if yahoo_fail_ratio >= 40:
-                st.error(f"Veri kaynağı uyarısı: {yahoo_fail_count}/{result_payload['tv_count']} adayda Yahoo/Alpaca günlük veri alınamadı.")
-            elif yahoo_fail_ratio >= 20:
-                st.warning(f"Veri kaynağı uyarısı: {yahoo_fail_count}/{result_payload['tv_count']} adayda Yahoo/Alpaca günlük veri alınamadı.")
+        prefilter_count = result_payload.get("prefilter_count", 0)
+        if prefilter_count > 0:
+            st.info(f"Ucuz ön eleme sonrası küçük havuz: {prefilter_count} hisse")
 
         msg_type = result_payload["message_type"]
         msg_text = result_payload["message"]
-
         if msg_type == "warning":
             st.warning(msg_text)
         elif msg_type == "success":
             st.success(msg_text)
-        elif msg_type == "info":
+        else:
             st.info(msg_text)
 
         final_df = result_payload["final_df"]
-        top3_df = result_payload["top3_df"]
+        best1_df = result_payload["best1_df"]
+        backups_df = result_payload["backups_df"]
+        low_reward_df = result_payload["low_reward_df"]
         rej_df = result_payload["rejected_log"]
 
+        if not best1_df.empty:
+            st.subheader("🥇 Best 1")
+            st.dataframe(best1_df, use_container_width=True)
+
+        if not backups_df.empty:
+            st.subheader("🥈 Opsiyonel Backups")
+            st.dataframe(backups_df, use_container_width=True)
+
+        if not low_reward_df.empty:
+            st.subheader("🟡 Düşük ödül nedeniyle elenen continuation adayları")
+            st.dataframe(low_reward_df[[c for c in low_reward_df.columns if c in [
+                "Symbol", "Description", "Trade_Status", "Entry_Idea", "TP1", "TP2", "TP1_%", "TP2_%", "Final_EV_Score", "Score", "Notes"
+            ]]], use_container_width=True)
+
         if not final_df.empty:
-            st.subheader("🏆 Top 10 Aday")
-            st.dataframe(final_df.head(10), use_container_width=True)
-
-            st.subheader("🥇 En İyi 3")
-            if not top3_df.empty:
-                st.dataframe(top3_df, use_container_width=True)
-            else:
-                st.warning("Top 10 içinden entry-ready 3 hisse çıkmadı.")
-
             csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 Tüm sonuçları CSV indir",
@@ -1343,12 +1360,12 @@ with tab2:
                 mime="text/csv",
             )
 
-            if not top3_df.empty:
-                csv_top3 = top3_df.to_csv(index=False).encode("utf-8-sig")
+            if not best1_df.empty:
+                best1_csv = best1_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
-                    "📥 En iyi 3 CSV indir",
-                    data=csv_top3,
-                    file_name=f"nextday_top3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "📥 Best 1 CSV indir",
+                    data=best1_csv,
+                    file_name=f"nextday_best1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                 )
 
