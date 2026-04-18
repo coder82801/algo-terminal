@@ -83,7 +83,6 @@ def get_api(api_key_value, secret_key_value):
         api_version="v2",
     )
 
-
 def normalize_symbol_for_yahoo(symbol: str) -> str:
     if not symbol:
         return symbol
@@ -657,12 +656,30 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 # ============================================================
 # YFINANCE VERİ İNDİRME (Anti-Bot Hayalet Modu)
 # ============================================================
-@st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 50, pause: float = 1.0):
+@st.cache_data(ttl=120)
+def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 10, pause: float = 2.0):
     if not tickers:
         return {}
 
     data_dict = {}
+
+    def _single_fetch(ticker: str):
+        try:
+            sub = yf.download(
+                tickers=ticker,
+                period=period,
+                progress=False,
+                threads=False,
+                auto_adjust=False,
+                group_by="ticker",
+            )
+            if sub is not None and not sub.empty:
+                sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if not sub.empty:
+                    return sub
+        except Exception as exc:
+            log_debug(f"Single fetch error for {ticker}: {exc}")
+        return pd.DataFrame()
 
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i + chunk_size]
@@ -671,7 +688,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                 tickers=chunk,
                 period=period,
                 progress=False,
-                threads=False, # DÜZELTME: Bulut banını engellemek için paralel indirmeyi kapattık
+                threads=False,
                 auto_adjust=False,
                 group_by="ticker",
             )
@@ -690,15 +707,22 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                         if not sub.empty:
                             data_dict[ticker] = sub
                     except Exception:
-                        continue
-            else:
-                if len(chunk) == 1:
-                    sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                    if not sub.empty:
-                        data_dict[chunk[0]] = sub
+                        pass
+
+            elif len(chunk) == 1 and yf_data is not None and not yf_data.empty:
+                sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if not sub.empty:
+                    data_dict[chunk[0]] = sub
 
         except Exception as exc:
             log_debug(f"Chunk download error: {chunk[:3]}... -> {exc}")
+
+        missing = [ticker for ticker in chunk if ticker not in data_dict]
+        for ticker in missing:
+            sub = _single_fetch(ticker)
+            if not sub.empty:
+                data_dict[ticker] = sub
+            time.sleep(0.7)
 
         time.sleep(pause)
 
@@ -1115,8 +1139,8 @@ with tab2:
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
-                        chunk_size=10,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
-                        pause=2.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
+                        chunk_size=10,
+                        pause=2.0,
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
