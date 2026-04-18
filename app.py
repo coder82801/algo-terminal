@@ -30,6 +30,12 @@ st.sidebar.header("Alpaca API (Paper)")
 api_key = st.sidebar.text_input("API Key ID", value=env_api_key, type="password")
 secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="password")
 
+# Ödül filtreleri (ana omurga bozulmadan düşük marjlı hisseleri elemek için)
+MIN_TP1_PCT = 5.0
+MIN_TP2_PCT = 10.0
+TOP3_MIN_TP1_PCT = 6.5
+TOP3_MIN_TP2_PCT = 12.0
+
 
 # ============================================================
 # YARDIMCI FONKSİYONLAR
@@ -137,6 +143,39 @@ def classify_distance_to_entry(current_price: float, reference_entry: float) -> 
     if dist_pct <= 6.0:
         return "WAIT_RETEST", dist_pct
     return "NO_TRADE", dist_pct
+
+
+def assess_reward_profile(entry: float, tp1: float, tp2: float) -> dict:
+    if entry <= 0 or not np.isfinite(entry):
+        return {
+            "tp1_pct": np.nan,
+            "tp2_pct": np.nan,
+            "reward_filter": "INVALID",
+            "top3_reward_ok": False,
+        }
+
+    tp1_pct = ((tp1 - entry) / entry) * 100 if np.isfinite(tp1) else np.nan
+    tp2_pct = ((tp2 - entry) / entry) * 100 if np.isfinite(tp2) else np.nan
+
+    reward_filter = "PASS"
+    if pd.isna(tp1_pct) or pd.isna(tp2_pct):
+        reward_filter = "INVALID"
+    elif tp1_pct < MIN_TP1_PCT or tp2_pct < MIN_TP2_PCT:
+        reward_filter = "LOW_REWARD"
+
+    top3_reward_ok = (
+        pd.notna(tp1_pct)
+        and pd.notna(tp2_pct)
+        and tp1_pct >= TOP3_MIN_TP1_PCT
+        and tp2_pct >= TOP3_MIN_TP2_PCT
+    )
+
+    return {
+        "tp1_pct": round(tp1_pct, 2) if pd.notna(tp1_pct) else np.nan,
+        "tp2_pct": round(tp2_pct, 2) if pd.notna(tp2_pct) else np.nan,
+        "reward_filter": reward_filter,
+        "top3_reward_ok": top3_reward_ok,
+    }
 
 
 def compute_single_exit_plan(
@@ -875,6 +914,13 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 )
                 tp1 = round(trade_plan["reference_entry"] + (trade_plan["reference_entry"] - trade_plan["stop_price"]), 4)
                 tp2 = round(trade_plan["reference_entry"] + 2 * (trade_plan["reference_entry"] - trade_plan["stop_price"]), 4)
+                reward_profile = assess_reward_profile(trade_plan["reference_entry"], tp1, tp2)
+
+                final_trade_status = trade_plan["trade_status"]
+                plan_note = trade_plan["plan_note"]
+                if reward_profile["reward_filter"] == "LOW_REWARD":
+                    final_trade_status = "NO_TRADE_LOW_REWARD"
+                    plan_note = "Getiri marjı düşük; zorlama aday değil"
 
                 final_candidates.append(
                     {
@@ -884,7 +930,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Category": category,
                         "Move_Type": row.get("move_type", "MIXED"),
                         "Entry_Type": trade_plan["entry_type"],
-                        "Trade_Status": trade_plan["trade_status"],
+                        "Trade_Status": final_trade_status,
                         "Close": round(last_close, 4 if last_close < 1 else 2),
                         "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
                         "Close_Strength": round(closing_strength, 2) if pd.notna(closing_strength) else np.nan,
@@ -905,8 +951,12 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Risk_Reward": trade_plan["risk_reward"],
                         "TP1": tp1,
                         "TP2": tp2,
+                        "TP1_%": reward_profile["tp1_pct"],
+                        "TP2_%": reward_profile["tp2_pct"],
+                        "Reward_Filter": reward_profile["reward_filter"],
+                        "Top3_Reward_OK": reward_profile["top3_reward_ok"],
                         "Score": score,
-                        "Notes": ", ".join(notes[:5] + [trade_plan["plan_note"]]),
+                        "Notes": ", ".join(notes[:5] + [plan_note]),
                     }
                 )
             else:
@@ -942,6 +992,7 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         default=0.0,
     )
     df["rr_score"] = np.clip(df["Risk_Reward"].fillna(0) / 2.0, 0, 1)
+    df["reward_score"] = np.where(df["Top3_Reward_OK"] == True, 1.0, 0.0)
 
     df["final_score"] = (
         0.22 * df["rvol_score"] +
@@ -951,7 +1002,8 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         0.10 * df["vwap_score"] +
         0.10 * df["rs_score"] +
         0.08 * df["clean_chart"] +
-        0.10 * df["entry_quality_score"]
+        0.10 * df["entry_quality_score"] +
+        0.10 * df["reward_score"]
     )
 
     df = df[
@@ -959,19 +1011,21 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         (df["Close_Strength"].fillna(0) >= 0.6) &
         (df["Above_VWAP"] == True) &
         (df["Dist_to_High_%"].fillna(999) <= 3.5) &
-        (df["Trade_Status"] != "NO_TRADE")
+        (~df["Trade_Status"].isin(["NO_TRADE", "NO_TRADE_LOW_REWARD"])) &
+        (df["Reward_Filter"] == "PASS")
     ]
 
     df = df[
         (df["Close_Strength"].fillna(0) >= 0.7) &
-        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0)
+        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0) &
+        (df["Top3_Reward_OK"] == True)
     ]
 
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
     df["final_score"] = df["final_score"] + df["stability_bonus"] + (0.05 * df["rr_score"])
 
     df = df.sort_values(["Trade_Status", "final_score", "Score"], ascending=[True, False, False])
-    status_order = pd.Categorical(df["Trade_Status"], categories=["READY", "WAIT_RETEST", "NO_TRADE"], ordered=True)
+    status_order = pd.Categorical(df["Trade_Status"], categories=["READY", "WAIT_RETEST", "NO_TRADE_LOW_REWARD", "NO_TRADE"], ordered=True)
     df = df.assign(_status_order=status_order).sort_values(["_status_order", "final_score", "Score"], ascending=[True, False, False]).drop(columns=["_status_order"])
     return df.head(3)
 
