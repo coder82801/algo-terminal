@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v4.1 (Best 1 First + Reward-Adjusted Continuation)")
+st.title("🎯 NextDay Scanner Pro v4.2 (Best 1 First + Reward-Adjusted Continuation)")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -677,24 +677,26 @@ def get_intraday_gainers(session: str) -> pd.DataFrame:
 # SWING RADAR - AŞAMA 1
 # ============================================================
 @st.cache_data(ttl=600)
-def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap_top_n: int = 40) -> pd.DataFrame:
-    """Cheap prefilter first: TradingView metrikleri ile geniş evrenden küçük ve kaliteli bir havuz çıkar."""
+def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap_top_n: int = 60) -> pd.DataFrame:
+    """Cheap prefilter first: TradingView metrikleri ile geniş evrenden küçük ve kaliteli bir havuz çıkar.
+    v4.2: aşırı sert ilk filtreyi gevşetir; amaç çoğu gece 20-60 arası küçük havuz bırakmaktır.
+    """
     base_filters = [
         {"left": "close", "operation": "greater", "right": 1.0},
-        {"left": "close", "operation": "less", "right": 80.0},
+        {"left": "close", "operation": "less", "right": 120.0},
         {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-        {"left": "volume", "operation": "greater", "right": 150000},
+        {"left": "volume", "operation": "greater", "right": 100000},
     ]
 
     if "A)" in algo_choice:
         algo_filters = [
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.25},
+            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.05},
         ]
         sort_field = "relative_volume_10d_calc"
     elif "B)" in algo_choice:
         algo_filters = [
-            {"left": "gap", "operation": "greater", "right": 1.5},
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.5},
+            {"left": "gap", "operation": "greater", "right": 1.0},
+            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.15},
         ]
         sort_field = "gap"
     else:
@@ -741,28 +743,36 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
             tv_change = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
             tv_perf1w = safe_float(d[8], np.nan) if len(d) > 8 else np.nan
 
-            # cheap prefilter: düşük maliyetli ama expansion ve continuation potansiyeline odaklı
-            rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 3.0, 0), 1.6)
-            gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 7.5, 0), 1.4)
-            change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 7.0, 0), 1.5)
-            vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 2_500_000, 0), 1.2)
-            perf1w_score = min(max((tv_perf1w if pd.notna(tv_perf1w) else 0) / 12.0, 0), 1.2)
+            # v4.2 cheap prefilter: precision'i korurken recall'u öldürmemek
+            rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 2.2, 0), 1.8)
+            gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 6.0, 0), 1.5)
+            change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 5.5, 0), 1.7)
+            vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 2_000_000, 0), 1.3)
+            perf1w_score = min(max((tv_perf1w if pd.notna(tv_perf1w) else 0) / 10.0, 0), 1.3)
+
             expansion_proxy = round(
-                (0.34 * rvol_score) +
-                (0.24 * gap_score) +
+                (0.30 * rvol_score) +
+                (0.20 * gap_score) +
                 (0.24 * change_score) +
-                (0.10 * vol_score) +
-                (0.08 * perf1w_score),
+                (0.14 * vol_score) +
+                (0.12 * perf1w_score),
                 3,
             )
-            price_penalty = 0.0 if pd.isna(tv_close) else (0.20 if tv_close > 45 else 0.0)
-            mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.18 if tv_market_cap > 10e9 else 0.0)
+
+            price_penalty = 0.0 if pd.isna(tv_close) else (0.12 if tv_close > 60 else 0.0)
+            mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.12 if tv_market_cap > 20e9 else 0.0)
             cheap_prefilter_score = round(expansion_proxy - price_penalty - mcap_penalty, 3)
 
-            # çok yavaş/ölçeksiz continuation isimlerini erken ele
-            if (pd.notna(tv_rvol) and tv_rvol < 1.35) and (pd.notna(tv_change) and abs(tv_change) < 2.0) and (pd.notna(tv_gap) and abs(tv_gap) < 1.0):
+            # sadece gerçekten çok sönük kombinasyonları erken ele
+            very_dull = (
+                (pd.notna(tv_rvol) and tv_rvol < 1.05)
+                and (pd.notna(tv_change) and abs(tv_change) < 1.0)
+                and (pd.notna(tv_gap) and abs(tv_gap) < 0.5)
+                and (pd.notna(tv_perf1w) and abs(tv_perf1w) < 2.0)
+            )
+            if very_dull:
                 continue
-            if cheap_prefilter_score < 0.55:
+            if cheap_prefilter_score < 0.30:
                 continue
 
             rows.append(
@@ -784,12 +794,51 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
         except Exception as exc:
             log_debug(f"Candidate parse error: {exc}")
 
+    # çok sert filtre nedeniyle boş kalırsa son bir esnek fallback uygula
+    if not rows:
+        for item in raw:
+            try:
+                d = item["d"]
+                symbol = d[0]
+                description = d[1] or ""
+                if not symbol or symbol in seen:
+                    continue
+                if is_likely_non_common_stock(symbol, description):
+                    continue
+                tv_close = safe_float(d[2], np.nan)
+                tv_volume = safe_float(d[3], np.nan) if len(d) > 3 else np.nan
+                tv_rvol = safe_float(d[4], np.nan) if len(d) > 4 else np.nan
+                tv_gap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
+                tv_market_cap = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
+                tv_change = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
+                tv_perf1w = safe_float(d[8], np.nan) if len(d) > 8 else np.nan
+
+                if pd.notna(tv_rvol) and tv_rvol >= 1.0:
+                    rows.append(
+                        {
+                            "symbol": symbol,
+                            "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
+                            "description": description,
+                            "tv_close": tv_close,
+                            "tv_volume": tv_volume,
+                            "tv_rvol": tv_rvol,
+                            "tv_gap": tv_gap,
+                            "tv_market_cap": tv_market_cap,
+                            "tv_change": tv_change,
+                            "tv_perf1w": tv_perf1w,
+                            "cheap_expansion_proxy": round(max((tv_rvol or 0) / 2.0, 0), 3),
+                            "cheap_prefilter_score": round(max((tv_rvol or 0) / 2.0, 0), 3),
+                        }
+                    )
+            except Exception:
+                pass
+
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    df = df.sort_values(["cheap_prefilter_score", "cheap_expansion_proxy", "tv_rvol", "tv_gap"], ascending=[False, False, False, False])
-    top_n = min(max(20, cheap_top_n), len(df))
+    df = df.sort_values(["cheap_prefilter_score", "cheap_expansion_proxy", "tv_rvol", "tv_gap", "tv_change"], ascending=[False, False, False, False, False])
+    top_n = min(max(25, cheap_top_n), len(df))
     return df.head(top_n).reset_index(drop=True)
 
 
@@ -1289,10 +1338,10 @@ with tab2:
     )
 
     max_scan_records = st.slider(
-        "Ucuz ön eleme evreni",
+        "Ucuz ön eleme evreni (v4.2 gevşetilmiş)",
         min_value=100,
         max_value=1200,
-        value=300,
+        value=500,
         step=100,
         help="Önce hızlı/ucuz filtreleme yapılır, sonra küçük havuza pahalı ranking uygulanır.",
     )
@@ -1303,7 +1352,7 @@ with tab2:
 
         try:
             with st.spinner("1. Aşama: Ucuz ön eleme yapılıyor..."):
-                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records, cheap_top_n=40)
+                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records, cheap_top_n=60)
 
             result_payload = {
                 "tv_count": 0,
@@ -1355,7 +1404,7 @@ with tab2:
                 if best1_df.empty and backups_df.empty:
                     if not low_reward_df.empty:
                         result_payload["message_type"] = "warning"
-                        result_payload["message"] = "Bu gece continuation adayları var ama ödül/getiri marjı hâlâ sınırlı. Best 1 çıkmadı; No Trade daha doğru."
+                        result_payload["message"] = "Bu gece continuation adayları var ama ödül/getiri marjı sınırlı. Best 1 çıkmadı; No Trade daha doğru."
                     else:
                         result_payload["message_type"] = "warning"
                         result_payload["message"] = "Best 1 için uygun continuation adayı çıkmadı."
