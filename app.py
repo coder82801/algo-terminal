@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v4 (Best 1 First + Reward-Adjusted Continuation)")
+st.title("🎯 NextDay Scanner Pro v4.1 (Best 1 First + Reward-Adjusted Continuation)")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -30,10 +30,10 @@ api_key = st.sidebar.text_input("API Key ID", value=env_api_key, type="password"
 secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="password")
 
 # Ödül filtreleri (ana omurga bozulmadan düşük marjlı hisseleri elemek için)
-MIN_TP1_PCT = 5.0
-MIN_TP2_PCT = 10.0
-TOP3_MIN_TP1_PCT = 6.5
-TOP3_MIN_TP2_PCT = 12.0
+MIN_TP1_PCT = 4.0
+MIN_TP2_PCT = 8.0
+TOP3_MIN_TP1_PCT = 5.5
+TOP3_MIN_TP2_PCT = 10.0
 
 
 # ============================================================
@@ -242,6 +242,30 @@ def assess_reward_profile(entry: float, tp1: float, tp2: float) -> dict:
     }
 
 
+def estimate_expected_move_pct(
+    last_close: float,
+    atr14: float,
+    rvol20: float,
+    closing_strength: float,
+    gap_pct: float,
+    breakout_dist: float,
+    category: str,
+) -> float:
+    if pd.isna(atr14) or atr14 <= 0 or pd.isna(last_close) or last_close <= 0:
+        atr_pct = 0.04
+    else:
+        atr_pct = atr14 / last_close
+
+    rvol_component = max((rvol20 if pd.notna(rvol20) else 0) - 1.0, 0) * 0.018
+    close_component = max((closing_strength if pd.notna(closing_strength) else 0) - 0.60, 0) * 0.06
+    gap_component = max(gap_pct, 0) * 0.003
+    breakout_component = max(0.02 - max(breakout_dist, 0), 0) * 1.2
+    category_bonus = 0.012 if category == "Continuation" else (0.008 if category == "Breakout" else 0.0)
+
+    expected = (atr_pct * 1.15) + rvol_component + close_component + gap_component + breakout_component + category_bonus
+    return float(min(max(expected, 0.035), 0.18))
+
+
 def compute_single_exit_plan(
     last_close: float,
     last_low: float,
@@ -295,7 +319,19 @@ def compute_single_exit_plan(
 
     risk_per_share = max(reference_entry - stop_price, reference_entry * 0.02)
     setup_k = 1.6 if category in ["Breakout", "Continuation"] else 1.4
-    single_tp = min(reference_entry * 1.12, reference_entry + setup_k * risk_per_share)
+    expected_move_pct = estimate_expected_move_pct(
+        last_close=last_close,
+        atr14=atr14,
+        rvol20=rvol20,
+        closing_strength=closing_strength,
+        gap_pct=gap_pct,
+        breakout_dist=breakout_dist,
+        category=category,
+    )
+    model_tp = reference_entry * (1 + expected_move_pct)
+    risk_tp = reference_entry + setup_k * risk_per_share
+    single_tp = max(model_tp, risk_tp)
+    single_tp = min(single_tp, reference_entry * 1.18)
     single_tp = round(single_tp, 4)
     rr = round((single_tp - reference_entry) / max(reference_entry - stop_price, 1e-9), 2)
 
@@ -674,6 +710,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
         "gap",
         "market_cap_basic",
         "change",
+        "Perf.1W",
     ]
 
     raw = tradingview_scan(
@@ -702,15 +739,31 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
             tv_gap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
             tv_market_cap = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
             tv_change = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
+            tv_perf1w = safe_float(d[8], np.nan) if len(d) > 8 else np.nan
 
-            # cheap prefilter score: hızlı ve ucuz metriklerle küçültme
-            rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 3.0, 0), 1.5)
-            gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 8.0, 0), 1.5)
-            change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 8.0, 0), 1.2)
-            vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 2_000_000, 0), 1.2)
-            price_penalty = 0.0 if pd.isna(tv_close) else (0.15 if tv_close > 40 else 0.0)
-            mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.15 if tv_market_cap > 8e9 else 0.0)
-            cheap_prefilter_score = round((0.38 * rvol_score) + (0.22 * gap_score) + (0.20 * change_score) + (0.20 * vol_score) - price_penalty - mcap_penalty, 3)
+            # cheap prefilter: düşük maliyetli ama expansion ve continuation potansiyeline odaklı
+            rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 3.0, 0), 1.6)
+            gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 7.5, 0), 1.4)
+            change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 7.0, 0), 1.5)
+            vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 2_500_000, 0), 1.2)
+            perf1w_score = min(max((tv_perf1w if pd.notna(tv_perf1w) else 0) / 12.0, 0), 1.2)
+            expansion_proxy = round(
+                (0.34 * rvol_score) +
+                (0.24 * gap_score) +
+                (0.24 * change_score) +
+                (0.10 * vol_score) +
+                (0.08 * perf1w_score),
+                3,
+            )
+            price_penalty = 0.0 if pd.isna(tv_close) else (0.20 if tv_close > 45 else 0.0)
+            mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.18 if tv_market_cap > 10e9 else 0.0)
+            cheap_prefilter_score = round(expansion_proxy - price_penalty - mcap_penalty, 3)
+
+            # çok yavaş/ölçeksiz continuation isimlerini erken ele
+            if (pd.notna(tv_rvol) and tv_rvol < 1.35) and (pd.notna(tv_change) and abs(tv_change) < 2.0) and (pd.notna(tv_gap) and abs(tv_gap) < 1.0):
+                continue
+            if cheap_prefilter_score < 0.55:
+                continue
 
             rows.append(
                 {
@@ -723,6 +776,8 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
                     "tv_gap": tv_gap,
                     "tv_market_cap": tv_market_cap,
                     "tv_change": tv_change,
+                    "tv_perf1w": tv_perf1w,
+                    "cheap_expansion_proxy": expansion_proxy,
                     "cheap_prefilter_score": cheap_prefilter_score,
                 }
             )
@@ -733,7 +788,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 300, cheap
     if df.empty:
         return df
 
-    df = df.sort_values(["cheap_prefilter_score", "tv_rvol", "tv_gap"], ascending=[False, False, False])
+    df = df.sort_values(["cheap_prefilter_score", "cheap_expansion_proxy", "tv_rvol", "tv_gap"], ascending=[False, False, False, False])
     top_n = min(max(20, cheap_top_n), len(df))
     return df.head(top_n).reset_index(drop=True)
 
@@ -1005,6 +1060,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 score += 6
                 notes.append("OBV pozitif")
 
+            cheap_expansion_proxy = safe_float(row.get("cheap_expansion_proxy", np.nan), np.nan)
             category = None
 
             if "A)" in algo_choice:
@@ -1067,21 +1123,22 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     plan_note = "Getiri marjı düşük; zorlama aday değil"
 
                 continuation_quality = (
-                    0.28 * min((rvol20 if pd.notna(rvol20) else 0) / 3.0, 1.5)
-                    + 0.22 * max(min(closing_strength if pd.notna(closing_strength) else 0, 1), 0)
-                    + 0.12 * (1.0 if close_above_vwap else 0.0)
-                    + 0.14 * max(min((rs_spread * 100) / 10.0, 1.2), 0)
-                    + 0.12 * max(0.0, 1 - min((breakout_dist * 100) / 3.5, 1.2))
-                    + 0.12 * max(min((score if pd.notna(score) else 0) / 100.0, 1.2), 0)
+                    0.24 * min((rvol20 if pd.notna(rvol20) else 0) / 3.0, 1.5)
+                    + 0.20 * max(min(closing_strength if pd.notna(closing_strength) else 0, 1), 0)
+                    + 0.10 * (1.0 if close_above_vwap else 0.0)
+                    + 0.12 * max(min((rs_spread * 100) / 10.0, 1.2), 0)
+                    + 0.10 * max(0.0, 1 - min((breakout_dist * 100) / 3.5, 1.2))
+                    + 0.10 * max(min((score if pd.notna(score) else 0) / 100.0, 1.2), 0)
+                    + 0.14 * min(max(cheap_expansion_proxy if pd.notna(cheap_expansion_proxy) else 0, 0), 1.5)
                 )
                 reward_quality = 0.0
                 if reward_profile["reward_filter"] == "PASS":
-                    reward_quality = min((reward_profile["tp2_pct"] if pd.notna(reward_profile["tp2_pct"]) else 0) / 15.0, 1.4)
+                    reward_quality = min((reward_profile["tp2_pct"] if pd.notna(reward_profile["tp2_pct"]) else 0) / 12.0, 1.6)
                 chase_penalty = 0.0
                 if pd.notna(trade_plan["distance_to_entry_pct"]):
-                    chase_penalty = max(trade_plan["distance_to_entry_pct"], 0) / 6.0
-                structure_penalty = 0.15 if pd.notna(gap_pct) and gap_pct > 18 else 0.0
-                final_ev_score = round(100 * (continuation_quality + 0.55 * reward_quality - 0.30 * chase_penalty - structure_penalty), 2)
+                    chase_penalty = max(trade_plan["distance_to_entry_pct"], 0) / 7.0
+                structure_penalty = 0.15 if pd.notna(gap_pct) and gap_pct > 22 else 0.0
+                final_ev_score = round(100 * (continuation_quality + 0.72 * reward_quality - 0.22 * chase_penalty - structure_penalty), 2)
 
                 final_candidates.append(
                     {
@@ -1298,7 +1355,7 @@ with tab2:
                 if best1_df.empty and backups_df.empty:
                     if not low_reward_df.empty:
                         result_payload["message_type"] = "warning"
-                        result_payload["message"] = "Bu gece continuation adayları var ama ödül/getiri marjı düşük. No Trade daha doğru."
+                        result_payload["message"] = "Bu gece continuation adayları var ama ödül/getiri marjı hâlâ sınırlı. Best 1 çıkmadı; No Trade daha doğru."
                     else:
                         result_payload["message_type"] = "warning"
                         result_payload["message"] = "Best 1 için uygun continuation adayı çıkmadı."
