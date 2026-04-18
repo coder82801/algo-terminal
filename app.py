@@ -1101,6 +1101,12 @@ with tab1:
 # ============================================================
 # TAB 2 - SWING RADAR
 # ============================================================
+if "swing_scan_results" not in st.session_state:
+    st.session_state.swing_scan_results = None
+
+if "swing_scan_error" not in st.session_state:
+    st.session_state.swing_scan_error = None
+
 with tab2:
     st.write("Profesyonel filtrelere göre ertesi gün potansiyeli yüksek adaylar:")
 
@@ -1122,15 +1128,26 @@ with tab2:
     )
 
     if st.button("🚀 Tarayıcıyı Başlat"):
+        st.session_state.swing_scan_error = None
+        st.session_state.swing_scan_results = None
+
         try:
             with st.spinner("1. Aşama: TradingView adayları taranıyor..."):
                 tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records)
 
-            if tv_df.empty:
-                st.warning("İlk aşamada aday bulunamadı.")
-            else:
-                st.info(f"İlk aşamada bulunan aday sayısı: {len(tv_df)}")
+            result_payload = {
+                "tv_count": 0,
+                "final_df": pd.DataFrame(),
+                "top3_df": pd.DataFrame(),
+                "rejected_log": pd.DataFrame(),
+                "message_type": "info",
+                "message": "",
+            }
 
+            if tv_df.empty:
+                result_payload["message_type"] = "warning"
+                result_payload["message"] = "İlk aşamada aday bulunamadı."
+            else:
                 yahoo_tickers = tv_df["yahoo_symbol"].dropna().unique().tolist()
                 if "SPY" not in yahoo_tickers:
                     yahoo_tickers.append("SPY")
@@ -1149,51 +1166,81 @@ with tab2:
                 gc.collect()
 
                 final_df = pd.DataFrame(final_candidates)
+                top3_df = rank_top3(final_df.head(10)) if not final_df.empty else pd.DataFrame()
+                rej_df = pd.DataFrame(rejected_log)
+
+                result_payload["tv_count"] = len(tv_df)
+                result_payload["final_df"] = final_df
+                result_payload["top3_df"] = top3_df
+                result_payload["rejected_log"] = rej_df
 
                 if final_df.empty:
-                    st.warning("Kurallara uyan aday çıkmadı.")
+                    result_payload["message_type"] = "warning"
+                    result_payload["message"] = "Kurallara uyan aday çıkmadı."
                 else:
-                    st.success(f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}")
+                    result_payload["message_type"] = "success"
+                    result_payload["message"] = f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}"
 
-                    st.subheader("🏆 Top 10 Aday")
-                    st.dataframe(final_df.head(10), use_container_width=True)
-
-                    top3_df = rank_top3(final_df.head(10))
-
-                    st.subheader("🥇 En İyi 3")
-                    if not top3_df.empty:
-                        st.dataframe(top3_df, use_container_width=True)
-                    else:
-                        st.warning("Top 10 içinden entry-ready 3 hisse çıkmadı.")
-
-                    csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "📥 Tüm sonuçları CSV indir",
-                        data=csv_all,
-                        file_name=f"nextday_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                    )
-
-                    if not top3_df.empty:
-                        csv_top3 = top3_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            "📥 En iyi 3 CSV indir",
-                            data=csv_top3,
-                            file_name=f"nextday_top3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                        )
-
-                with st.expander("Reddedilenler / Hata kayıtları"):
-                    rej_df = pd.DataFrame(rejected_log)
-                    if not rej_df.empty:
-                        st.dataframe(rej_df, use_container_width=True)
-                    else:
-                        st.write("Kayıt yok.")
+            st.session_state.swing_scan_results = result_payload
 
         except Exception as exc:
-            st.error(f"Tarama hatası: {exc}")
-            if DEBUG_MODE:
-                st.code(traceback.format_exc())
+            st.session_state.swing_scan_error = traceback.format_exc() if DEBUG_MODE else str(exc)
+
+    if st.session_state.swing_scan_error:
+        st.error(f"Tarama hatası: {st.session_state.swing_scan_error}")
+
+    if st.session_state.swing_scan_results is not None:
+        result_payload = st.session_state.swing_scan_results
+
+        if result_payload["tv_count"] > 0:
+            st.info(f"İlk aşamada bulunan aday sayısı: {result_payload['tv_count']}")
+
+        msg_type = result_payload["message_type"]
+        msg_text = result_payload["message"]
+
+        if msg_type == "warning":
+            st.warning(msg_text)
+        elif msg_type == "success":
+            st.success(msg_text)
+        elif msg_type == "info":
+            st.info(msg_text)
+
+        final_df = result_payload["final_df"]
+        top3_df = result_payload["top3_df"]
+        rej_df = result_payload["rejected_log"]
+
+        if not final_df.empty:
+            st.subheader("🏆 Top 10 Aday")
+            st.dataframe(final_df.head(10), use_container_width=True)
+
+            st.subheader("🥇 En İyi 3")
+            if not top3_df.empty:
+                st.dataframe(top3_df, use_container_width=True)
+            else:
+                st.warning("Top 10 içinden entry-ready 3 hisse çıkmadı.")
+
+            csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 Tüm sonuçları CSV indir",
+                data=csv_all,
+                file_name=f"nextday_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+            )
+
+            if not top3_df.empty:
+                csv_top3 = top3_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "📥 En iyi 3 CSV indir",
+                    data=csv_top3,
+                    file_name=f"nextday_top3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+
+        with st.expander("Reddedilenler / Hata kayıtları"):
+            if not rej_df.empty:
+                st.dataframe(rej_df, use_container_width=True)
+            else:
+                st.write("Kayıt yok.")
 
 
 # ============================================================
