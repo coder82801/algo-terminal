@@ -1115,8 +1115,8 @@ with tab2:
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
-                        chunk_size=50,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
-                        pause=1.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
+                        chunk_size=10,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
+                        pause=2.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
