@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import alpaca_trade_api as tradeapi
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -70,9 +69,13 @@ def format_price(x: float) -> str:
 
 
 def get_api(api_key_value, secret_key_value):
-    # Alpaca import'unu buraya taşıdık.
-    # Böylece paket eksik olsa bile tüm uygulama çökmez;
-    # sadece emir gönderme kısmı hata verir.
+    try:
+        import alpaca_trade_api as tradeapi
+    except ImportError as e:
+        raise RuntimeError(
+            "alpaca-trade-api paketi kurulu değil. requirements.txt dosyasına alpaca-trade-api ekleyip yeniden deploy et."
+        ) from e
+
     return tradeapi.REST(
         key_id=api_key_value,
         secret_key=secret_key_value,
