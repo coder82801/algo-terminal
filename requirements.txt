@@ -4,3 +4,4 @@ numpy==1.26.4
 yfinance==0.2.37
 requests==2.31.0
 streamlit-autorefresh==1.0.1
+alpaca-trade-api
