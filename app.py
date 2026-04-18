@@ -83,6 +83,68 @@ def get_api(api_key_value, secret_key_value):
         api_version="v2",
     )
 
+
+def get_alpaca_data_api(api_key_value: str, secret_key_value: str):
+    if not api_key_value or not secret_key_value:
+        return None
+    try:
+        import alpaca_trade_api as tradeapi
+        return tradeapi.REST(
+            key_id=api_key_value,
+            secret_key=secret_key_value,
+            base_url="https://data.alpaca.markets",
+            api_version="v2",
+        )
+    except Exception as exc:
+        log_debug(f"Alpaca data api init error: {exc}")
+        return None
+
+
+def get_alpaca_daily_history(ticker: str, api_key_value: str, secret_key_value: str, days_back: int = 420):
+    api = get_alpaca_data_api(api_key_value, secret_key_value)
+    if api is None:
+        return pd.DataFrame()
+
+    try:
+        from alpaca_trade_api.rest import TimeFrame
+        end_ts = pd.Timestamp.utcnow()
+        start_ts = end_ts - pd.Timedelta(days=days_back)
+        feed = os.getenv("ALPACA_FEED", "iex") or "iex"
+        bars = api.get_bars(
+            ticker,
+            TimeFrame.Day,
+            start=start_ts.isoformat(),
+            end=end_ts.isoformat(),
+            adjustment="raw",
+            feed=feed,
+        ).df
+        if bars is None or bars.empty:
+            return pd.DataFrame()
+
+        if isinstance(bars.index, pd.MultiIndex):
+            try:
+                bars = bars.xs(ticker, level=0)
+            except Exception:
+                try:
+                    bars = bars.xs(ticker, level="symbol")
+                except Exception:
+                    pass
+
+        rename_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+        bars = bars.rename(columns=rename_map)
+        keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in bars.columns]
+        bars = bars[keep_cols].dropna()
+        return bars
+    except Exception as exc:
+        log_debug(f"Alpaca daily fetch error for {ticker}: {exc}")
+        return pd.DataFrame()
+
 def normalize_symbol_for_yahoo(symbol: str) -> str:
     if not symbol:
         return symbol
@@ -663,7 +725,17 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
 
     data_dict = {}
 
+    def _normalize_sub(df_like):
+        if df_like is None or df_like.empty:
+            return pd.DataFrame()
+        cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_like.columns]
+        if len(cols) < 5:
+            return pd.DataFrame()
+        out = df_like[cols].dropna()
+        return out if not out.empty else pd.DataFrame()
+
     def _single_fetch(ticker: str):
+        # 1) yfinance.download
         try:
             sub = yf.download(
                 tickers=ticker,
@@ -673,12 +745,26 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                 auto_adjust=False,
                 group_by="ticker",
             )
-            if sub is not None and not sub.empty:
-                sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if not sub.empty:
-                    return sub
+            sub = _normalize_sub(sub)
+            if not sub.empty:
+                return sub
         except Exception as exc:
-            log_debug(f"Single fetch error for {ticker}: {exc}")
+            log_debug(f"Single yf.download error for {ticker}: {exc}")
+
+        # 2) yfinance.Ticker.history
+        try:
+            hist = yf.Ticker(ticker).history(
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                prepost=False,
+            )
+            hist = _normalize_sub(hist)
+            if not hist.empty:
+                return hist
+        except Exception as exc:
+            log_debug(f"Ticker.history error for {ticker}: {exc}")
+
         return pd.DataFrame()
 
     for i in range(0, len(tickers), chunk_size):
@@ -703,14 +789,12 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                             "Close": yf_data[ticker]["Close"],
                             "Volume": yf_data[ticker]["Volume"],
                         }).dropna()
-
                         if not sub.empty:
                             data_dict[ticker] = sub
                     except Exception:
                         pass
-
-            elif len(chunk) == 1 and yf_data is not None and not yf_data.empty:
-                sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            elif len(chunk) == 1:
+                sub = _normalize_sub(yf_data)
                 if not sub.empty:
                     data_dict[chunk[0]] = sub
 
@@ -722,7 +806,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
             sub = _single_fetch(ticker)
             if not sub.empty:
                 data_dict[ticker] = sub
-            time.sleep(0.7)
+            time.sleep(0.8)
 
         time.sleep(pause)
 
@@ -744,7 +828,7 @@ def get_intraday_session_data(ticker: str):
 # ============================================================
 # SWING RADAR - AŞAMA 2
 # ============================================================
-def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_dict: dict):
+def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_dict: dict, api_key_value: str = "", secret_key_value: str = ""):
     final_candidates = []
     rejected_log = []
 
@@ -752,6 +836,11 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
         return final_candidates, rejected_log
 
     spy_df = data_dict.get("SPY")
+    if spy_df is None or spy_df.empty:
+        spy_df = get_alpaca_daily_history("SPY", api_key_value, secret_key_value, days_back=420)
+        if spy_df is not None and not spy_df.empty:
+            data_dict["SPY"] = spy_df
+
     spy_ret_10d = 0.0
     if spy_df is not None and len(spy_df) >= 11:
         spy_ret_10d = (spy_df["Close"].iloc[-1] - spy_df["Close"].iloc[-10]) / spy_df["Close"].iloc[-10]
@@ -765,8 +854,13 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             df = data_dict.get(yahoo_symbol)
 
             if df is None or df.empty:
-                rejected_log.append({"Hisse": symbol, "Neden": "Yahoo veri yok"})
-                continue
+                df = get_alpaca_daily_history(yahoo_symbol, api_key_value, secret_key_value, days_back=420)
+                if df is not None and not df.empty:
+                    data_dict[yahoo_symbol] = df
+                    rejected_note = None
+                else:
+                    rejected_log.append({"Hisse": symbol, "Neden": "Yahoo veri yok / Alpaca fallback başarısız"})
+                    continue
 
             if len(df) < 220:
                 rejected_log.append({"Hisse": symbol, "Neden": "Yetersiz günlük veri (<220)"})
@@ -1161,7 +1255,7 @@ with tab2:
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
-                    final_candidates, rejected_log = evaluate_candidates(algo_choice, tv_df, data_dict)
+                    final_candidates, rejected_log = evaluate_candidates(algo_choice, tv_df, data_dict, api_key, secret_key)
 
                 gc.collect()
 
@@ -1174,12 +1268,28 @@ with tab2:
                 result_payload["top3_df"] = top3_df
                 result_payload["rejected_log"] = rej_df
 
+                yahoo_fail_count = 0
+                if not rej_df.empty and "Neden" in rej_df.columns:
+                    yahoo_fail_count = rej_df["Neden"].astype(str).str.contains("Yahoo veri yok", na=False).sum()
+                yahoo_fail_ratio = (yahoo_fail_count / max(len(tv_df), 1)) * 100
+                result_payload["yahoo_fail_count"] = int(yahoo_fail_count)
+                result_payload["yahoo_fail_ratio"] = round(yahoo_fail_ratio, 1)
+
                 if final_df.empty:
                     result_payload["message_type"] = "warning"
-                    result_payload["message"] = "Kurallara uyan aday çıkmadı."
+                    if yahoo_fail_ratio >= 40:
+                        result_payload["message"] = (
+                            f"Kurallara uyan aday çıkmadı. Veri katmanında sorun olabilir: "
+                            f"{yahoo_fail_count}/{len(tv_df)} adayda Yahoo/Alpaca günlük veri alınamadı."
+                        )
+                    else:
+                        result_payload["message"] = "Kurallara uyan aday çıkmadı."
                 else:
                     result_payload["message_type"] = "success"
-                    result_payload["message"] = f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}"
+                    suffix = ""
+                    if yahoo_fail_ratio >= 20:
+                        suffix = f" | Veri uyarısı: {yahoo_fail_count}/{len(tv_df)} adayda Yahoo/Alpaca veri sorunu"
+                    result_payload["message"] = f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}{suffix}"
 
             st.session_state.swing_scan_results = result_payload
 
@@ -1194,6 +1304,12 @@ with tab2:
 
         if result_payload["tv_count"] > 0:
             st.info(f"İlk aşamada bulunan aday sayısı: {result_payload['tv_count']}")
+            yahoo_fail_ratio = result_payload.get("yahoo_fail_ratio", 0)
+            yahoo_fail_count = result_payload.get("yahoo_fail_count", 0)
+            if yahoo_fail_ratio >= 40:
+                st.error(f"Veri kaynağı uyarısı: {yahoo_fail_count}/{result_payload['tv_count']} adayda Yahoo/Alpaca günlük veri alınamadı.")
+            elif yahoo_fail_ratio >= 20:
+                st.warning(f"Veri kaynağı uyarısı: {yahoo_fail_count}/{result_payload['tv_count']} adayda Yahoo/Alpaca günlük veri alınamadı.")
 
         msg_type = result_payload["message_type"]
         msg_text = result_payload["message"]
