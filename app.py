@@ -5,6 +5,7 @@ import math
 import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Dict, List, Tuple
 
 import requests
 import numpy as np
@@ -563,6 +564,7 @@ TRADINGVIEW_URL = "https://scanner.tradingview.com/america/scan"
 TV_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
+
 def tradingview_scan(
     base_filters: list,
     columns: list,
@@ -584,12 +586,21 @@ def tradingview_scan(
             "range": [start, start + page_size - 1],
         }
 
-        try:
-            res = requests.post(TRADINGVIEW_URL, json=payload, headers=TV_HEADERS, timeout=20)
-            res.raise_for_status()
-            data = res.json().get("data", [])
-        except Exception as exc:
-            log_debug(f"TradingView scan error [{start}-{start+page_size}]: {exc}")
+        success = False
+        last_exc = None
+        for attempt in range(3):
+            try:
+                res = requests.post(TRADINGVIEW_URL, json=payload, headers=TV_HEADERS, timeout=20)
+                res.raise_for_status()
+                data = res.json().get("data", [])
+                success = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.7 * (attempt + 1))
+
+        if not success:
+            log_debug(f"TradingView scan error [{start}-{start+page_size}] sort={sort_field}: {last_exc}")
             break
 
         if not data:
@@ -604,6 +615,239 @@ def tradingview_scan(
 
     return collected
 
+
+def _parse_tv_item(item) -> dict | None:
+    try:
+        d = item["d"]
+        symbol = d[0]
+        description = d[1] or ""
+        if not symbol:
+            return None
+        if is_likely_non_common_stock(symbol, description):
+            return None
+
+        tv_close = safe_float(d[2], np.nan)
+        tv_volume = safe_float(d[3], np.nan) if len(d) > 3 else np.nan
+        tv_rvol = safe_float(d[4], np.nan) if len(d) > 4 else np.nan
+        tv_gap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
+        tv_market_cap = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
+        tv_change = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
+        tv_perf1w = safe_float(d[8], np.nan) if len(d) > 8 else np.nan
+
+        return {
+            "symbol": symbol,
+            "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
+            "description": description,
+            "tv_close": tv_close,
+            "tv_volume": tv_volume,
+            "tv_rvol": tv_rvol,
+            "tv_gap": tv_gap,
+            "tv_market_cap": tv_market_cap,
+            "tv_change": tv_change,
+            "tv_perf1w": tv_perf1w,
+        }
+    except Exception as exc:
+        log_debug(f"TV item parse error: {exc}")
+        return None
+
+
+def _cheap_score_tv_row(row: dict) -> tuple[float, float, bool]:
+    tv_close = row.get("tv_close", np.nan)
+    tv_volume = row.get("tv_volume", np.nan)
+    tv_rvol = row.get("tv_rvol", np.nan)
+    tv_gap = row.get("tv_gap", np.nan)
+    tv_market_cap = row.get("tv_market_cap", np.nan)
+    tv_change = row.get("tv_change", np.nan)
+    tv_perf1w = row.get("tv_perf1w", np.nan)
+
+    rvol_score = min(max((tv_rvol if pd.notna(tv_rvol) else 0) / 2.0, 0), 1.8)
+    gap_score = min(max(abs(tv_gap if pd.notna(tv_gap) else 0) / 5.0, 0), 1.5)
+    change_score = min(max(abs(tv_change if pd.notna(tv_change) else 0) / 5.0, 0), 1.7)
+    vol_score = min(max((tv_volume if pd.notna(tv_volume) else 0) / 1_500_000, 0), 1.4)
+    perf1w_score = min(max((tv_perf1w if pd.notna(tv_perf1w) else 0) / 8.0, 0), 1.4)
+
+    expansion_proxy = round(
+        (0.30 * rvol_score)
+        + (0.20 * gap_score)
+        + (0.22 * change_score)
+        + (0.16 * vol_score)
+        + (0.12 * perf1w_score),
+        3,
+    )
+
+    price_penalty = 0.0 if pd.isna(tv_close) else (0.10 if tv_close > 70 else 0.0)
+    mcap_penalty = 0.0 if pd.isna(tv_market_cap) else (0.10 if tv_market_cap > 30e9 else 0.0)
+    cheap_prefilter_score = round(expansion_proxy - price_penalty - mcap_penalty, 3)
+
+    very_dull = (
+        (pd.notna(tv_rvol) and tv_rvol < 1.0)
+        and (pd.notna(tv_change) and abs(tv_change) < 0.7)
+        and (pd.notna(tv_gap) and abs(tv_gap) < 0.3)
+        and (pd.notna(tv_perf1w) and abs(tv_perf1w) < 1.5)
+    )
+    return expansion_proxy, cheap_prefilter_score, very_dull
+
+
+def fetch_tradingview_candidates(
+    algo_choice: str,
+    max_records: int = 500,
+    cheap_top_n: int = 80,
+) -> tuple[pd.DataFrame, dict, list[dict]]:
+    """
+    v4.3:
+    - Stage 1 boş kalmaması için çok kademeli TradingView sorgusu
+    - strict -> relaxed -> generic momentum -> generic liquidity fallback
+    - ekranda gösterilecek stage1 tanı bilgileri üretir
+    """
+    columns = [
+        "name",
+        "description",
+        "close",
+        "volume",
+        "relative_volume_10d_calc",
+        "gap",
+        "market_cap_basic",
+        "change",
+        "Perf.1W",
+    ]
+
+    diag = {
+        "scan_max_records": int(max_records),
+        "variant_counts": {},
+        "raw_unique_count": 0,
+        "prefilter_count": 0,
+        "used_stage1_fallback": False,
+        "stage1_reason": "",
+    }
+    stage1_log = []
+
+    base_common = [
+        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
+        {"left": "close", "operation": "greater", "right": 1.0},
+        {"left": "close", "operation": "less", "right": 120.0},
+    ]
+
+    strict_filters = base_common + [{"left": "volume", "operation": "greater", "right": 100000}]
+    relaxed_filters = base_common + [{"left": "volume", "operation": "greater", "right": 50000}]
+    loose_filters = base_common + [{"left": "volume", "operation": "greater", "right": 25000}]
+
+    if "A)" in algo_choice:
+        query_variants = [
+            ("strict_breakout", strict_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.05}], "relative_volume_10d_calc"),
+            ("relaxed_breakout", relaxed_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 0.95}], "relative_volume_10d_calc"),
+            ("momentum_gap", relaxed_filters + [{"left": "change", "operation": "greater", "right": 1.0}], "change"),
+            ("liquidity_rvol", loose_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 0.85}], "relative_volume_10d_calc"),
+        ]
+    elif "B)" in algo_choice:
+        query_variants = [
+            ("strict_gap", strict_filters + [{"left": "gap", "operation": "greater", "right": 1.0}, {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.10}], "gap"),
+            ("relaxed_gap", relaxed_filters + [{"left": "gap", "operation": "greater", "right": 0.5}], "gap"),
+            ("momentum_change", relaxed_filters + [{"left": "change", "operation": "greater", "right": 1.0}], "change"),
+            ("liquidity_rvol", loose_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 0.85}], "relative_volume_10d_calc"),
+        ]
+    else:
+        query_variants = [
+            ("strict_accum", strict_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.0}], "relative_volume_10d_calc"),
+            ("relaxed_accum", relaxed_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 0.9}], "relative_volume_10d_calc"),
+            ("momentum_change", relaxed_filters + [{"left": "change", "operation": "greater", "right": 0.7}], "change"),
+            ("liquidity_rvol", loose_filters + [{"left": "relative_volume_10d_calc", "operation": "greater", "right": 0.8}], "relative_volume_10d_calc"),
+        ]
+
+    raw_map: Dict[str, dict] = {}
+    for name, filters, sort_field in query_variants:
+        items = tradingview_scan(
+            base_filters=filters,
+            columns=columns,
+            sort_field=sort_field,
+            max_records=max_records,
+            page_size=100,
+        )
+        diag["variant_counts"][name] = len(items)
+        for item in items:
+            parsed = _parse_tv_item(item)
+            if not parsed:
+                continue
+            sym = parsed["symbol"]
+            if sym not in raw_map:
+                raw_map[sym] = parsed
+
+    diag["raw_unique_count"] = len(raw_map)
+
+    if not raw_map:
+        diag["stage1_reason"] = "TradingView ham aday akışı boş döndü veya tüm varyantlar sıfır sonuç verdi."
+        stage1_log.append({"Hisse": "STAGE1", "Neden": diag["stage1_reason"]})
+        return pd.DataFrame(), diag, stage1_log
+
+    rows = []
+    prefilter_reject_count = 0
+    for sym, row in raw_map.items():
+        expansion_proxy, cheap_prefilter_score, very_dull = _cheap_score_tv_row(row)
+        row["cheap_expansion_proxy"] = expansion_proxy
+        row["cheap_prefilter_score"] = cheap_prefilter_score
+
+        # Sadece çok sönükleri erken ele; amaç stage1'i öldürmemek.
+        if very_dull:
+            prefilter_reject_count += 1
+            continue
+        if cheap_prefilter_score < 0.18:
+            prefilter_reject_count += 1
+            continue
+
+        rows.append(row)
+
+    # İlk filtre çok dar gelirse otomatik fallback: en iyi ham adaylardan seç
+    if len(rows) < 12:
+        diag["used_stage1_fallback"] = True
+        fallback_df = pd.DataFrame(raw_map.values())
+        if not fallback_df.empty:
+            if "cheap_prefilter_score" not in fallback_df.columns:
+                fallback_df["cheap_prefilter_score"] = 0.0
+                fallback_df["cheap_expansion_proxy"] = 0.0
+                for i in fallback_df.index:
+                    ex, sc, _ = _cheap_score_tv_row(fallback_df.loc[i].to_dict())
+                    fallback_df.loc[i, "cheap_expansion_proxy"] = ex
+                    fallback_df.loc[i, "cheap_prefilter_score"] = sc
+
+            fallback_df["fallback_rank_score"] = (
+                fallback_df["tv_rvol"].fillna(0) * 0.45
+                + fallback_df["tv_gap"].fillna(0).abs() * 0.20
+                + fallback_df["tv_change"].fillna(0).abs() * 0.20
+                + np.log1p(fallback_df["tv_volume"].fillna(0)) * 0.15
+            )
+            fallback_df = fallback_df.sort_values(
+                ["fallback_rank_score", "cheap_prefilter_score", "tv_rvol", "tv_change"],
+                ascending=[False, False, False, False],
+            )
+            top_fb = fallback_df.head(max(18, min(40, cheap_top_n))).copy()
+            rows = top_fb.to_dict("records")
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        diag["stage1_reason"] = "Ham adaylar geldi ancak cheap prefilter sonrası küçük havuz oluşmadı."
+        stage1_log.append({"Hisse": "STAGE1", "Neden": diag["stage1_reason"]})
+        return pd.DataFrame(), diag, stage1_log
+
+    df = df.sort_values(
+        ["cheap_prefilter_score", "cheap_expansion_proxy", "tv_rvol", "tv_gap", "tv_change", "tv_perf1w"],
+        ascending=[False, False, False, False, False, False],
+    ).reset_index(drop=True)
+
+    top_n = min(max(20, cheap_top_n), len(df))
+    df = df.head(top_n).reset_index(drop=True)
+    diag["prefilter_count"] = len(df)
+    if diag["used_stage1_fallback"]:
+        diag["stage1_reason"] = "Strict cheap prefilter dar kaldı; otomatik fallback küçük havuzu devreye girdi."
+    else:
+        diag["stage1_reason"] = f"Strict/relaxed prefilter ile {len(df)} hisse bırakıldı."
+
+    if prefilter_reject_count > 0:
+        stage1_log.append({"Hisse": "STAGE1", "Neden": f"Cheap prefilter ilk geçişte {prefilter_reject_count} hisseyi eledi."})
+
+    return df, diag, stage1_log
+
+
+# ============================================================
+# CANLI GÜN İÇİ RADAR
 
 # ============================================================
 # CANLI GÜN İÇİ RADAR
@@ -1352,11 +1596,12 @@ with tab2:
 
         try:
             with st.spinner("1. Aşama: Ucuz ön eleme yapılıyor..."):
-                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records, cheap_top_n=60)
+                tv_df, stage1_diag, stage1_log = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records, cheap_top_n=80)
 
             result_payload = {
                 "tv_count": 0,
                 "prefilter_count": 0,
+                "stage1_diag": {},
                 "final_df": pd.DataFrame(),
                 "best1_df": pd.DataFrame(),
                 "backups_df": pd.DataFrame(),
@@ -1366,9 +1611,11 @@ with tab2:
                 "message": "",
             }
 
+            result_payload["stage1_diag"] = stage1_diag
             if tv_df.empty:
                 result_payload["message_type"] = "warning"
                 result_payload["message"] = "İlk aşamada aday bulunamadı."
+                result_payload["rejected_log"] = pd.DataFrame(stage1_log)
             else:
                 yahoo_tickers = tv_df["yahoo_symbol"].dropna().unique().tolist()
                 if "SPY" not in yahoo_tickers:
@@ -1391,9 +1638,9 @@ with tab2:
                 low_reward_df = final_df[final_df["Trade_Status"] == "NO_TRADE_LOW_REWARD"].copy() if not final_df.empty else pd.DataFrame()
                 actionable_df = final_df[final_df["Trade_Status"].isin(["READY", "WAIT_RETEST"])].copy() if not final_df.empty else pd.DataFrame()
                 best1_df, backups_df = rank_best_candidates(final_df) if not final_df.empty else (pd.DataFrame(), pd.DataFrame())
-                rej_df = pd.DataFrame(rejected_log)
+                rej_df = pd.DataFrame(stage1_log + rejected_log)
 
-                result_payload["tv_count"] = int(max_scan_records)
+                result_payload["tv_count"] = int(stage1_diag.get("raw_unique_count", 0))
                 result_payload["prefilter_count"] = len(tv_df)
                 result_payload["final_df"] = final_df
                 result_payload["best1_df"] = best1_df
@@ -1427,6 +1674,14 @@ with tab2:
         prefilter_count = result_payload.get("prefilter_count", 0)
         if prefilter_count > 0:
             st.info(f"Ucuz ön eleme sonrası küçük havuz: {prefilter_count} hisse")
+            diag = result_payload.get("stage1_diag", {})
+            if diag:
+                vcounts = diag.get("variant_counts", {})
+                diag_txt = " | ".join([f"{k}:{v}" for k, v in vcounts.items()])
+                if diag_txt:
+                    st.caption(f"Ham aday taraması: {diag.get('raw_unique_count',0)} benzersiz hisse — {diag_txt}")
+                if diag.get("used_stage1_fallback"):
+                    st.caption("Stage 1 fallback aktif: strict cheap prefilter çok dar kaldığı için esnek küçük havuz üretildi.")
 
         msg_type = result_payload["message_type"]
         msg_text = result_payload["message"]
