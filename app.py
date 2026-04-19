@@ -656,7 +656,7 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 # YFINANCE VERİ İNDİRME
 # ============================================================
 @st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 50, pause: float = 1.0):
+def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 10, pause: float = 2.0):
     if not tickers:
         return {}
 
