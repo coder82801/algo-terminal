@@ -64,9 +64,6 @@ def format_price(x: float) -> str:
 
 
 def get_api(api_key_value, secret_key_value):
-    # Alpaca import'unu buraya taşıdık.
-    # Böylece paket eksik olsa bile tüm uygulama çökmez;
-    # sadece emir gönderme kısmı hata verir.
     return tradeapi.REST(
         key_id=api_key_value,
         secret_key=secret_key_value,
@@ -524,10 +521,10 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 
 
 # ============================================================
-# YFINANCE VERİ İNDİRME (Anti-Bot Hayalet Modu)
+# YFINANCE VERİ İNDİRME
 # ============================================================
 @st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 50, pause: float = 1.0):
+def download_daily_data_chunked(tickers: list[str], period: str = "260d", chunk_size: int = 75, pause: float = 1.0):
     if not tickers:
         return {}
 
@@ -540,7 +537,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                 tickers=chunk,
                 period=period,
                 progress=False,
-                threads=False, # DÜZELTME: Bulut banını engellemek için paralel indirmeyi kapattık
+                threads=False,
                 auto_adjust=False,
                 group_by="ticker",
             )
@@ -572,6 +569,7 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
         time.sleep(pause)
 
     return data_dict
+
 
 @st.cache_data(ttl=300)
 def get_intraday_session_data(ticker: str):
@@ -941,9 +939,9 @@ with tab2:
                 with st.spinner("2. Aşama: Günlük veriler chunk'lı indiriliyor..."):
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
-                        period="220d",
-                        chunk_size=50,  # DÜZELTME: Ban önlemek için paket 50'ye düştü
-                        pause=1.0,      # DÜZELTME: Paketler arası 1 tam saniye nefes alma
+                        period="260d",
+                        chunk_size=75,
+                        pause=1.0,
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
