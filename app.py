@@ -19,7 +19,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v4.2 (Best 1 First + Reward-Adjusted Continuation)")
+st.title("🎯 NextDay Scanner Pro v4.3 (Best 1 First + Reward-Adjusted Continuation)")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
