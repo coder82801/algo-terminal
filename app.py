@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import alpaca_trade_api as tradeapi
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -29,6 +28,8 @@ env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
 st.sidebar.header("Alpaca API (Paper)")
 api_key = st.sidebar.text_input("API Key ID", value=env_api_key, type="password")
 secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="password")
+
+st.sidebar.caption("Günlük veri kaynağı: Önce Alpaca historical bars, eksik kalırsa Yahoo fallback.")
 
 
 # ============================================================
@@ -64,12 +65,92 @@ def format_price(x: float) -> str:
 
 
 def get_api(api_key_value, secret_key_value):
+    try:
+        import alpaca_trade_api as tradeapi
+    except ImportError as exc:
+        raise RuntimeError("alpaca-trade-api paketi kurulu değil.") from exc
+
     return tradeapi.REST(
         key_id=api_key_value,
         secret_key=secret_key_value,
         base_url="https://paper-api.alpaca.markets",
         api_version="v2",
     )
+
+
+def _normalize_yf_period(period: str) -> str:
+    supported = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
+    if period in supported:
+        return period
+    if isinstance(period, str) and period.endswith("d"):
+        try:
+            days = int(period[:-1])
+            if days >= 200:
+                return "1y"
+            if days >= 120:
+                return "6mo"
+            if days >= 60:
+                return "3mo"
+        except Exception:
+            pass
+    return "1y"
+
+
+def _alpaca_headers(api_key_value: str, secret_key_value: str) -> dict:
+    return {
+        "APCA-API-KEY-ID": api_key_value,
+        "APCA-API-SECRET-KEY": secret_key_value,
+    }
+
+
+def fetch_alpaca_daily_single(symbol: str, api_key_value: str, secret_key_value: str, feed: str = "iex") -> pd.DataFrame:
+    if not api_key_value or not secret_key_value:
+        return pd.DataFrame()
+
+    start = (datetime.now(ZoneInfo("UTC")) - pd.Timedelta(days=430)).strftime("%Y-%m-%dT00:00:00Z")
+    end = (datetime.now(ZoneInfo("UTC")) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Day",
+        "start": start,
+        "end": end,
+        "adjustment": "raw",
+        "limit": 1000,
+        "feed": feed or "iex",
+    }
+
+    try:
+        res = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params=params, timeout=20)
+        if res.status_code != 200:
+            log_debug(f"Alpaca daily {symbol} -> HTTP {res.status_code}: {res.text[:200]}")
+            return pd.DataFrame()
+
+        payload = res.json()
+        bars = payload.get("bars", [])
+        if not bars:
+            return pd.DataFrame()
+
+        rows = []
+        for bar in bars:
+            rows.append({
+                "Date": pd.to_datetime(bar.get("t"), utc=True),
+                "Open": safe_float(bar.get("o")),
+                "High": safe_float(bar.get("h")),
+                "Low": safe_float(bar.get("l")),
+                "Close": safe_float(bar.get("c")),
+                "Volume": safe_float(bar.get("v")),
+            })
+
+        df = pd.DataFrame(rows).dropna()
+        if df.empty:
+            return df
+
+        df = df.set_index("Date").sort_index()
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as exc:
+        log_debug(f"Alpaca daily fetch error for {symbol}: {exc}")
+        return pd.DataFrame()
 
 
 def normalize_symbol_for_yahoo(symbol: str) -> str:
@@ -655,19 +736,56 @@ def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd
 # ============================================================
 # YFINANCE VERİ İNDİRME
 # ============================================================
-@st.cache_data(ttl=900)
-def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_size: int = 10, pause: float = 2.0):
+@st.cache_data(ttl=300)
+def download_daily_data_chunked(
+    tickers: list[str],
+    period: str = "220d",
+    chunk_size: int = 10,
+    pause: float = 2.0,
+    alpaca_key: str = "",
+    alpaca_secret: str = "",
+    alpaca_feed: str = "iex",
+):
     if not tickers:
         return {}
 
     data_dict = {}
+    yf_period = _normalize_yf_period(period)
 
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i + chunk_size]
+    def _single_yf_fetch(ticker: str):
+        try:
+            sub = yf.download(
+                tickers=ticker,
+                period=yf_period,
+                progress=False,
+                threads=False,
+                auto_adjust=False,
+                group_by="ticker",
+            )
+            if sub is not None and not sub.empty:
+                sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if not sub.empty:
+                    return sub
+        except Exception as exc:
+            log_debug(f"Single Yahoo fetch error for {ticker}: {exc}")
+        return pd.DataFrame()
+
+    # 1) Önce Alpaca varsa oradan dene (tekli ve stabil)
+    if alpaca_key and alpaca_secret:
+        for ticker in tickers:
+            sub = fetch_alpaca_daily_single(ticker, alpaca_key, alpaca_secret, alpaca_feed)
+            if not sub.empty:
+                data_dict[ticker] = sub
+            time.sleep(0.15)
+
+    # 2) Eksik kalanlar için Yahoo batch
+    remaining = [ticker for ticker in tickers if ticker not in data_dict]
+    for i in range(0, len(remaining), chunk_size):
+        chunk = remaining[i:i + chunk_size]
         try:
             yf_data = yf.download(
                 tickers=chunk,
-                period=period,
+                period=yf_period,
                 progress=False,
                 threads=False,
                 auto_adjust=False,
@@ -684,19 +802,24 @@ def download_daily_data_chunked(tickers: list[str], period: str = "220d", chunk_
                             "Close": yf_data[ticker]["Close"],
                             "Volume": yf_data[ticker]["Volume"],
                         }).dropna()
-
                         if not sub.empty:
                             data_dict[ticker] = sub
                     except Exception:
                         continue
-            else:
-                if len(chunk) == 1:
-                    sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                    if not sub.empty:
-                        data_dict[chunk[0]] = sub
-
+            elif len(chunk) == 1 and yf_data is not None and not yf_data.empty:
+                sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if not sub.empty:
+                    data_dict[chunk[0]] = sub
         except Exception as exc:
-            log_debug(f"Chunk download error: {chunk[:3]}... -> {exc}")
+            log_debug(f"Yahoo chunk download error {chunk[:3]}... -> {exc}")
+
+        # 3) Yahoo batch boş döndüyse tekli Yahoo retry
+        missing = [ticker for ticker in chunk if ticker not in data_dict]
+        for ticker in missing:
+            sub = _single_yf_fetch(ticker)
+            if not sub.empty:
+                data_dict[ticker] = sub
+            time.sleep(0.5)
 
         time.sleep(pause)
 
@@ -1161,12 +1284,15 @@ with tab2:
                 if "SPY" not in yahoo_tickers:
                     yahoo_tickers.append("SPY")
 
-                with st.spinner("2. Aşama: Günlük veriler chunk'lı indiriliyor..."):
+                with st.spinner("2. Aşama: Günlük veriler Alpaca/Yahoo üzerinden indiriliyor..."):
                     data_dict = download_daily_data_chunked(
                         yahoo_tickers,
                         period="220d",
-                        chunk_size=50,
-                        pause=1.0,
+                        chunk_size=10,
+                        pause=2.0,
+                        alpaca_key=api_key,
+                        alpaca_secret=secret_key,
+                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
                     )
 
                 with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
