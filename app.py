@@ -822,6 +822,92 @@ def download_daily_data_chunked(
     return data_dict
 
 
+def fetch_alpaca_intraday_5m(symbol: str, api_key_value: str, secret_key_value: str, feed: str = "iex") -> pd.DataFrame:
+    if not api_key_value or not secret_key_value:
+        return pd.DataFrame()
+
+    end = datetime.now(ZoneInfo("UTC"))
+    start = end - pd.Timedelta(days=7)
+
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "5Min",
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "adjustment": "all",
+        "limit": 10000,
+        "feed": feed or "iex",
+    }
+
+    try:
+        res = requests.get(
+            url,
+            headers=_alpaca_headers(api_key_value, secret_key_value),
+            params=params,
+            timeout=20,
+        )
+        if res.status_code != 200:
+            log_debug(f"Alpaca intraday {symbol} -> HTTP {res.status_code}: {res.text[:200]}")
+            return pd.DataFrame()
+
+        payload = res.json()
+        bars = payload.get("bars", [])
+        if not bars:
+            return pd.DataFrame()
+
+        rows = []
+        for bar in bars:
+            rows.append({
+                "Date": pd.to_datetime(bar.get("t"), utc=True),
+                "Open": safe_float(bar.get("o")),
+                "High": safe_float(bar.get("h")),
+                "Low": safe_float(bar.get("l")),
+                "Close": safe_float(bar.get("c")),
+                "Volume": safe_float(bar.get("v")),
+            })
+
+        df = pd.DataFrame(rows).dropna()
+        if df.empty:
+            return df
+
+        df = df.set_index("Date").sort_index()
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as exc:
+        log_debug(f"Alpaca intraday fetch error for {symbol}: {exc}")
+        return pd.DataFrame()
+
+
+def pick_last_valid_regular_day(intraday_df: pd.DataFrame, min_regular_bars: int = 50) -> pd.DataFrame:
+    """Regular session barları gerçekten olan en son geçerli günü seçer."""
+    if intraday_df is None or intraday_df.empty:
+        return pd.DataFrame()
+
+    df = intraday_df.copy()
+    idx = df.index
+    try:
+        et_index = idx.tz_convert("America/New_York")
+    except Exception:
+        try:
+            et_index = idx.tz_localize("America/New_York")
+        except Exception:
+            et_index = idx
+
+    unique_days = sorted(pd.Index(et_index.date).unique(), reverse=True)
+    if len(unique_days) == 0:
+        return pd.DataFrame()
+
+    for day in unique_days:
+        mask = pd.Index(et_index.date) == day
+        sub = df.loc[mask].copy()
+        if sub.empty:
+            continue
+        _, regular_df, _ = split_sessions(sub)
+        if not regular_df.empty and len(regular_df) >= min_regular_bars and regular_df["Volume"].fillna(0).sum() > 0:
+            return sub
+
+    return pd.DataFrame()
+
+
 def _extract_last_active_day(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -849,17 +935,28 @@ def _extract_last_active_day(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=300)
-def get_intraday_session_data(ticker: str):
+@st.cache_data(ttl=120)
+def get_intraday_session_data(
+    symbol: str,
+    yahoo_symbol: str,
+    api_key_value: str = "",
+    secret_key_value: str = "",
+    alpaca_feed: str = "iex",
+):
+    intraday = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
+    intraday = pick_last_valid_regular_day(intraday)
+    if not intraday.empty:
+        return intraday
+
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(yahoo_symbol)
         intraday = stock.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
         if intraday.empty:
             return pd.DataFrame()
-        intraday = _extract_last_active_day(intraday)
+        intraday = pick_last_valid_regular_day(intraday)
         return intraday
     except Exception as exc:
-        log_debug(f"Intraday data error for {ticker}: {exc}")
+        log_debug(f"Intraday data error for {symbol}/{yahoo_symbol}: {exc}")
         return pd.DataFrame()
 
 
@@ -976,9 +1073,24 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             df["OBV"] = pd.Series(obv, index=df.index).cumsum()
             obv_slope_10 = df["OBV"].iloc[-1] - df["OBV"].iloc[-10]
 
-            intraday = get_intraday_session_data(yahoo_symbol)
+            intraday = get_intraday_session_data(
+                symbol=symbol,
+                yahoo_symbol=yahoo_symbol,
+                api_key_value=api_key,
+                secret_key_value=secret_key,
+                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+            )
+
+            if intraday.empty:
+                rejected_log.append({"Hisse": symbol, "Neden": "Intraday veri yok / geçerli regular session bulunamadı"})
+                continue
+
             _, regular_df, _ = split_sessions(intraday)
-            regular_vwap = calc_session_vwap(regular_df) if not regular_df.empty else np.nan
+            if regular_df.empty or len(regular_df) < 50:
+                rejected_log.append({"Hisse": symbol, "Neden": "Regular session barları yetersiz"})
+                continue
+
+            regular_vwap = calc_session_vwap(regular_df)
 
             if pd.isna(regular_vwap) or regular_vwap <= 0:
                 rejected_log.append({"Hisse": symbol, "Neden": "Regular VWAP hesaplanamadı"})
