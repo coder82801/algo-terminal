@@ -31,6 +31,10 @@ secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="pas
 
 st.sidebar.caption("Günlük veri kaynağı: Önce Alpaca historical bars, eksik kalırsa Yahoo fallback.")
 
+# Core guardrails
+MAX_EXTENSION_ABOVE_BREAKOUT_PCT = 0.08   # %8 üstü: breakout değil, extended kabul et
+MAX_CONTINUATION_EXTENSION_PCT = 0.06     # continuation için daha sıkı üst sınır
+
 
 # ============================================================
 # YARDIMCI FONKSİYONLAR
@@ -115,7 +119,7 @@ def fetch_alpaca_daily_single(symbol: str, api_key_value: str, secret_key_value:
         "timeframe": "1Day",
         "start": start,
         "end": end,
-        "adjustment": "raw",
+        "adjustment": "all",
         "limit": 1000,
         "feed": feed or "iex",
     }
@@ -226,17 +230,10 @@ def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: fl
 # ÇOKLU SEANS VWAP FONKSİYONLARI
 # ============================================================
 def split_sessions(intraday_df: pd.DataFrame):
-    """
-    5 dakikalık veriyi ET saatine göre üçe ayırır:
-    - premarket: 04:00 - 09:30
-    - regular:   09:30 - 16:00
-    - afterhours:16:00 - 20:00
-    """
     if intraday_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df = intraday_df.copy()
-
     idx = df.index
     try:
         et_times = idx.tz_convert("America/New_York")
@@ -318,12 +315,6 @@ def get_active_session_et():
 
 
 def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
-    """
-    Aktif seansa göre karar:
-    - AL (VWAP DESTEK)
-    - BEKLE
-    - UZAK DUR
-    """
     if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
         return {
             "signal": "NÖTR",
@@ -409,36 +400,41 @@ def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None
 # ============================================================
 # YENİ: ENTRY TYPE + MOVE TYPE ENGINE
 # ============================================================
+def close_enough(value: float, threshold: float) -> bool:
+    try:
+        return value <= threshold
+    except Exception:
+        return False
+
+
 def classify_entry_type(
     close_above_vwap: bool,
-    breakout_dist: float,
+    dist_below_breakout: float,
+    extension_above_breakout: float,
     rvol20: float,
     gap_pct: float,
     closing_strength: float,
     atr5: float,
     atr20: float,
 ):
-    """
-    breakout_dist = prior_20d_high'a uzaklık (oran)
-    """
     if not close_above_vwap:
         return "WEAK"
 
+    if extension_above_breakout > MAX_EXTENSION_ABOVE_BREAKOUT_PCT:
+        return "EXTENDED"
+
     atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.10
 
-    if breakout_dist <= 0.02 and rvol20 >= 2.0 and closing_strength >= 0.70:
+    if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03 and rvol20 >= 2.0 and closing_strength >= 0.70:
         return "BREAKOUT"
 
-    if 0.02 < breakout_dist <= 0.05 and rvol20 >= 1.5 and closing_strength >= 0.60:
+    if 0.02 < dist_below_breakout <= 0.05 and extension_above_breakout <= 0.02 and rvol20 >= 1.5 and closing_strength >= 0.60:
         return "MICRO_PULLBACK"
 
-    if breakout_dist > 0.05 and close_above_vwap and gap_pct >= 0:
+    if close_above_vwap and extension_above_breakout <= 0.02 and gap_pct >= 0 and closing_strength >= 0.60:
         return "VWAP_PULLBACK"
 
-    if close_above_vwap and (breakout_dist <= 0.02) and gap_pct >= 5 and atr_expanding:
-        return "BREAKOUT"
-
-    if close_above_vwap and breakout_dist < 0.01 and rvol20 >= 3:
+    if close_above_vwap and dist_below_breakout <= 0.01 and extension_above_breakout <= 0.03 and rvol20 >= 3 and atr_expanding:
         return "BREAKOUT"
 
     return "EXTENDED"
@@ -449,7 +445,8 @@ def classify_move_type(
     rvol20: float,
     closing_strength: float,
     obv_slope_10: float,
-    breakout_dist: float,
+    dist_below_breakout: float,
+    extension_above_breakout: float,
     atr5: float,
     atr20: float,
     last_close: float,
@@ -458,23 +455,19 @@ def classify_move_type(
     atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.15
     trend_ok = pd.notna(sma50) and last_close > sma50
 
+    if extension_above_breakout > 0.10:
+        return "WEAK_MOVE"
+
     if gap_pct >= 3.0 and rvol20 >= 2.0 and closing_strength >= 0.75 and obv_slope_10 > 0:
         return "NEWS_DRIVEN"
 
-    if rvol20 >= 4.0 and atr_expanding and closing_strength >= 0.70 and breakout_dist <= 0.03:
+    if rvol20 >= 4.0 and atr_expanding and closing_strength >= 0.70 and dist_below_breakout <= 0.03 and extension_above_breakout <= 0.05:
         return "SHORT_SQUEEZE"
 
-    if close_enough(breakout_dist, 0.05) and rvol20 >= 1.5 and trend_ok and obv_slope_10 > 0:
+    if close_enough(dist_below_breakout, 0.05) and extension_above_breakout <= 0.05 and rvol20 >= 1.5 and trend_ok and obv_slope_10 > 0:
         return "TECHNICAL_MOMENTUM"
 
     return "WEAK_MOVE"
-
-
-def close_enough(value: float, threshold: float) -> bool:
-    try:
-        return value <= threshold
-    except Exception:
-        return False
 
 
 def compute_confidence_score(
@@ -482,7 +475,8 @@ def compute_confidence_score(
     closing_strength: float,
     close_above_vwap: bool,
     rs_positive: bool,
-    breakout_dist: float,
+    dist_below_breakout: float,
+    extension_above_breakout: float,
     move_type: str,
     entry_type: str,
 ):
@@ -512,10 +506,15 @@ def compute_confidence_score(
     if rs_positive:
         score += 10
 
-    if breakout_dist <= 0.02:
+    if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03:
         score += 12
-    elif breakout_dist <= 0.05:
+    elif dist_below_breakout <= 0.05 and extension_above_breakout <= 0.05:
         score += 6
+
+    if extension_above_breakout > 0.08:
+        score -= 12
+    elif extension_above_breakout > 0.05:
+        score -= 6
 
     if move_type == "NEWS_DRIVEN":
         score += 12
@@ -770,7 +769,6 @@ def download_daily_data_chunked(
             log_debug(f"Single Yahoo fetch error for {ticker}: {exc}")
         return pd.DataFrame()
 
-    # 1) Önce Alpaca varsa oradan dene (tekli ve stabil)
     if alpaca_key and alpaca_secret:
         for ticker in tickers:
             sub = fetch_alpaca_daily_single(ticker, alpaca_key, alpaca_secret, alpaca_feed)
@@ -778,7 +776,6 @@ def download_daily_data_chunked(
                 data_dict[ticker] = sub
             time.sleep(0.15)
 
-    # 2) Eksik kalanlar için Yahoo batch
     remaining = [ticker for ticker in tickers if ticker not in data_dict]
     for i in range(0, len(remaining), chunk_size):
         chunk = remaining[i:i + chunk_size]
@@ -813,7 +810,6 @@ def download_daily_data_chunked(
         except Exception as exc:
             log_debug(f"Yahoo chunk download error {chunk[:3]}... -> {exc}")
 
-        # 3) Yahoo batch boş döndüyse tekli Yahoo retry
         missing = [ticker for ticker in chunk if ticker not in data_dict]
         for ticker in missing:
             sub = _single_yf_fetch(ticker)
@@ -826,17 +822,72 @@ def download_daily_data_chunked(
     return data_dict
 
 
+def _extract_last_active_day(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    idx = out.index
+    try:
+        et_index = idx.tz_convert("America/New_York")
+    except Exception:
+        try:
+            et_index = idx.tz_localize("America/New_York")
+        except Exception:
+            et_index = idx
+
+    out["et_index"] = et_index
+    out["et_date"] = pd.Index(et_index.date)
+
+    valid_dates = list(pd.Series(out["et_date"]).dropna().unique())
+    if not valid_dates:
+        return pd.DataFrame()
+
+    last_day = valid_dates[-1]
+    out = out[out["et_date"] == last_day].copy()
+    out = out.drop(columns=["et_index", "et_date"], errors="ignore")
+    return out
+
+
 @st.cache_data(ttl=300)
 def get_intraday_session_data(ticker: str):
     try:
         stock = yf.Ticker(ticker)
-        intraday = stock.history(period="1d", interval="5m", prepost=True, auto_adjust=False)
+        intraday = stock.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
         if intraday.empty:
             return pd.DataFrame()
+        intraday = _extract_last_active_day(intraday)
         return intraday
     except Exception as exc:
         log_debug(f"Intraday data error for {ticker}: {exc}")
         return pd.DataFrame()
+
+
+def _get_spy_return_10d(data_dict: dict, alpaca_key: str, alpaca_secret: str, alpaca_feed: str) -> tuple[float, bool]:
+    spy_df = data_dict.get("SPY")
+    if spy_df is not None and not spy_df.empty and len(spy_df) >= 11:
+        ret = (float(spy_df["Close"].iloc[-1]) - float(spy_df["Close"].iloc[-10])) / float(spy_df["Close"].iloc[-10])
+        return ret, True
+
+    log_debug("SPY verisi eksik; tekrar indiriliyor...")
+
+    if alpaca_key and alpaca_secret:
+        spy_df = fetch_alpaca_daily_single("SPY", alpaca_key, alpaca_secret, alpaca_feed)
+        if not spy_df.empty and len(spy_df) >= 11:
+            ret = (float(spy_df["Close"].iloc[-1]) - float(spy_df["Close"].iloc[-10])) / float(spy_df["Close"].iloc[-10])
+            return ret, True
+
+    try:
+        spy = yf.download("SPY", period="1mo", progress=False, threads=False, auto_adjust=False)
+        if spy is not None and not spy.empty:
+            close = spy["Close"].dropna()
+            if len(close) >= 11:
+                ret = (float(close.iloc[-1]) - float(close.iloc[-10])) / float(close.iloc[-10])
+                return ret, True
+    except Exception as exc:
+        log_debug(f"SPY retry failed: {exc}")
+
+    return 0.0, False
 
 
 # ============================================================
@@ -849,10 +900,15 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
     if tv_candidates_df.empty:
         return final_candidates, rejected_log
 
-    spy_df = data_dict.get("SPY")
-    spy_ret_10d = 0.0
-    if spy_df is not None and len(spy_df) >= 11:
-        spy_ret_10d = (spy_df["Close"].iloc[-1] - spy_df["Close"].iloc[-10]) / spy_df["Close"].iloc[-10]
+    spy_ret_10d, spy_ok = _get_spy_return_10d(
+        data_dict=data_dict,
+        alpaca_key=api_key,
+        alpaca_secret=secret_key,
+        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+    )
+
+    if not spy_ok:
+        log_debug("SPY verisi sağlıklı alınamadı; RS metrikleri temkinli çalışacak.")
 
     for _, row in tv_candidates_df.iterrows():
         symbol = row["symbol"]
@@ -863,7 +919,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             df = data_dict.get(yahoo_symbol)
 
             if df is None or df.empty:
-                rejected_log.append({"Hisse": symbol, "Neden": "Yahoo veri yok"})
+                rejected_log.append({"Hisse": symbol, "Neden": "Yahoo/Alpaca günlük veri yok"})
                 continue
 
             if len(df) < 220:
@@ -888,15 +944,18 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             closing_strength = calc_closing_strength(last_close, last_low, last_high)
 
             stock_ret_10d = (df["Close"].iloc[-1] - df["Close"].iloc[-10]) / df["Close"].iloc[-10]
-            rs_positive = stock_ret_10d > spy_ret_10d
-            rs_spread = stock_ret_10d - spy_ret_10d
+            rs_positive = stock_ret_10d > spy_ret_10d if spy_ok else False
+            rs_spread = stock_ret_10d - spy_ret_10d if spy_ok else np.nan
 
             prior_20d_high = df["High"].shift(1).rolling(20).max().iloc[-1]
-            breakout_dist = (
-                (prior_20d_high - last_close) / last_close
-                if pd.notna(prior_20d_high) and prior_20d_high > last_close
-                else 0
-            )
+
+            dist_below_breakout = 0.0
+            extension_above_breakout = 0.0
+            if pd.notna(prior_20d_high) and prior_20d_high > 0:
+                if last_close < prior_20d_high:
+                    dist_below_breakout = (prior_20d_high - last_close) / last_close
+                elif last_close > prior_20d_high:
+                    extension_above_breakout = (last_close - prior_20d_high) / prior_20d_high
 
             sma50 = df["Close"].rolling(50).mean().iloc[-1]
             sma200 = df["Close"].rolling(200).mean().iloc[-1]
@@ -920,8 +979,10 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             intraday = get_intraday_session_data(yahoo_symbol)
             _, regular_df, _ = split_sessions(intraday)
             regular_vwap = calc_session_vwap(regular_df) if not regular_df.empty else np.nan
-            if pd.isna(regular_vwap):
-                regular_vwap = (last_high + last_low + last_close) / 3
+
+            if pd.isna(regular_vwap) or regular_vwap <= 0:
+                rejected_log.append({"Hisse": symbol, "Neden": "Regular VWAP hesaplanamadı"})
+                continue
 
             close_above_vwap = last_close > regular_vwap
 
@@ -976,11 +1037,14 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     score += 4
                     notes.append("ATR genişliyor")
 
-            if breakout_dist <= 0.02:
+            if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03:
                 score += 10
-                notes.append("Kırılıma <%2")
-            elif breakout_dist <= 0.05:
+                notes.append("Kırılıma yakın")
+            elif dist_below_breakout <= 0.05 and extension_above_breakout <= 0.05:
                 score += 4
+            elif extension_above_breakout > 0.08:
+                score -= 10
+                notes.append("Aşırı uzamış")
 
             if obv_slope_10 > 0:
                 score += 6
@@ -996,7 +1060,9 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     and closing_strength >= 0.75
                     and close_above_vwap
                     and rs_positive
-                    and breakout_dist <= 0.02
+                    and obv_slope_10 > 0
+                    and dist_below_breakout <= 0.02
+                    and extension_above_breakout <= 0.03
                 ):
                     category = "Breakout"
 
@@ -1008,6 +1074,10 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     and close_above_vwap
                     and pd.notna(closing_strength)
                     and closing_strength >= 0.70
+                    and rs_positive
+                    and obv_slope_10 > 0
+                    and extension_above_breakout <= MAX_CONTINUATION_EXTENSION_PCT
+                    and (dist_below_breakout <= 0.03 or extension_above_breakout <= 0.05)
                 ):
                     category = "Continuation"
 
@@ -1024,12 +1094,10 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     category = "Accumulation"
 
             if category:
-                # ====================================================
-                # ENTRY TYPE + MOVE TYPE + CONFIDENCE
-                # ====================================================
                 entry_type = classify_entry_type(
                     close_above_vwap=close_above_vwap,
-                    breakout_dist=breakout_dist,
+                    dist_below_breakout=dist_below_breakout,
+                    extension_above_breakout=extension_above_breakout,
                     rvol20=rvol20 if pd.notna(rvol20) else 0,
                     gap_pct=gap_pct,
                     closing_strength=closing_strength if pd.notna(closing_strength) else 0,
@@ -1042,7 +1110,8 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     rvol20=rvol20 if pd.notna(rvol20) else 0,
                     closing_strength=closing_strength if pd.notna(closing_strength) else 0,
                     obv_slope_10=obv_slope_10,
-                    breakout_dist=breakout_dist,
+                    dist_below_breakout=dist_below_breakout,
+                    extension_above_breakout=extension_above_breakout,
                     atr5=atr5,
                     atr20=atr20,
                     last_close=last_close,
@@ -1054,16 +1123,20 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     closing_strength=closing_strength if pd.notna(closing_strength) else 0,
                     close_above_vwap=close_above_vwap,
                     rs_positive=rs_positive,
-                    breakout_dist=breakout_dist,
+                    dist_below_breakout=dist_below_breakout,
+                    extension_above_breakout=extension_above_breakout,
                     move_type=move_type,
                     entry_type=entry_type,
                 )
 
-                # ====================================================
-                # ENTRY / STOP / TP — DÜZELTİLMİŞ RİSK MANTIĞI
-                # ====================================================
                 if entry_type == "BREAKOUT":
-                    entry_idea = round(max(last_close, prior_20d_high * 1.002), 4) if pd.notna(prior_20d_high) else round(last_close, 4)
+                    if pd.notna(prior_20d_high):
+                        if last_close > prior_20d_high:
+                            entry_idea = round(last_close * 1.001, 4)
+                        else:
+                            entry_idea = round(max(last_close, prior_20d_high * 1.002), 4)
+                    else:
+                        entry_idea = round(last_close, 4)
                 elif entry_type == "MICRO_PULLBACK":
                     entry_idea = round(max(regular_vwap * 1.01, last_close * 0.995), 4)
                 elif entry_type == "VWAP_PULLBACK":
@@ -1082,7 +1155,6 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     stop_price = round(entry_idea * 0.95, 4)
 
                 stop_limit_price = dynamic_stop_limit(stop_price)
-
                 risk = max(entry_idea - stop_price, 0.01)
 
                 if entry_type == "BREAKOUT":
@@ -1110,10 +1182,11 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Close": round(last_close, 4 if last_close < 1 else 2),
                         "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
                         "Close_Strength": round(closing_strength, 2) if pd.notna(closing_strength) else np.nan,
-                        "Dist_to_High_%": round(breakout_dist * 100, 2),
+                        "Dist_to_High_%": round(dist_below_breakout * 100, 2),
+                        "Extension_Above_High_%": round(extension_above_breakout * 100, 2),
                         "VWAP_Regular": round(regular_vwap, 4 if regular_vwap < 1 else 2),
                         "Above_VWAP": bool(close_above_vwap),
-                        "RS_10d_minus_SPY_%": round(rs_spread * 100, 2),
+                        "RS_10d_minus_SPY_%": round(rs_spread * 100, 2) if pd.notna(rs_spread) else np.nan,
                         "ATR14": round(atr14, 4 if pd.notna(atr14) and atr14 < 1 else 2) if pd.notna(atr14) else np.nan,
                         "Gap_%": round(gap_pct, 2),
                         "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
@@ -1144,7 +1217,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
 
 
 # ============================================================
-# TOP 10 -> EN İYİ 3
+# TOP 3
 # ============================================================
 def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     if candidates_df.empty:
@@ -1156,6 +1229,7 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df["close_strength_score"] = df["Close_Strength"].fillna(0).clip(0, 1)
     df["vwap_score"] = np.where(df["Above_VWAP"] == True, 1.0, 0.0)
     df["breakout_score"] = 1 - np.minimum(df["Dist_to_High_%"].fillna(999) / 3.0, 1.0)
+    df["extension_penalty"] = np.where(df["Extension_Above_High_%"].fillna(0) > 5, -0.12, 0.0)
     df["compression_score"] = np.where(df["Dist_to_High_%"].fillna(99) <= 2.0, 0.8, 0.5)
     df["rs_score"] = np.clip(df["RS_10d_minus_SPY_%"].fillna(0) / 10.0, 0, 1)
     df["clean_chart"] = np.where(df["Close_Strength"].fillna(0) >= 0.7, 1.0, 0.5)
@@ -1189,14 +1263,16 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         0.08 * df["clean_chart"] +
         0.07 * df["confidence_score"] +
         df["entry_bonus"] +
-        df["move_bonus"]
+        df["move_bonus"] +
+        df["extension_penalty"]
     )
 
     df = df[
         (df["RVOL"].fillna(0) >= 1.5) &
         (df["Close_Strength"].fillna(0) >= 0.6) &
         (df["Above_VWAP"] == True) &
-        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0)
+        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0) &
+        (df["Extension_Above_High_%"].fillna(999) <= 8.0)
     ]
 
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
@@ -1310,13 +1386,13 @@ with tab2:
                     st.subheader("🏆 Top 10 Aday")
                     st.dataframe(final_df.head(10), use_container_width=True)
 
-                    top3_df = rank_top3(final_df.head(10))
+                    top3_df = rank_top3(final_df)
 
                     st.subheader("🥇 En İyi 3")
                     if not top3_df.empty:
                         st.dataframe(top3_df, use_container_width=True)
                     else:
-                        st.warning("Top 10 içinden entry-ready 3 hisse çıkmadı.")
+                        st.warning("Final havuzundan entry-ready 3 hisse çıkmadı.")
 
                     csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
@@ -1364,10 +1440,10 @@ with tab3:
                 try:
                     yahoo_symbol = normalize_symbol_for_yahoo(ticker_input)
 
-                    stock = yf.Ticker(yahoo_symbol)
-                    intraday = stock.history(period="1d", interval="5m", prepost=True, auto_adjust=False)
-
-                    daily_dict = download_daily_data_chunked([yahoo_symbol], period="260d", chunk_size=1, pause=0)
+                    intraday = get_intraday_session_data(yahoo_symbol)
+                    daily_dict = download_daily_data_chunked([yahoo_symbol], period="260d", chunk_size=1, pause=0,
+                                                           alpaca_key=api_key, alpaca_secret=secret_key,
+                                                           alpaca_feed=os.getenv("ALPACA_FEED", "iex"))
                     daily_df = daily_dict.get(yahoo_symbol, pd.DataFrame())
 
                     if intraday.empty or daily_df.empty:
@@ -1565,4 +1641,3 @@ st.caption(
     "Bu araç yatırım tavsiyesi değildir. Önce paper trading ile test edilmesi gerekir. "
     "Dış veri kaynaklarında rate-limit ve veri uyuşmazlığı olabilir."
 )
-
