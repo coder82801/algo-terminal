@@ -31,6 +31,11 @@ secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="pas
 
 st.sidebar.caption("Günlük veri kaynağı: Önce Alpaca historical bars, eksik kalırsa Yahoo fallback.")
 
+st.sidebar.divider()
+st.sidebar.header("Son Filtre")
+REJECT_EXTENDED = st.sidebar.checkbox("EXTENDED adayları ele", value=True)
+MIN_FINAL_CONFIDENCE = st.sidebar.slider("Min nihai confidence", min_value=0, max_value=100, value=60, step=5)
+
 # Core guardrails
 MAX_EXTENSION_ABOVE_BREAKOUT_PCT = 0.08   # %8 üstü: breakout değil, extended kabul et
 MAX_CONTINUATION_EXTENSION_PCT = 0.06     # continuation için daha sıkı üst sınır
@@ -1240,6 +1245,14 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     move_type=move_type,
                     entry_type=entry_type,
                 )
+
+                if REJECT_EXTENDED and entry_type == "EXTENDED":
+                    rejected_log.append({"Hisse": symbol, "Neden": "Entry_Type=EXTENDED"})
+                    continue
+
+                if confidence < MIN_FINAL_CONFIDENCE:
+                    rejected_log.append({"Hisse": symbol, "Neden": f"Confidence<{MIN_FINAL_CONFIDENCE}"})
+                    continue
 
                 if entry_type == "BREAKOUT":
                     if pd.notna(prior_20d_high):
