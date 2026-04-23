@@ -1407,12 +1407,419 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
     return df.head(3)
 
 
+
+# ============================================================
+# INTRADAY TRADE ENGINE
+# ============================================================
+def calc_ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calc_macd(series: pd.Series):
+    ema12 = calc_ema(series, 12)
+    ema26 = calc_ema(series, 26)
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
+    return macd, signal, hist
+
+
+def calc_intraday_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    temp = df.copy()
+    prev_close = temp['Close'].shift(1)
+    tr = pd.concat([
+        temp['High'] - temp['Low'],
+        (temp['High'] - prev_close).abs(),
+        (temp['Low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def detect_intraday_setup(features: dict) -> str:
+    if features['close_above_vwap'] and features['opening_range_break'] and features['ema9_above_ema20'] and features['macd_hist_positive']:
+        if features['gap_pct'] >= 2 and features['session_rvol'] >= 0.20 and features['price_to_day_high_pct'] >= -1.5:
+            return 'OPEN_DRIVE_BREAKOUT'
+
+    if features['close_above_vwap'] and features['ema9_above_ema20'] and features['macd_hist_positive']:
+        if features['first_pullback_hold'] and features['price_to_vwap_pct'] >= -0.3 and features['price_to_ema9_pct'] >= -0.5:
+            return 'FIRST_PULLBACK'
+
+    if features['close_above_vwap'] and features['macd_hist_positive'] and features['ema9_above_ema20']:
+        if features['vwap_reclaim'] and features['price_to_day_high_pct'] >= -3.0:
+            return 'VWAP_RECLAIM'
+
+    return 'NO_SETUP'
+
+
+def intraday_confidence_score(features: dict, setup_type: str) -> int:
+    score = 0
+
+    if features['session_rvol'] >= 0.50:
+        score += 18
+    elif features['session_rvol'] >= 0.30:
+        score += 14
+    elif features['session_rvol'] >= 0.20:
+        score += 10
+
+    if features['close_above_vwap']:
+        score += 12
+    if features['ema9_above_ema20']:
+        score += 10
+    if features['ema20_above_ema50']:
+        score += 8
+    if features['macd_hist_positive']:
+        score += 10
+
+    rsi = features['rsi14']
+    if pd.notna(rsi):
+        if 58 <= rsi <= 75:
+            score += 10
+        elif 52 <= rsi < 58:
+            score += 6
+        elif rsi > 82:
+            score -= 8
+
+    if features['opening_range_break']:
+        score += 10
+    if features['first_pullback_hold']:
+        score += 8
+    if features['vwap_reclaim']:
+        score += 8
+
+    if features['gap_pct'] >= 5:
+        score += 8
+    elif features['gap_pct'] >= 2:
+        score += 5
+
+    if features['rs_vs_spy_intraday_pct'] >= 3:
+        score += 8
+    elif features['rs_vs_spy_intraday_pct'] >= 1:
+        score += 4
+
+    if features['price_to_day_high_pct'] < -4:
+        score -= 10
+    elif features['price_to_day_high_pct'] < -2:
+        score -= 5
+
+    if setup_type == 'OPEN_DRIVE_BREAKOUT':
+        score += 10
+    elif setup_type == 'FIRST_PULLBACK':
+        score += 8
+    elif setup_type == 'VWAP_RECLAIM':
+        score += 6
+    else:
+        score -= 20
+
+    return max(0, min(100, int(round(score))))
+
+
+def compute_intraday_trade_levels(features: dict, setup_type: str) -> dict:
+    price = features['last_price']
+    vwap = features['session_vwap']
+    ema9 = features['ema9']
+    atr5m = features['atr5m']
+    opening_range_high = features['opening_range_high']
+    opening_range_low = features['opening_range_low']
+    intraday_low = features['day_low']
+
+    if pd.isna(atr5m) or atr5m <= 0:
+        atr5m = max(price * 0.01, 0.05)
+
+    if setup_type == 'OPEN_DRIVE_BREAKOUT':
+        trigger = max(x for x in [price, opening_range_high, features['premarket_high']] if pd.notna(x))
+        entry = round(trigger * 1.001, 4)
+        anchor = max(vwap, opening_range_low) if pd.notna(opening_range_low) else vwap
+        stop = round(max(anchor - 0.6 * atr5m, entry * 0.97), 4)
+        rr1, rr2 = 1.2, 2.4
+    elif setup_type == 'FIRST_PULLBACK':
+        anchor_entry = max(x for x in [vwap, ema9, price] if pd.notna(x))
+        entry = round(anchor_entry * 1.001, 4)
+        anchor = max(x for x in [vwap, intraday_low, opening_range_low] if pd.notna(x))
+        stop = round(max(anchor - 0.5 * atr5m, entry * 0.975), 4)
+        rr1, rr2 = 1.0, 2.0
+    elif setup_type == 'VWAP_RECLAIM':
+        entry = round(max(price, vwap) * 1.001, 4)
+        stop = round(max(vwap - 0.7 * atr5m, entry * 0.972), 4)
+        rr1, rr2 = 1.0, 2.0
+    else:
+        return {'entry': None, 'stop': None, 'tp1': None, 'tp2': None}
+
+    if stop >= entry:
+        stop = round(entry * 0.975, 4)
+
+    risk = max(entry - stop, 0.01)
+    tp1 = round(entry + rr1 * risk, 4)
+    tp2 = round(entry + rr2 * risk, 4)
+    return {'entry': entry, 'stop': stop, 'tp1': tp1, 'tp2': tp2}
+
+
+@st.cache_data(ttl=30)
+def fetch_intraday_trade_universe(session_name: str, max_records: int = 30, min_price: float = 1.0, max_price: float = 100.0):
+    if session_name == 'premarket':
+        sort_field = 'premarket_change'
+        vol_field = 'premarket_volume'
+        price_field = 'premarket_close'
+        min_vol = 50000
+    elif session_name == 'afterhours':
+        sort_field = 'postmarket_change'
+        vol_field = 'postmarket_volume'
+        price_field = 'postmarket_close'
+        min_vol = 50000
+    else:
+        sort_field = 'change'
+        vol_field = 'volume'
+        price_field = 'close'
+        min_vol = 150000
+
+    filters = [
+        {'left': price_field, 'operation': 'in_range', 'right': [min_price, max_price]},
+        {'left': vol_field, 'operation': 'greater', 'right': min_vol},
+        {'left': 'exchange', 'operation': 'in_range', 'right': ['NASDAQ', 'NYSE', 'AMEX']},
+    ]
+
+    columns = ['name', 'description', price_field, sort_field, vol_field, 'market_cap_basic']
+    raw = tradingview_scan(filters, columns, sort_field, max_records=max_records, page_size=min(100, max_records))
+
+    rows = []
+    seen = set()
+    for item in raw:
+        try:
+            d = item['d']
+            symbol = d[0]
+            description = d[1] or ''
+            if not symbol or symbol in seen:
+                continue
+            if is_likely_non_common_stock(symbol, description):
+                continue
+            seen.add(symbol)
+            rows.append({
+                'symbol': symbol,
+                'yahoo_symbol': normalize_symbol_for_yahoo(symbol),
+                'description': description,
+                'live_price': safe_float(d[2], np.nan),
+                'live_change_pct': safe_float(d[3], np.nan),
+                'live_volume': safe_float(d[4], np.nan),
+                'market_cap': safe_float(d[5], np.nan) if len(d) > 5 else np.nan,
+            })
+        except Exception as exc:
+            log_debug(f'Intraday universe parse error: {exc}')
+    return pd.DataFrame(rows)
+
+
+def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFrame, spy_daily_df: pd.DataFrame, intraday_df: pd.DataFrame) -> dict | None:
+    if daily_df is None or daily_df.empty or intraday_df is None or intraday_df.empty:
+        return None
+
+    premarket_df, regular_df, afterhours_df = split_sessions(intraday_df)
+    if regular_df.empty or len(regular_df) < 12:
+        return None
+
+    reg = regular_df.copy()
+    reg['EMA9'] = calc_ema(reg['Close'], 9)
+    reg['EMA20'] = calc_ema(reg['Close'], 20)
+    reg['EMA50'] = calc_ema(reg['Close'], 50)
+    macd, macd_signal, macd_hist = calc_macd(reg['Close'])
+    reg['MACD'] = macd
+    reg['MACD_SIGNAL'] = macd_signal
+    reg['MACD_HIST'] = macd_hist
+    reg['RSI14'] = calc_rsi(reg['Close'], 14)
+    reg['ATR5M'] = calc_intraday_atr(reg, 14)
+
+    last = reg.iloc[-1]
+    last_price = float(last['Close'])
+    day_high = float(reg['High'].max())
+    day_low = float(reg['Low'].min())
+    session_vwap = calc_session_vwap(reg)
+    if pd.isna(session_vwap) or session_vwap <= 0:
+        return None
+
+    first3 = reg.iloc[:3].copy()
+    opening_range_high = float(first3['High'].max()) if not first3.empty else np.nan
+    opening_range_low = float(first3['Low'].min()) if not first3.empty else np.nan
+    opening_range_break = bool(len(reg) > 3 and reg.iloc[3:]['High'].max() > opening_range_high) if pd.notna(opening_range_high) else False
+
+    pullback_window = reg.iloc[3:9].copy()
+    first_pullback_hold = False
+    if not pullback_window.empty and pd.notna(opening_range_low):
+        first_pullback_hold = float(pullback_window['Low'].min()) >= max(opening_range_low, session_vwap) * 0.985
+
+    vwap_reclaim = False
+    if len(reg) >= 8:
+        vwap_reclaim = bool((reg['Close'].iloc[:-1] < session_vwap).any() and last_price > session_vwap)
+
+    prev_close = float(daily_df['Close'].iloc[-2]) if len(daily_df) >= 2 else np.nan
+    prev_day_high = float(daily_df['High'].iloc[-2]) if len(daily_df) >= 2 else np.nan
+    gap_pct = ((float(reg['Open'].iloc[0]) - prev_close) / prev_close * 100) if prev_close > 0 else np.nan
+
+    avg_vol_20 = daily_df['Volume'].rolling(20).mean().iloc[-1] if len(daily_df) >= 20 else np.nan
+    session_volume = float(reg['Volume'].sum())
+    session_rvol = (session_volume / avg_vol_20) if pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
+
+    spy_intraday = None
+    spy_last = np.nan
+    spy_prev_close = np.nan
+    if spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2:
+        spy_prev_close = float(spy_daily_df['Close'].iloc[-2])
+        spy_last = float(spy_daily_df['Close'].iloc[-1])
+    rs_vs_spy_intraday_pct = 0.0
+    if prev_close > 0 and pd.notna(spy_prev_close) and spy_prev_close > 0:
+        stock_ret = (last_price - prev_close) / prev_close * 100
+        spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100 if pd.notna(spy_last) else 0.0
+        rs_vs_spy_intraday_pct = stock_ret - spy_ret
+
+    price_to_day_high_pct = ((last_price - day_high) / day_high * 100) if day_high > 0 else np.nan
+    price_to_vwap_pct = ((last_price - session_vwap) / session_vwap * 100) if session_vwap > 0 else np.nan
+    ema9 = float(last['EMA9']) if pd.notna(last['EMA9']) else np.nan
+    ema20 = float(last['EMA20']) if pd.notna(last['EMA20']) else np.nan
+    ema50 = float(last['EMA50']) if pd.notna(last['EMA50']) else np.nan
+    price_to_ema9_pct = ((last_price - ema9) / ema9 * 100) if pd.notna(ema9) and ema9 > 0 else np.nan
+
+    return {
+        'last_price': last_price,
+        'session_vwap': session_vwap,
+        'ema9': ema9,
+        'ema20': ema20,
+        'ema50': ema50,
+        'ema9_above_ema20': bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20),
+        'ema20_above_ema50': bool(pd.notna(ema20) and pd.notna(ema50) and ema20 > ema50),
+        'macd': float(last['MACD']) if pd.notna(last['MACD']) else np.nan,
+        'macd_signal': float(last['MACD_SIGNAL']) if pd.notna(last['MACD_SIGNAL']) else np.nan,
+        'macd_hist': float(last['MACD_HIST']) if pd.notna(last['MACD_HIST']) else np.nan,
+        'macd_hist_positive': bool(pd.notna(last['MACD_HIST']) and last['MACD_HIST'] > 0),
+        'rsi14': float(last['RSI14']) if pd.notna(last['RSI14']) else np.nan,
+        'atr5m': float(last['ATR5M']) if pd.notna(last['ATR5M']) else np.nan,
+        'close_above_vwap': bool(last_price > session_vwap),
+        'opening_range_high': opening_range_high,
+        'opening_range_low': opening_range_low,
+        'opening_range_break': opening_range_break,
+        'first_pullback_hold': first_pullback_hold,
+        'vwap_reclaim': vwap_reclaim,
+        'day_high': day_high,
+        'day_low': day_low,
+        'premarket_high': float(premarket_df['High'].max()) if not premarket_df.empty else np.nan,
+        'premarket_low': float(premarket_df['Low'].min()) if not premarket_df.empty else np.nan,
+        'premarket_volume': float(premarket_df['Volume'].sum()) if not premarket_df.empty else 0.0,
+        'gap_pct': gap_pct,
+        'session_volume': session_volume,
+        'session_rvol': session_rvol,
+        'price_to_day_high_pct': price_to_day_high_pct,
+        'price_to_vwap_pct': price_to_vwap_pct,
+        'price_to_ema9_pct': price_to_ema9_pct,
+        'prev_day_high': prev_day_high,
+        'rs_vs_spy_intraday_pct': rs_vs_spy_intraday_pct,
+    }
+
+
+def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, spy_daily_df: pd.DataFrame):
+    final_candidates = []
+    rejected = []
+
+    for _, row in universe_df.iterrows():
+        symbol = row['symbol']
+        yahoo_symbol = row['yahoo_symbol']
+        daily_df = daily_dict.get(yahoo_symbol)
+        if daily_df is None or daily_df.empty or len(daily_df) < 60:
+            rejected.append({'Hisse': symbol, 'Neden': 'Yetersiz günlük veri'})
+            continue
+
+        intraday_df = get_intraday_session_data(
+            symbol=symbol,
+            yahoo_symbol=yahoo_symbol,
+            api_key_value=api_key,
+            secret_key_value=secret_key,
+            alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
+        )
+        if intraday_df.empty:
+            rejected.append({'Hisse': symbol, 'Neden': 'Intraday veri yok'})
+            continue
+
+        feats = build_intraday_features(symbol, yahoo_symbol, daily_df, spy_daily_df, intraday_df)
+        if feats is None:
+            rejected.append({'Hisse': symbol, 'Neden': 'İntraday feature üretilemedi'})
+            continue
+
+        setup_type = detect_intraday_setup(feats)
+        if setup_type == 'NO_SETUP':
+            rejected.append({'Hisse': symbol, 'Neden': 'Net intraday setup yok'})
+            continue
+
+        confidence = intraday_confidence_score(feats, setup_type)
+        if confidence < 65:
+            rejected.append({'Hisse': symbol, 'Neden': f'Confidence düşük ({confidence})'})
+            continue
+
+        levels = compute_intraday_trade_levels(feats, setup_type)
+        if levels['entry'] is None or levels['stop'] is None:
+            rejected.append({'Hisse': symbol, 'Neden': 'Trade seviyeleri hesaplanamadı'})
+            continue
+
+        risk = max(levels['entry'] - levels['stop'], 0.01)
+        pos = calc_position_size(
+            account_size=2000.0,
+            risk_per_trade_pct=0.02,
+            entry=levels['entry'],
+            stop=levels['stop'],
+        )
+
+        why_parts = []
+        if feats['opening_range_break']:
+            why_parts.append('ORB')
+        if feats['first_pullback_hold']:
+            why_parts.append('İlk pullback tuttu')
+        if feats['close_above_vwap']:
+            why_parts.append('VWAP üstü')
+        if feats['ema9_above_ema20']:
+            why_parts.append('EMA9>EMA20')
+        if feats['macd_hist_positive']:
+            why_parts.append('MACD+')
+
+        final_candidates.append({
+            'Symbol': symbol,
+            'Setup_Type': setup_type,
+            'Confidence': confidence,
+            'Price': round(feats['last_price'], 4 if feats['last_price'] < 1 else 2),
+            'Gap_%': round(feats['gap_pct'], 2) if pd.notna(feats['gap_pct']) else np.nan,
+            'Session_RVOL': round(feats['session_rvol'], 2) if pd.notna(feats['session_rvol']) else np.nan,
+            'RSI14': round(feats['rsi14'], 2) if pd.notna(feats['rsi14']) else np.nan,
+            'MACD_Hist': round(feats['macd_hist'], 4) if pd.notna(feats['macd_hist']) else np.nan,
+            'VWAP': round(feats['session_vwap'], 4 if feats['session_vwap'] < 1 else 2),
+            'EMA9': round(feats['ema9'], 4 if pd.notna(feats['ema9']) and feats['ema9'] < 1 else 2) if pd.notna(feats['ema9']) else np.nan,
+            'EMA20': round(feats['ema20'], 4 if pd.notna(feats['ema20']) and feats['ema20'] < 1 else 2) if pd.notna(feats['ema20']) else np.nan,
+            'Price_to_DayHigh_%': round(feats['price_to_day_high_pct'], 2) if pd.notna(feats['price_to_day_high_pct']) else np.nan,
+            'RS_vs_SPY_%': round(feats['rs_vs_spy_intraday_pct'], 2),
+            'Entry': levels['entry'],
+            'Stop': levels['stop'],
+            'TP1': levels['tp1'],
+            'TP2': levels['tp2'],
+            'Risk_per_Share': round(risk, 4),
+            'Model_Why': ', '.join(why_parts[:5]),
+            'Suggested_Shares_2k_2pct': pos['shares'],
+        })
+
+    final_candidates = sorted(final_candidates, key=lambda x: (x['Confidence'], x['Session_RVOL'] if not pd.isna(x['Session_RVOL']) else 0), reverse=True)
+    return final_candidates, rejected
+
+
 # ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
         "⚡ Canlı Gün İçi Radar",
+        "🧠 Intraday Trade Engine",
         "🔮 Kurumsal Swing Radar",
         "📊 VWAP Analizi ve Emir Merkezi",
     ]
@@ -1449,9 +1856,102 @@ with tab1:
 
 
 # ============================================================
-# TAB 2 - SWING RADAR
+# TAB 2 - INTRADAY TRADE ENGINE
 # ============================================================
 with tab2:
+    st.subheader("🧠 Intraday Trade Engine")
+    st.write("Aynı gün canlı verilerle trade edilebilecek güçlü setup'ları bulur. Mevcut continuation motorundan ayrıdır.")
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        intraday_session = st.selectbox(
+            "Tarama seansı",
+            ["regular", "premarket", "afterhours"],
+            index=0,
+            format_func=lambda x: {"regular": "Regular", "premarket": "Pre-Market", "afterhours": "After-Hours"}[x],
+        )
+    with col_b:
+        intraday_universe = st.slider("İlk tarama genişliği", min_value=10, max_value=60, value=25, step=5)
+    with col_c:
+        intraday_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=50.0, value=1.0, step=0.5, key='intraday_min_price')
+    with col_d:
+        intraday_max_price = st.number_input("Max fiyat ($)", min_value=5.0, max_value=500.0, value=100.0, step=5.0, key='intraday_max_price')
+
+    st.caption("Open Drive Breakout, First Pullback ve VWAP Reclaim setup'larını tarar. MACD/RSI yardımcı, VWAP/EMA/hacim ana omurgadır.")
+
+    if st.button("⚡ Intraday Engine'i Çalıştır", key="btn_intraday_engine"):
+        try:
+            with st.spinner("1. Aşama: İntraday evren taranıyor..."):
+                universe_df = fetch_intraday_trade_universe(
+                    session_name=intraday_session,
+                    max_records=intraday_universe,
+                    min_price=intraday_min_price,
+                    max_price=intraday_max_price,
+                )
+
+            if universe_df.empty:
+                st.warning("İntraday evren boş döndü.")
+            else:
+                tickers = universe_df['yahoo_symbol'].dropna().unique().tolist()
+                if 'SPY' not in tickers:
+                    tickers.append('SPY')
+
+                with st.spinner("2. Aşama: Günlük referans veriler indiriliyor..."):
+                    daily_dict = download_daily_data_chunked(
+                        tickers,
+                        period='260d',
+                        chunk_size=10,
+                        pause=1.0,
+                        alpaca_key=api_key,
+                        alpaca_secret=secret_key,
+                        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
+                    )
+
+                spy_daily_df = daily_dict.get('SPY', pd.DataFrame())
+
+                with st.spinner("3. Aşama: Intraday setup scoring yapılıyor..."):
+                    intraday_candidates, intraday_rejected = evaluate_intraday_candidates(
+                        universe_df=universe_df,
+                        daily_dict=daily_dict,
+                        spy_daily_df=spy_daily_df,
+                    )
+
+                intraday_df = pd.DataFrame(intraday_candidates)
+                if intraday_df.empty:
+                    st.warning("Trade edilebilir intraday setup bulunamadı.")
+                else:
+                    st.success(f"Trade edilebilir intraday aday sayısı: {len(intraday_df)}")
+                    st.dataframe(intraday_df, use_container_width=True)
+
+                    top_intraday = intraday_df.head(3).copy()
+                    st.subheader("🎯 En Güçlü Intraday 3")
+                    st.dataframe(top_intraday, use_container_width=True)
+
+                    csv_intraday = intraday_df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button(
+                        "📥 Intraday sonuçları CSV indir",
+                        data=csv_intraday,
+                        file_name=f"intraday_engine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime='text/csv',
+                    )
+
+                with st.expander("İntraday reddedilenler"):
+                    rej = pd.DataFrame(intraday_rejected)
+                    if not rej.empty:
+                        st.dataframe(rej, use_container_width=True)
+                    else:
+                        st.write("Kayıt yok.")
+
+        except Exception as exc:
+            st.error(f"Intraday engine hatası: {exc}")
+            if DEBUG_MODE:
+                st.code(traceback.format_exc())
+
+
+# ============================================================
+# TAB 2 - SWING RADAR
+# ============================================================
+with tab3:
     st.write("Profesyonel filtrelere göre ertesi gün potansiyeli yüksek adaylar:")
 
     algo_choice = st.selectbox(
@@ -1550,9 +2050,9 @@ with tab2:
 
 
 # ============================================================
-# TAB 3 - ÇOKLU SEANS VWAP + EMİR MERKEZİ
+# TAB 4 - ÇOKLU SEANS VWAP + EMİR MERKEZİ
 # ============================================================
-with tab3:
+with tab4:
     st.subheader("📊 VWAP Analizi ve Emir Merkezi")
 
     ticker_input = st.text_input("İşlem yapılacak hisse sembolü", "").upper().strip()
@@ -1565,7 +2065,13 @@ with tab3:
                 try:
                     yahoo_symbol = normalize_symbol_for_yahoo(ticker_input)
 
-                    intraday = get_intraday_session_data(yahoo_symbol)
+                    intraday = get_intraday_session_data(
+                        symbol=ticker_input,
+                        yahoo_symbol=yahoo_symbol,
+                        api_key_value=api_key,
+                        secret_key_value=secret_key,
+                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+                    )
                     daily_dict = download_daily_data_chunked([yahoo_symbol], period="260d", chunk_size=1, pause=0,
                                                            alpaca_key=api_key, alpaca_secret=secret_key,
                                                            alpaca_feed=os.getenv("ALPACA_FEED", "iex"))
