@@ -1449,76 +1449,156 @@ def calc_intraday_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def detect_intraday_setup(features: dict) -> str:
-    if features['close_above_vwap'] and features['opening_range_break'] and features['ema9_above_ema20'] and features['macd_hist_positive']:
-        if features['gap_pct'] >= 2 and features['session_rvol'] >= 0.20 and features['price_to_day_high_pct'] >= -1.5:
-            return 'OPEN_DRIVE_BREAKOUT'
+    # Önce acımasız kırmızı bayraklar
+    if features.get("vwap_lost_after_open", False):
+        return "NO_SETUP"
+    if features.get("opening_range_fail", False):
+        return "NO_SETUP"
+    if features.get("price_to_premarket_high_pct", np.nan) < -4.0:
+        return "NO_SETUP"
+    if features.get("price_to_day_high_pct", np.nan) < -2.5:
+        return "NO_SETUP"
+    if features.get("session_rvol", np.nan) < 1.2:
+        return "NO_SETUP"
 
-    if features['close_above_vwap'] and features['ema9_above_ema20'] and features['macd_hist_positive']:
-        if features['first_pullback_hold'] and features['price_to_vwap_pct'] >= -0.3 and features['price_to_ema9_pct'] >= -0.5:
-            return 'FIRST_PULLBACK'
+    # 1) Açılış sürüşü: gap + hacim + ORB + VWAP üstü + tepeye yakın kalma
+    if (
+        features["close_above_vwap"]
+        and features["opening_range_break"]
+        and features["ema9_above_ema20"]
+        and features["macd_hist_positive"]
+        and features["gap_pct"] >= 3.0
+        and features["session_rvol"] >= 2.0
+        and features["price_to_day_high_pct"] >= -1.0
+        and features["price_to_premarket_high_pct"] >= -2.0
+    ):
+        return "OPEN_DRIVE_BREAKOUT"
 
-    if features['close_above_vwap'] and features['macd_hist_positive'] and features['ema9_above_ema20']:
-        if features['vwap_reclaim'] and features['price_to_day_high_pct'] >= -3.0:
-            return 'VWAP_RECLAIM'
+    # 2) İlk pullback: güçlü hisse, VWAP/EMA9 üstünde kontrollü geri çekilme
+    if (
+        features["close_above_vwap"]
+        and features["ema9_above_ema20"]
+        and features["macd_hist_positive"]
+        and features["first_pullback_hold"]
+        and features["session_rvol"] >= 1.5
+        and features["price_to_vwap_pct"] >= -0.2
+        and features["price_to_ema9_pct"] >= -0.4
+        and features["price_to_day_high_pct"] >= -1.5
+        and features["price_to_premarket_high_pct"] >= -3.0
+    ):
+        return "FIRST_PULLBACK"
 
-    return 'NO_SETUP'
+    # 3) VWAP reclaim: gün içi zayıflamadan sonra reclaim ama yalnızca tekrar güç varsa
+    if (
+        features["close_above_vwap"]
+        and features["macd_hist_positive"]
+        and features["ema9_above_ema20"]
+        and features["vwap_reclaim"]
+        and features["session_rvol"] >= 1.3
+        and features["rsi14"] >= 60
+        and features["price_to_day_high_pct"] >= -2.0
+        and features["price_to_premarket_high_pct"] >= -3.5
+    ):
+        return "VWAP_RECLAIM"
+
+    return "NO_SETUP"
 
 
 def intraday_confidence_score(features: dict, setup_type: str) -> int:
     score = 0
 
-    if features['session_rvol'] >= 0.50:
-        score += 18
-    elif features['session_rvol'] >= 0.30:
+    srvol = features.get("session_rvol", np.nan)
+    if pd.notna(srvol):
+        if srvol >= 3.0:
+            score += 26
+        elif srvol >= 2.0:
+            score += 20
+        elif srvol >= 1.5:
+            score += 14
+        elif srvol >= 1.2:
+            score += 8
+
+    if features["close_above_vwap"]:
         score += 14
-    elif features['session_rvol'] >= 0.20:
+    if features["ema9_above_ema20"]:
         score += 10
-
-    if features['close_above_vwap']:
-        score += 12
-    if features['ema9_above_ema20']:
-        score += 10
-    if features['ema20_above_ema50']:
+    if features["ema20_above_ema50"]:
+        score += 6
+    if features["macd_hist_positive"]:
         score += 8
-    if features['macd_hist_positive']:
-        score += 10
 
-    rsi = features['rsi14']
+    rsi = features["rsi14"]
     if pd.notna(rsi):
-        if 58 <= rsi <= 75:
+        if 60 <= rsi <= 75:
             score += 10
-        elif 52 <= rsi < 58:
-            score += 6
+        elif 55 <= rsi < 60:
+            score += 5
         elif rsi > 82:
             score -= 8
+        elif rsi < 50:
+            score -= 12
 
-    if features['opening_range_break']:
+    if features["opening_range_break"]:
         score += 10
-    if features['first_pullback_hold']:
+    if features["first_pullback_hold"]:
         score += 8
-    if features['vwap_reclaim']:
-        score += 8
+    if features["vwap_reclaim"]:
+        score += 6
 
-    if features['gap_pct'] >= 5:
-        score += 8
-    elif features['gap_pct'] >= 2:
-        score += 5
+    gap_pct = features.get("gap_pct", np.nan)
+    if pd.notna(gap_pct):
+        if gap_pct >= 8:
+            score += 10
+        elif gap_pct >= 3:
+            score += 6
+        elif gap_pct < -5:
+            score -= 6
 
-    if features['rs_vs_spy_intraday_pct'] >= 3:
-        score += 8
-    elif features['rs_vs_spy_intraday_pct'] >= 1:
-        score += 4
-
-    if features['price_to_day_high_pct'] < -4:
-        score -= 10
-    elif features['price_to_day_high_pct'] < -2:
-        score -= 5
-
-    if setup_type == 'OPEN_DRIVE_BREAKOUT':
+    rs_intraday = features.get("rs_vs_spy_intraday_pct", 0.0)
+    if rs_intraday >= 5:
         score += 10
-    elif setup_type == 'FIRST_PULLBACK':
+    elif rs_intraday >= 2:
+        score += 6
+    elif rs_intraday < 0:
+        score -= 8
+
+    pth = features.get("price_to_day_high_pct", np.nan)
+    if pd.notna(pth):
+        if pth >= -0.75:
+            score += 10
+        elif pth >= -1.5:
+            score += 6
+        elif pth < -3.0:
+            score -= 14
+        elif pth < -2.0:
+            score -= 8
+
+    ptph = features.get("price_to_premarket_high_pct", np.nan)
+    if pd.notna(ptph):
+        if ptph >= -1.5:
+            score += 8
+        elif ptph < -4.0:
+            score -= 14
+        elif ptph < -2.5:
+            score -= 6
+
+    ptvwap = features.get("price_to_vwap_pct", np.nan)
+    if pd.notna(ptvwap):
+        if ptvwap >= 0.3:
+            score += 8
+        elif ptvwap < -0.25:
+            score -= 12
+
+    if features.get("vwap_lost_after_open", False):
+        score -= 18
+    if features.get("opening_range_fail", False):
+        score -= 18
+
+    if setup_type == "OPEN_DRIVE_BREAKOUT":
+        score += 12
+    elif setup_type == "FIRST_PULLBACK":
         score += 8
-    elif setup_type == 'VWAP_RECLAIM':
+    elif setup_type == "VWAP_RECLAIM":
         score += 6
     else:
         score -= 20
@@ -1619,7 +1699,14 @@ def fetch_intraday_trade_universe(session_name: str, max_records: int = 30, min_
     return pd.DataFrame(rows)
 
 
-def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFrame, spy_daily_df: pd.DataFrame, intraday_df: pd.DataFrame) -> dict | None:
+def build_intraday_features(
+    symbol: str,
+    yahoo_symbol: str,
+    daily_df: pd.DataFrame,
+    spy_daily_df: pd.DataFrame,
+    intraday_df: pd.DataFrame,
+    spy_intraday_df: pd.DataFrame | None = None,
+) -> dict | None:
     if daily_df is None or daily_df.empty or intraday_df is None or intraday_df.empty:
         return None
 
@@ -1646,19 +1733,35 @@ def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFra
     if pd.isna(session_vwap) or session_vwap <= 0:
         return None
 
+    # İlk 15 dakika opening range
     first3 = reg.iloc[:3].copy()
     opening_range_high = float(first3['High'].max()) if not first3.empty else np.nan
     opening_range_low = float(first3['Low'].min()) if not first3.empty else np.nan
     opening_range_break = bool(len(reg) > 3 and reg.iloc[3:]['High'].max() > opening_range_high) if pd.notna(opening_range_high) else False
 
+    # Açılış range'i sonra aşağı kırıldı mı? Özellikle long için kötü işaret
+    opening_range_fail = False
+    if len(reg) > 6 and pd.notna(opening_range_low):
+        later_low = float(reg.iloc[3:]['Low'].min())
+        opening_range_fail = later_low < opening_range_low * 0.998
+
+    # İlk kontrollü geri çekilme tuttu mu
     pullback_window = reg.iloc[3:9].copy()
     first_pullback_hold = False
     if not pullback_window.empty and pd.notna(opening_range_low):
         first_pullback_hold = float(pullback_window['Low'].min()) >= max(opening_range_low, session_vwap) * 0.985
 
+    # VWAP reclaim: önce altına inip sonra üstüne dönme
     vwap_reclaim = False
     if len(reg) >= 8:
         vwap_reclaim = bool((reg['Close'].iloc[:-1] < session_vwap).any() and last_price > session_vwap)
+
+    # Açılıştan sonra VWAP kaybı ve tekrar altında kalma: long için olumsuz
+    vwap_lost_after_open = False
+    if len(reg) >= 6:
+        after_open = reg.iloc[3:].copy()
+        if not after_open.empty:
+            vwap_lost_after_open = bool((after_open['Close'] < session_vwap).tail(3).any() and last_price < session_vwap * 1.002)
 
     prev_close = float(daily_df['Close'].iloc[-2]) if len(daily_df) >= 2 else np.nan
     prev_day_high = float(daily_df['High'].iloc[-2]) if len(daily_df) >= 2 else np.nan
@@ -1666,18 +1769,28 @@ def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFra
 
     avg_vol_20 = daily_df['Volume'].rolling(20).mean().iloc[-1] if len(daily_df) >= 20 else np.nan
     session_volume = float(reg['Volume'].sum())
-    session_rvol = (session_volume / avg_vol_20) if pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
+    # Gün ortasında daha anlamlı olsun diye seans hacmini günlük ortalamaya zamansal normalize et
+    bars_so_far = max(len(reg), 1)
+    full_day_equiv_volume = session_volume * (78 / bars_so_far)
+    session_rvol = (full_day_equiv_volume / avg_vol_20) if pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
 
-    spy_intraday = None
-    spy_last = np.nan
-    spy_prev_close = np.nan
-    if spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2:
-        spy_prev_close = float(spy_daily_df['Close'].iloc[-2])
-        spy_last = float(spy_daily_df['Close'].iloc[-1])
+    # Intraday RS vs SPY: aynı gün regular seans getirisi ile hesapla
     rs_vs_spy_intraday_pct = 0.0
-    if prev_close > 0 and pd.notna(spy_prev_close) and spy_prev_close > 0:
+    if prev_close > 0:
         stock_ret = (last_price - prev_close) / prev_close * 100
-        spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100 if pd.notna(spy_last) else 0.0
+        spy_ret = 0.0
+        if spy_intraday_df is not None and not spy_intraday_df.empty:
+            _, spy_reg, _ = split_sessions(spy_intraday_df)
+            if not spy_reg.empty:
+                spy_prev_close = float(spy_daily_df['Close'].iloc[-2]) if spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2 else np.nan
+                spy_last = float(spy_reg['Close'].iloc[-1])
+                if pd.notna(spy_prev_close) and spy_prev_close > 0:
+                    spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100
+        elif spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2:
+            spy_prev_close = float(spy_daily_df['Close'].iloc[-2])
+            spy_last = float(spy_daily_df['Close'].iloc[-1])
+            if spy_prev_close > 0:
+                spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100
         rs_vs_spy_intraday_pct = stock_ret - spy_ret
 
     price_to_day_high_pct = ((last_price - day_high) / day_high * 100) if day_high > 0 else np.nan
@@ -1686,6 +1799,11 @@ def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFra
     ema20 = float(last['EMA20']) if pd.notna(last['EMA20']) else np.nan
     ema50 = float(last['EMA50']) if pd.notna(last['EMA50']) else np.nan
     price_to_ema9_pct = ((last_price - ema9) / ema9 * 100) if pd.notna(ema9) and ema9 > 0 else np.nan
+
+    premarket_high = float(premarket_df['High'].max()) if not premarket_df.empty else np.nan
+    premarket_low = float(premarket_df['Low'].min()) if not premarket_df.empty else np.nan
+    premarket_volume = float(premarket_df['Volume'].sum()) if not premarket_df.empty else 0.0
+    price_to_premarket_high_pct = ((last_price - premarket_high) / premarket_high * 100) if pd.notna(premarket_high) and premarket_high > 0 else np.nan
 
     return {
         'last_price': last_price,
@@ -1705,17 +1823,20 @@ def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFra
         'opening_range_high': opening_range_high,
         'opening_range_low': opening_range_low,
         'opening_range_break': opening_range_break,
+        'opening_range_fail': opening_range_fail,
         'first_pullback_hold': first_pullback_hold,
         'vwap_reclaim': vwap_reclaim,
+        'vwap_lost_after_open': vwap_lost_after_open,
         'day_high': day_high,
         'day_low': day_low,
-        'premarket_high': float(premarket_df['High'].max()) if not premarket_df.empty else np.nan,
-        'premarket_low': float(premarket_df['Low'].min()) if not premarket_df.empty else np.nan,
-        'premarket_volume': float(premarket_df['Volume'].sum()) if not premarket_df.empty else 0.0,
+        'premarket_high': premarket_high,
+        'premarket_low': premarket_low,
+        'premarket_volume': premarket_volume,
         'gap_pct': gap_pct,
         'session_volume': session_volume,
         'session_rvol': session_rvol,
         'price_to_day_high_pct': price_to_day_high_pct,
+        'price_to_premarket_high_pct': price_to_premarket_high_pct,
         'price_to_vwap_pct': price_to_vwap_pct,
         'price_to_ema9_pct': price_to_ema9_pct,
         'prev_day_high': prev_day_high,
@@ -1726,6 +1847,14 @@ def build_intraday_features(symbol: str, yahoo_symbol: str, daily_df: pd.DataFra
 def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, spy_daily_df: pd.DataFrame):
     final_candidates = []
     rejected = []
+
+    spy_intraday_df = get_intraday_session_data(
+        symbol='SPY',
+        yahoo_symbol='SPY',
+        api_key_value=api_key,
+        secret_key_value=secret_key,
+        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
+    )
 
     for _, row in universe_df.iterrows():
         symbol = row['symbol']
@@ -1746,9 +1875,29 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             rejected.append({'Hisse': symbol, 'Neden': 'Intraday veri yok'})
             continue
 
-        feats = build_intraday_features(symbol, yahoo_symbol, daily_df, spy_daily_df, intraday_df)
+        feats = build_intraday_features(symbol, yahoo_symbol, daily_df, spy_daily_df, intraday_df, spy_intraday_df=spy_intraday_df)
         if feats is None:
             rejected.append({'Hisse': symbol, 'Neden': 'İntraday feature üretilemedi'})
+            continue
+
+        # Global hard reject: yumuşak ve bozulmuş adayları en başta at
+        if pd.isna(feats['session_rvol']) or feats['session_rvol'] < 1.2:
+            rejected.append({'Hisse': symbol, 'Neden': f'Session RVOL düşük ({round(feats['session_rvol'],2) if pd.notna(feats['session_rvol']) else 'NaN'})'})
+            continue
+        if pd.notna(feats['price_to_day_high_pct']) and feats['price_to_day_high_pct'] < -2.0:
+            rejected.append({'Hisse': symbol, 'Neden': f'Day-highdan fazla uzak ({round(feats['price_to_day_high_pct'],2)}%)'})
+            continue
+        if pd.notna(feats['rsi14']) and feats['rsi14'] < 55:
+            rejected.append({'Hisse': symbol, 'Neden': f'RSI zayıf ({round(feats['rsi14'],2)})'})
+            continue
+        if feats.get('opening_range_fail', False):
+            rejected.append({'Hisse': symbol, 'Neden': 'Opening range fail'})
+            continue
+        if feats.get('vwap_lost_after_open', False):
+            rejected.append({'Hisse': symbol, 'Neden': 'VWAP kaybı'})
+            continue
+        if pd.notna(feats.get('price_to_premarket_high_pct', np.nan)) and feats['price_to_premarket_high_pct'] < -4.0:
+            rejected.append({'Hisse': symbol, 'Neden': f'Premarket highdan koptu ({round(feats['price_to_premarket_high_pct'],2)}%)'})
             continue
 
         setup_type = detect_intraday_setup(feats)
@@ -1757,7 +1906,7 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             continue
 
         confidence = intraday_confidence_score(feats, setup_type)
-        if confidence < 65:
+        if confidence < 72:
             rejected.append({'Hisse': symbol, 'Neden': f'Confidence düşük ({confidence})'})
             continue
 
@@ -1785,6 +1934,8 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             why_parts.append('EMA9>EMA20')
         if feats['macd_hist_positive']:
             why_parts.append('MACD+')
+        if pd.notna(feats['price_to_premarket_high_pct']) and feats['price_to_premarket_high_pct'] >= -1.5:
+            why_parts.append('PM high yakınında')
 
         final_candidates.append({
             'Symbol': symbol,
@@ -1799,17 +1950,27 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             'EMA9': round(feats['ema9'], 4 if pd.notna(feats['ema9']) and feats['ema9'] < 1 else 2) if pd.notna(feats['ema9']) else np.nan,
             'EMA20': round(feats['ema20'], 4 if pd.notna(feats['ema20']) and feats['ema20'] < 1 else 2) if pd.notna(feats['ema20']) else np.nan,
             'Price_to_DayHigh_%': round(feats['price_to_day_high_pct'], 2) if pd.notna(feats['price_to_day_high_pct']) else np.nan,
+            'Price_to_PMHigh_%': round(feats['price_to_premarket_high_pct'], 2) if pd.notna(feats['price_to_premarket_high_pct']) else np.nan,
+            'Price_to_VWAP_%': round(feats['price_to_vwap_pct'], 2) if pd.notna(feats['price_to_vwap_pct']) else np.nan,
             'RS_vs_SPY_%': round(feats['rs_vs_spy_intraday_pct'], 2),
             'Entry': levels['entry'],
             'Stop': levels['stop'],
             'TP1': levels['tp1'],
             'TP2': levels['tp2'],
             'Risk_per_Share': round(risk, 4),
-            'Model_Why': ', '.join(why_parts[:5]),
+            'Model_Why': ', '.join(why_parts[:6]),
             'Suggested_Shares_2k_2pct': pos['shares'],
         })
 
-    final_candidates = sorted(final_candidates, key=lambda x: (x['Confidence'], x['Session_RVOL'] if not pd.isna(x['Session_RVOL']) else 0), reverse=True)
+    final_candidates = sorted(
+        final_candidates,
+        key=lambda x: (
+            x['Confidence'],
+            x['Session_RVOL'] if not pd.isna(x['Session_RVOL']) else 0,
+            x['Price_to_DayHigh_%'] if not pd.isna(x['Price_to_DayHigh_%']) else -999,
+        ),
+        reverse=True
+    )
     return final_candidates, rejected
 
 
