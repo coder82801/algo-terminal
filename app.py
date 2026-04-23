@@ -1882,13 +1882,13 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
 
         # Global hard reject: yumuşak ve bozulmuş adayları en başta at
         if pd.isna(feats['session_rvol']) or feats['session_rvol'] < 1.2:
-            rejected.append({'Hisse': symbol, 'Neden': f'Session RVOL düşük ({round(feats['session_rvol'],2) if pd.notna(feats['session_rvol']) else 'NaN'})'})
+            rejected.append({'Hisse': symbol, 'Neden': f"Session RVOL düşük ({round(feats['session_rvol'], 2) if pd.notna(feats['session_rvol']) else 'NaN'})"})
             continue
         if pd.notna(feats['price_to_day_high_pct']) and feats['price_to_day_high_pct'] < -2.0:
-            rejected.append({'Hisse': symbol, 'Neden': f'Day-highdan fazla uzak ({round(feats['price_to_day_high_pct'],2)}%)'})
+            rejected.append({'Hisse': symbol, 'Neden': f"Day-highdan fazla uzak ({round(feats['price_to_day_high_pct'], 2)}%)"})
             continue
         if pd.notna(feats['rsi14']) and feats['rsi14'] < 55:
-            rejected.append({'Hisse': symbol, 'Neden': f'RSI zayıf ({round(feats['rsi14'],2)})'})
+            rejected.append({'Hisse': symbol, 'Neden': f"RSI zayıf ({round(feats['rsi14'], 2)})"})
             continue
         if feats.get('opening_range_fail', False):
             rejected.append({'Hisse': symbol, 'Neden': 'Opening range fail'})
@@ -1897,7 +1897,7 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             rejected.append({'Hisse': symbol, 'Neden': 'VWAP kaybı'})
             continue
         if pd.notna(feats.get('price_to_premarket_high_pct', np.nan)) and feats['price_to_premarket_high_pct'] < -4.0:
-            rejected.append({'Hisse': symbol, 'Neden': f'Premarket highdan koptu ({round(feats['price_to_premarket_high_pct'],2)}%)'})
+            rejected.append({'Hisse': symbol, 'Neden': f"Premarket highdan koptu ({round(feats['price_to_premarket_high_pct'], 2)}%)"})
             continue
 
         setup_type = detect_intraday_setup(feats)
