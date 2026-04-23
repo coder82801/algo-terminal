@@ -882,10 +882,37 @@ def fetch_alpaca_intraday_5m(symbol: str, api_key_value: str, secret_key_value: 
         return pd.DataFrame()
 
 
-def pick_last_valid_regular_day(intraday_df: pd.DataFrame, min_regular_bars: int = 50) -> pd.DataFrame:
-    """Regular session barları gerçekten olan en son geçerli günü seçer."""
+def _dynamic_min_regular_bars(now_et: datetime | None = None) -> int:
+    """Seansın ne kadar ilerlediğine göre minimum gerekli regular 5m bar sayısı.
+    Günün erken saatlerinde 50 bar beklemek intraday modülü gereksiz yere kilitler.
+    """
+    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
+    session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    minutes_since_open = max(0, int((now_et - session_open).total_seconds() // 60))
+
+    if minutes_since_open < 20:
+        return 3
+    if minutes_since_open < 45:
+        return 6
+    if minutes_since_open < 90:
+        return 9
+    if minutes_since_open < 150:
+        return 12
+    if minutes_since_open < 240:
+        return 18
+    return 24
+
+
+
+def pick_last_valid_regular_day(intraday_df: pd.DataFrame, min_regular_bars: int | None = None) -> pd.DataFrame:
+    """Regular session barları gerçekten olan en son geçerli günü seçer.
+    Varsayılan eşik seans saatine göre dinamik belirlenir.
+    """
     if intraday_df is None or intraday_df.empty:
         return pd.DataFrame()
+
+    if min_regular_bars is None:
+        min_regular_bars = _dynamic_min_regular_bars()
 
     df = intraday_df.copy()
     idx = df.index
@@ -907,7 +934,8 @@ def pick_last_valid_regular_day(intraday_df: pd.DataFrame, min_regular_bars: int
         if sub.empty:
             continue
         _, regular_df, _ = split_sessions(sub)
-        if not regular_df.empty and len(regular_df) >= min_regular_bars and regular_df["Volume"].fillna(0).sum() > 0:
+        reg_vol = regular_df["Volume"].fillna(0).sum() if not regular_df.empty else 0
+        if not regular_df.empty and len(regular_df) >= min_regular_bars and reg_vol > 0:
             return sub
 
     return pd.DataFrame()
@@ -941,6 +969,28 @@ def _extract_last_active_day(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120)
+def _fetch_yahoo_intraday_candidates(yahoo_symbol: str) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    try:
+        stock = yf.Ticker(yahoo_symbol)
+        df_5m = stock.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
+        if df_5m is not None and not df_5m.empty:
+            out["5m_5d"] = df_5m[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
+    except Exception as exc:
+        log_debug(f"Yahoo 5m intraday error for {yahoo_symbol}: {exc}")
+
+    try:
+        stock = yf.Ticker(yahoo_symbol)
+        df_1m = stock.history(period="2d", interval="1m", prepost=True, auto_adjust=False)
+        if df_1m is not None and not df_1m.empty:
+            out["1m_2d"] = df_1m[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
+    except Exception as exc:
+        log_debug(f"Yahoo 1m intraday error for {yahoo_symbol}: {exc}")
+
+    return out
+
+
+@st.cache_data(ttl=120)
 def get_intraday_session_data(
     symbol: str,
     yahoo_symbol: str,
@@ -948,21 +998,60 @@ def get_intraday_session_data(
     secret_key_value: str = "",
     alpaca_feed: str = "iex",
 ):
+    min_bars = _dynamic_min_regular_bars()
+
     intraday = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
-    intraday = pick_last_valid_regular_day(intraday)
+    intraday = pick_last_valid_regular_day(intraday, min_regular_bars=min_bars)
     if not intraday.empty:
         return intraday
 
-    try:
-        stock = yf.Ticker(yahoo_symbol)
-        intraday = stock.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
-        if intraday.empty:
-            return pd.DataFrame()
-        intraday = pick_last_valid_regular_day(intraday)
-        return intraday
-    except Exception as exc:
-        log_debug(f"Intraday data error for {symbol}/{yahoo_symbol}: {exc}")
-        return pd.DataFrame()
+    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
+    for key in ["5m_5d", "1m_2d"]:
+        cand = yahoo_candidates.get(key, pd.DataFrame())
+        cand = pick_last_valid_regular_day(cand, min_regular_bars=min_bars)
+        if not cand.empty:
+            return cand
+
+    return pd.DataFrame()
+
+
+def get_intraday_session_data_verbose(
+    symbol: str,
+    yahoo_symbol: str,
+    api_key_value: str = "",
+    secret_key_value: str = "",
+    alpaca_feed: str = "iex",
+):
+    min_bars = _dynamic_min_regular_bars()
+
+    alpaca_raw = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
+    if alpaca_raw is not None and not alpaca_raw.empty:
+        picked = pick_last_valid_regular_day(alpaca_raw, min_regular_bars=min_bars)
+        if not picked.empty:
+            return picked, "alpaca_ok"
+        return pd.DataFrame(), f"Alpaca veri var ama geçerli regular session yok (<{min_bars} bar veya hacim yok)"
+
+    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
+    if not yahoo_candidates:
+        return pd.DataFrame(), "Alpaca boş, Yahoo boş"
+
+    for key in ["5m_5d", "1m_2d"]:
+        cand = yahoo_candidates.get(key, pd.DataFrame())
+        if cand is None or cand.empty:
+            continue
+        picked = pick_last_valid_regular_day(cand, min_regular_bars=min_bars)
+        if not picked.empty:
+            return picked, f"yahoo_{key}_ok"
+
+    detail = []
+    if "5m_5d" in yahoo_candidates:
+        detail.append("Yahoo 5m var ama geçerli regular session yok")
+    if "1m_2d" in yahoo_candidates:
+        detail.append("Yahoo 1m var ama geçerli regular session yok")
+    if detail:
+        return pd.DataFrame(), "; ".join(detail) + f" (<{min_bars} bar veya hacim yok)"
+
+    return pd.DataFrame(), "Intraday veri yok"
 
 
 def _get_spy_return_10d(data_dict: dict, alpaca_key: str, alpaca_secret: str, alpaca_feed: str) -> tuple[float, bool]:
@@ -1711,7 +1800,8 @@ def build_intraday_features(
         return None
 
     premarket_df, regular_df, afterhours_df = split_sessions(intraday_df)
-    if regular_df.empty or len(regular_df) < 12:
+    min_needed = max(6, _dynamic_min_regular_bars())
+    if regular_df.empty or len(regular_df) < min_needed:
         return None
 
     reg = regular_df.copy()
@@ -1848,13 +1938,15 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
     final_candidates = []
     rejected = []
 
-    spy_intraday_df = get_intraday_session_data(
+    spy_intraday_df, spy_intraday_reason = get_intraday_session_data_verbose(
         symbol='SPY',
         yahoo_symbol='SPY',
         api_key_value=api_key,
         secret_key_value=secret_key,
         alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
     )
+    if spy_intraday_df.empty:
+        log_debug(f"SPY intraday fallback -> {spy_intraday_reason}")
 
     for _, row in universe_df.iterrows():
         symbol = row['symbol']
@@ -1864,7 +1956,7 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             rejected.append({'Hisse': symbol, 'Neden': 'Yetersiz günlük veri'})
             continue
 
-        intraday_df = get_intraday_session_data(
+        intraday_df, intraday_reason = get_intraday_session_data_verbose(
             symbol=symbol,
             yahoo_symbol=yahoo_symbol,
             api_key_value=api_key,
@@ -1872,7 +1964,7 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
             alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
         )
         if intraday_df.empty:
-            rejected.append({'Hisse': symbol, 'Neden': 'Intraday veri yok'})
+            rejected.append({'Hisse': symbol, 'Neden': intraday_reason})
             continue
 
         feats = build_intraday_features(symbol, yahoo_symbol, daily_df, spy_daily_df, intraday_df, spy_intraday_df=spy_intraday_df)
