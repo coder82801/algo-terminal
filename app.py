@@ -2067,14 +2067,606 @@ def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, sp
 
 
 # ============================================================
+# NIGHT BUY / OVERNIGHT PRESSURE ENGINE
+# ============================================================
+def _score_linear(value, low, high, clamp=True):
+    try:
+        if pd.isna(value):
+            return 0.0
+        score = (float(value) - low) / (high - low) * 100.0
+        if clamp:
+            return float(max(0.0, min(100.0, score)))
+        return float(score)
+    except Exception:
+        return 0.0
+
+
+def _rsi_strength_score(rsi: float) -> float:
+    if pd.isna(rsi):
+        return 0.0
+    # Night-buy için ideal bölge: 55-75. 80+ momentum olabilir ama fakeout riski de artar.
+    if 55 <= rsi <= 68:
+        return 100.0
+    if 68 < rsi <= 75:
+        return 85.0
+    if 50 <= rsi < 55:
+        return 55.0
+    if 75 < rsi <= 82:
+        return 55.0
+    if rsi > 82:
+        return 20.0
+    return 10.0
+
+
+def _safe_pct(numerator: float, denominator: float) -> float:
+    try:
+        if pd.isna(numerator) or pd.isna(denominator) or denominator == 0:
+            return np.nan
+        return (numerator - denominator) / denominator * 100.0
+    except Exception:
+        return np.nan
+
+
+def _target_pct_by_price(price: float) -> float:
+    if pd.isna(price) or price <= 0:
+        return 0.08
+    if price < 3:
+        return 0.15
+    if price < 10:
+        return 0.10
+    if price < 50:
+        return 0.06
+    return 0.035
+
+
+def _price_round(price: float) -> int:
+    if pd.isna(price):
+        return 4
+    return 4 if price < 1 else 3 if price < 10 else 2
+
+
+def calc_daily_indicators_for_night(df: pd.DataFrame) -> pd.DataFrame:
+    temp = df.copy()
+    temp["EMA9"] = calc_ema(temp["Close"], 9)
+    temp["EMA20"] = calc_ema(temp["Close"], 20)
+    temp["EMA50"] = calc_ema(temp["Close"], 50)
+    temp["RSI14"] = calc_rsi(temp["Close"], 14)
+    macd, macd_signal, macd_hist = calc_macd(temp["Close"])
+    temp["MACD"] = macd
+    temp["MACD_SIGNAL"] = macd_signal
+    temp["MACD_HIST"] = macd_hist
+    temp["ATR14"] = calc_atr(temp, 14)
+    return temp
+
+
+@st.cache_data(ttl=30)
+def fetch_night_buy_universe(
+    scan_mode: str = "afterhours",
+    max_records: int = 80,
+    min_price: float = 1.0,
+    max_price: float = 80.0,
+    min_volume: int = 100000,
+) -> pd.DataFrame:
+    """TradingView üzerinden night-buy evrenini alır.
+    Bilinçli olarak sadece daha stabil TradingView kolonları kullanıldı; short/float verisi bu sürümde proxy skorla hesaplanır.
+    """
+    if scan_mode == "afterhours":
+        sort_field = "postmarket_change"
+        vol_field = "postmarket_volume"
+        price_field = "postmarket_close"
+        min_live_vol = max(10000, int(min_volume * 0.08))
+    elif scan_mode == "premarket":
+        sort_field = "premarket_change"
+        vol_field = "premarket_volume"
+        price_field = "premarket_close"
+        min_live_vol = max(10000, int(min_volume * 0.08))
+    else:
+        sort_field = "relative_volume_10d_calc"
+        vol_field = "volume"
+        price_field = "close"
+        min_live_vol = min_volume
+
+    filters = [
+        {"left": price_field, "operation": "in_range", "right": [min_price, max_price]},
+        {"left": vol_field, "operation": "greater", "right": min_live_vol},
+        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
+    ]
+
+    columns = [
+        "name",
+        "description",
+        price_field,
+        sort_field,
+        vol_field,
+        "close",
+        "volume",
+        "relative_volume_10d_calc",
+        "gap",
+        "market_cap_basic",
+    ]
+
+    raw = tradingview_scan(filters, columns, sort_field, max_records=max_records, page_size=min(100, max_records))
+    rows = []
+    seen = set()
+    for item in raw:
+        try:
+            d = item["d"]
+            symbol = d[0]
+            description = d[1] or ""
+            if not symbol or symbol in seen:
+                continue
+            if is_likely_non_common_stock(symbol, description):
+                continue
+            seen.add(symbol)
+            rows.append({
+                "symbol": symbol,
+                "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
+                "description": description,
+                "live_price": safe_float(d[2], np.nan),
+                "live_change_pct": safe_float(d[3], np.nan),
+                "live_volume": safe_float(d[4], np.nan),
+                "regular_close": safe_float(d[5], np.nan),
+                "regular_volume": safe_float(d[6], np.nan),
+                "tv_rvol": safe_float(d[7], np.nan),
+                "tv_gap": safe_float(d[8], np.nan),
+                "market_cap": safe_float(d[9], np.nan),
+            })
+        except Exception as exc:
+            log_debug(f"Night universe parse error: {exc}")
+    return pd.DataFrame(rows)
+
+
+def get_recent_intraday_full_data(
+    symbol: str,
+    yahoo_symbol: str,
+    api_key_value: str = "",
+    secret_key_value: str = "",
+    alpaca_feed: str = "iex",
+) -> pd.DataFrame:
+    """After-hours/premarket dahil son aktif günün intraday datası.
+    Mevcut get_intraday_session_data regular session seçmeye odaklandığı için night-buy için ayrı tutuldu.
+    """
+    intraday = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
+    if intraday is not None and not intraday.empty:
+        picked = _extract_last_active_day(intraday)
+        if picked is not None and not picked.empty:
+            return picked
+
+    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
+    for key in ["1m_2d", "5m_5d"]:
+        cand = yahoo_candidates.get(key, pd.DataFrame())
+        if cand is None or cand.empty:
+            continue
+        picked = _extract_last_active_day(cand)
+        if picked is not None and not picked.empty:
+            return picked
+    return pd.DataFrame()
+
+
+def compute_fib_channel_features(df: pd.DataFrame, price: float) -> dict:
+    if df is None or df.empty or len(df) < 40 or pd.isna(price) or price <= 0:
+        return {
+            "swing_low": np.nan,
+            "swing_high": np.nan,
+            "fib_1272": np.nan,
+            "fib_1618": np.nan,
+            "channel_score": 0.0,
+            "upside_to_1272_pct": np.nan,
+        }
+    recent = df.tail(60).copy()
+    swing_low = float(recent["Low"].min())
+    swing_high = float(recent["High"].max())
+    wave = swing_high - swing_low
+    if wave <= 0:
+        return {
+            "swing_low": swing_low,
+            "swing_high": swing_high,
+            "fib_1272": np.nan,
+            "fib_1618": np.nan,
+            "channel_score": 0.0,
+            "upside_to_1272_pct": np.nan,
+        }
+
+    fib_1272 = swing_low + 1.272 * wave
+    fib_1618 = swing_low + 1.618 * wave
+    upside_1272 = (fib_1272 - price) / price * 100 if price > 0 else np.nan
+
+    prior_20h = float(df["High"].shift(1).rolling(20).max().iloc[-1]) if len(df) >= 21 else np.nan
+    prior_60h = float(df["High"].shift(1).rolling(60).max().iloc[-1]) if len(df) >= 61 else np.nan
+
+    score = 0.0
+    if pd.notna(prior_20h):
+        if price >= prior_20h * 0.995:
+            score += 30
+        elif price >= prior_20h * 0.97:
+            score += 18
+    if pd.notna(prior_60h):
+        if price >= prior_60h * 0.98:
+            score += 20
+        elif price >= prior_60h * 0.94:
+            score += 10
+    if pd.notna(upside_1272):
+        if upside_1272 >= 12:
+            score += 35
+        elif upside_1272 >= 7:
+            score += 25
+        elif upside_1272 >= 3:
+            score += 12
+        elif upside_1272 < 0:
+            score -= 15
+    # Fiyat son dalganın çok tepesindeyse ama extension alanı kalmadıysa fakeout riski artar.
+    if pd.notna(fib_1618) and price > fib_1618:
+        score -= 18
+
+    return {
+        "swing_low": swing_low,
+        "swing_high": swing_high,
+        "fib_1272": fib_1272,
+        "fib_1618": fib_1618,
+        "channel_score": float(max(0, min(100, score))),
+        "upside_to_1272_pct": upside_1272,
+    }
+
+
+def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday_df: pd.DataFrame) -> tuple[dict | None, str | None]:
+    symbol = row["symbol"]
+    yahoo_symbol = row["yahoo_symbol"]
+    if daily_df is None or daily_df.empty or len(daily_df) < 80:
+        return None, "Yetersiz günlük veri"
+
+    dfi = calc_daily_indicators_for_night(daily_df).dropna(subset=["Close", "Volume"]).copy()
+    if dfi.empty or len(dfi) < 60:
+        return None, "İndikatör için yetersiz veri"
+
+    last = dfi.iloc[-1]
+    prev = dfi.iloc[-2]
+    last_close = float(last["Close"])
+    last_open = float(last["Open"])
+    last_high = float(last["High"])
+    last_low = float(last["Low"])
+    last_volume = float(last["Volume"])
+    live_price = safe_float(row.get("live_price", np.nan), np.nan)
+    if pd.isna(live_price) or live_price <= 0:
+        live_price = last_close
+
+    atr14 = float(last["ATR14"]) if pd.notna(last["ATR14"]) else max(last_close * 0.04, 0.05)
+    avg_vol_20 = float(dfi["Volume"].rolling(20).mean().iloc[-1])
+    rvol20 = last_volume / avg_vol_20 if avg_vol_20 > 0 else np.nan
+    if pd.notna(row.get("tv_rvol", np.nan)) and row.get("tv_rvol", np.nan) > 0:
+        rvol20 = max(rvol20 if pd.notna(rvol20) else 0, float(row["tv_rvol"]))
+
+    closing_strength = calc_closing_strength(last_close, last_low, last_high)
+    prev_day_change_pct = (last_close - float(prev["Close"])) / float(prev["Close"]) * 100 if float(prev["Close"]) > 0 else np.nan
+
+    ema9 = float(last["EMA9"]) if pd.notna(last["EMA9"]) else np.nan
+    ema20 = float(last["EMA20"]) if pd.notna(last["EMA20"]) else np.nan
+    ema50 = float(last["EMA50"]) if pd.notna(last["EMA50"]) else np.nan
+    ema9_slope = float(last["EMA9"] - dfi["EMA9"].iloc[-4]) if len(dfi) >= 4 and pd.notna(dfi["EMA9"].iloc[-4]) else np.nan
+    ema20_slope = float(last["EMA20"] - dfi["EMA20"].iloc[-4]) if len(dfi) >= 4 and pd.notna(dfi["EMA20"].iloc[-4]) else np.nan
+    rsi14 = float(last["RSI14"]) if pd.notna(last["RSI14"]) else np.nan
+    macd_hist = float(last["MACD_HIST"]) if pd.notna(last["MACD_HIST"]) else np.nan
+    macd_hist_prev = float(dfi["MACD_HIST"].iloc[-2]) if pd.notna(dfi["MACD_HIST"].iloc[-2]) else np.nan
+    macd_rising = pd.notna(macd_hist) and pd.notna(macd_hist_prev) and macd_hist > macd_hist_prev
+
+    pre_df, reg_df, ah_df = split_sessions(intraday_df) if intraday_df is not None and not intraday_df.empty else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    reg_vwap = calc_session_vwap(reg_df) if reg_df is not None and not reg_df.empty else np.nan
+    ah_vwap = calc_session_vwap(ah_df) if ah_df is not None and not ah_df.empty else np.nan
+    ah_price = float(ah_df["Close"].iloc[-1]) if ah_df is not None and not ah_df.empty else live_price
+    ah_high = float(ah_df["High"].max()) if ah_df is not None and not ah_df.empty else np.nan
+    ah_low = float(ah_df["Low"].min()) if ah_df is not None and not ah_df.empty else np.nan
+    ah_volume = float(ah_df["Volume"].sum()) if ah_df is not None and not ah_df.empty else safe_float(row.get("live_volume", 0), 0)
+    ah_change_pct = _safe_pct(ah_price, last_close)
+    live_change_pct = safe_float(row.get("live_change_pct", np.nan), np.nan)
+    if pd.isna(ah_change_pct) and pd.notna(live_change_pct):
+        ah_change_pct = live_change_pct
+
+    price_to_ema9_pct = _safe_pct(ah_price, ema9) if pd.notna(ema9) else np.nan
+    ah_volume_to_daily_pct = (ah_volume / avg_vol_20 * 100) if avg_vol_20 > 0 else np.nan
+
+    # Talep basıncı: hacim + kapanış gücü + AH hacim/fiyat devamı.
+    demand_parts = []
+    demand_parts.append(_score_linear(rvol20, 1.0, 6.0) * 0.40)
+    demand_parts.append((closing_strength if pd.notna(closing_strength) else 0) * 100 * 0.22)
+    demand_parts.append(_score_linear(ah_volume_to_daily_pct, 1.0, 12.0) * 0.18)
+    demand_parts.append(_score_linear(ah_change_pct, 0.0, 8.0) * 0.20)
+    demand_score = float(max(0, min(100, sum(demand_parts))))
+
+    # Teknik uyum: EMA9>EMA20, EMA eğimleri, MACD ivmesi, RSI verimli güç bölgesi, VWAP üstü.
+    technical_score = 0.0
+    if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20:
+        technical_score += 22
+    if pd.notna(ema20) and pd.notna(ema50) and ema20 > ema50:
+        technical_score += 10
+    if pd.notna(ema9) and ah_price > ema9:
+        technical_score += 14
+    if pd.notna(ema9_slope) and ema9_slope > 0:
+        technical_score += 10
+    if pd.notna(ema20_slope) and ema20_slope >= 0:
+        technical_score += 6
+    if pd.notna(macd_hist) and macd_hist > 0:
+        technical_score += 12
+    if macd_rising:
+        technical_score += 10
+    technical_score += _rsi_strength_score(rsi14) * 0.16
+    if pd.notna(reg_vwap) and ah_price > reg_vwap:
+        technical_score += 8
+    if pd.notna(ah_vwap) and ah_price > ah_vwap:
+        technical_score += 8
+    technical_score = float(max(0, min(100, technical_score)))
+
+    # Squeeze katkısı: bu sürümde gerçek short-float yoksa proxy kullanır.
+    # Düşük piyasa değeri + yüksek RVOL + yüksek hacim + fiyatın kırılım bölgesinde olması squeeze basıncı olarak yorumlanır.
+    market_cap = safe_float(row.get("market_cap", np.nan), np.nan)
+    squeeze_score = 0.0
+    if pd.notna(market_cap):
+        if market_cap < 75_000_000:
+            squeeze_score += 28
+        elif market_cap < 300_000_000:
+            squeeze_score += 22
+        elif market_cap < 1_000_000_000:
+            squeeze_score += 12
+    if pd.notna(rvol20):
+        if rvol20 >= 8:
+            squeeze_score += 28
+        elif rvol20 >= 5:
+            squeeze_score += 22
+        elif rvol20 >= 3:
+            squeeze_score += 14
+    if pd.notna(ah_volume_to_daily_pct):
+        if ah_volume_to_daily_pct >= 12:
+            squeeze_score += 18
+        elif ah_volume_to_daily_pct >= 5:
+            squeeze_score += 12
+        elif ah_volume_to_daily_pct >= 2:
+            squeeze_score += 6
+    prior_20h = float(dfi["High"].shift(1).rolling(20).max().iloc[-1]) if len(dfi) >= 21 else np.nan
+    extension_above_20h_pct = _safe_pct(ah_price, prior_20h) if pd.notna(prior_20h) else np.nan
+    if pd.notna(prior_20h) and ah_price >= prior_20h * 0.995:
+        squeeze_score += 18
+    if pd.notna(live_change_pct) and live_change_pct >= 8:
+        squeeze_score += 8
+    squeeze_score = float(max(0, min(100, squeeze_score)))
+
+    fib = compute_fib_channel_features(dfi, ah_price)
+    channel_score = fib["channel_score"]
+
+    # After-hours strength: stratejinin kendisi night-buy olduğu için ayrı güç skoru.
+    ah_strength = 0.0
+    if pd.notna(ah_change_pct):
+        if ah_change_pct >= 8:
+            ah_strength += 30
+        elif ah_change_pct >= 4:
+            ah_strength += 22
+        elif ah_change_pct >= 1.5:
+            ah_strength += 12
+        elif ah_change_pct < -1:
+            ah_strength -= 12
+    if pd.notna(ah_vwap) and ah_price > ah_vwap:
+        ah_strength += 26
+    if pd.notna(reg_vwap) and ah_price > reg_vwap:
+        ah_strength += 16
+    if pd.notna(ah_volume_to_daily_pct):
+        if ah_volume_to_daily_pct >= 10:
+            ah_strength += 22
+        elif ah_volume_to_daily_pct >= 4:
+            ah_strength += 14
+        elif ah_volume_to_daily_pct >= 1:
+            ah_strength += 6
+    if pd.notna(ah_high) and ah_high > 0:
+        ah_close_strength = (ah_price - ah_low) / (ah_high - ah_low) if pd.notna(ah_low) and ah_high > ah_low else np.nan
+        if pd.notna(ah_close_strength):
+            if ah_close_strength >= 0.75:
+                ah_strength += 10
+            elif ah_close_strength < 0.35:
+                ah_strength -= 10
+    ah_strength = float(max(0, min(100, ah_strength)))
+
+    # Piyasa/sektör desteği: burada SPY canlı intraday entegrasyonu yok; nötr 50 veriyoruz.
+    market_support = 50.0
+
+    # Fakeout/risk: üst fitil, aşırı uzama, EMA9'dan kopma, RSI şişmesi, AH VWAP altı, önceki gün fazla prim.
+    fakeout_risk = 0.0
+    if pd.notna(closing_strength):
+        if closing_strength < 0.45:
+            fakeout_risk += 22
+        elif closing_strength < 0.65:
+            fakeout_risk += 12
+    if pd.notna(prev_day_change_pct):
+        if prev_day_change_pct >= 25:
+            fakeout_risk += 24
+        elif prev_day_change_pct >= 15:
+            fakeout_risk += 16
+        elif prev_day_change_pct >= 10:
+            fakeout_risk += 10
+    if pd.notna(price_to_ema9_pct):
+        if price_to_ema9_pct >= 18:
+            fakeout_risk += 24
+        elif price_to_ema9_pct >= 10:
+            fakeout_risk += 14
+        elif price_to_ema9_pct <= -2:
+            fakeout_risk += 12
+    if pd.notna(rsi14):
+        if rsi14 >= 85:
+            fakeout_risk += 22
+        elif rsi14 >= 78:
+            fakeout_risk += 12
+        elif rsi14 < 50:
+            fakeout_risk += 18
+    if pd.notna(ah_vwap) and ah_price < ah_vwap:
+        fakeout_risk += 20
+    if pd.notna(extension_above_20h_pct):
+        if extension_above_20h_pct >= 18:
+            fakeout_risk += 20
+        elif extension_above_20h_pct >= 10:
+            fakeout_risk += 10
+    if pd.notna(ah_volume_to_daily_pct) and ah_volume_to_daily_pct < 0.5:
+        fakeout_risk += 12
+    fakeout_risk = float(max(0, min(100, fakeout_risk)))
+
+    positive_score = (
+        0.25 * demand_score +
+        0.20 * technical_score +
+        0.20 * squeeze_score +
+        0.15 * ah_strength +
+        0.15 * channel_score +
+        0.05 * market_support
+    )
+    # Risk doğrudan çıkarılır; bu yüzden iyi görünen ama fakeout riski yüksek adaylar elenir.
+    final_score = float(max(0, min(100, positive_score - 0.55 * fakeout_risk)))
+
+    hard_reject_reasons = []
+    if pd.isna(rvol20) or rvol20 < 1.3:
+        hard_reject_reasons.append("RVOL düşük")
+    if technical_score < 45:
+        hard_reject_reasons.append("Teknik hizalanma zayıf")
+    if ah_strength < 30:
+        hard_reject_reasons.append("After-hours güç zayıf")
+    if fakeout_risk >= 70:
+        hard_reject_reasons.append("Fakeout riski çok yüksek")
+    if ah_price < 1:
+        hard_reject_reasons.append("Fiyat < 1$")
+
+    target_pct = _target_pct_by_price(ah_price)
+    # Giriş bölgesi: AH VWAP ve son fiyatın üzerinde kontrollü bölge. Tek fiyat yerine bölge verilir.
+    entry_base_candidates = [ah_price]
+    if pd.notna(ah_vwap) and ah_vwap > 0:
+        entry_base_candidates.append(ah_vwap * 1.002)
+    if pd.notna(reg_vwap) and reg_vwap > 0:
+        entry_base_candidates.append(reg_vwap * 1.002)
+    entry_low = max(entry_base_candidates)
+    entry_high = entry_low * (1.012 if ah_price < 10 else 1.006)
+
+    stop_anchor = ah_vwap if pd.notna(ah_vwap) and ah_vwap > 0 else reg_vwap if pd.notna(reg_vwap) and reg_vwap > 0 else last_close
+    stop_price = min(entry_low * 0.94, stop_anchor - 0.65 * atr14)
+    stop_price = max(0.01, stop_price)
+    if stop_price >= entry_low:
+        stop_price = entry_low * 0.94
+    risk = max(entry_low - stop_price, 0.01)
+    tp1 = max(entry_low + 1.2 * risk, entry_low * (1 + target_pct))
+    tp2 = max(entry_low + 2.4 * risk, entry_low * (1 + 1.75 * target_pct))
+
+    if final_score >= 85 and fakeout_risk <= 45 and not hard_reject_reasons:
+        grade = "A"
+    elif final_score >= 75 and fakeout_risk <= 55 and not hard_reject_reasons:
+        grade = "B+"
+    elif final_score >= 65 and fakeout_risk <= 60:
+        grade = "B / Watch"
+    else:
+        grade = "Reject / Watch Only"
+
+    why = []
+    if demand_score >= 70:
+        why.append("Talep/hacim güçlü")
+    if technical_score >= 70:
+        why.append("EMA/MACD/RSI hizalı")
+    if squeeze_score >= 60:
+        why.append("Squeeze proxy güçlü")
+    if ah_strength >= 65:
+        why.append("AH tutunma güçlü")
+    if channel_score >= 60:
+        why.append("Kanal/Fib alanı açık")
+
+    risk_notes = []
+    if fakeout_risk >= 50:
+        risk_notes.append("Fakeout riski yüksek")
+    if pd.notna(prev_day_change_pct) and prev_day_change_pct >= 10:
+        risk_notes.append("Önceki gün fazla prim")
+    if pd.notna(price_to_ema9_pct) and price_to_ema9_pct >= 10:
+        risk_notes.append("EMA9'dan uzak")
+    if pd.notna(rsi14) and rsi14 >= 78:
+        risk_notes.append("RSI şişmiş")
+    if hard_reject_reasons:
+        risk_notes.extend(hard_reject_reasons[:3])
+
+    rnd = _price_round(ah_price)
+    result = {
+        "Symbol": symbol,
+        "Description": row.get("description", ""),
+        "Grade": grade,
+        "Final_Night_Score": round(final_score, 1),
+        "Demand_Pressure": round(demand_score, 1),
+        "Technical_Alignment": round(technical_score, 1),
+        "Squeeze_Proxy": round(squeeze_score, 1),
+        "AH_Strength": round(ah_strength, 1),
+        "Channel_Clarity": round(channel_score, 1),
+        "Fakeout_Risk": round(fakeout_risk, 1),
+        "Last_Close": round(last_close, rnd),
+        "AH_Live_Price": round(ah_price, rnd),
+        "AH_Change_%": round(ah_change_pct, 2) if pd.notna(ah_change_pct) else np.nan,
+        "RVOL20": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
+        "AH_Vol_to_Daily_%": round(ah_volume_to_daily_pct, 2) if pd.notna(ah_volume_to_daily_pct) else np.nan,
+        "EMA9": round(ema9, rnd) if pd.notna(ema9) else np.nan,
+        "EMA20": round(ema20, rnd) if pd.notna(ema20) else np.nan,
+        "EMA9_gt_EMA20": bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20),
+        "RSI14": round(rsi14, 2) if pd.notna(rsi14) else np.nan,
+        "MACD_Hist": round(macd_hist, 4) if pd.notna(macd_hist) else np.nan,
+        "MACD_Rising": bool(macd_rising),
+        "AH_VWAP": round(ah_vwap, rnd) if pd.notna(ah_vwap) else np.nan,
+        "Regular_VWAP": round(reg_vwap, rnd) if pd.notna(reg_vwap) else np.nan,
+        "Fib_1272": round(fib["fib_1272"], rnd) if pd.notna(fib["fib_1272"]) else np.nan,
+        "Upside_to_Fib127_%": round(fib["upside_to_1272_pct"], 2) if pd.notna(fib["upside_to_1272_pct"]) else np.nan,
+        "Night_Entry_Low": round(entry_low, rnd),
+        "Night_Entry_High": round(entry_high, rnd),
+        "Stop": round(stop_price, rnd),
+        "TP1": round(tp1, rnd),
+        "TP2": round(tp2, rnd),
+        "Risk_per_Share": round(risk, rnd),
+        "Why": ", ".join(why[:5]) if why else "Net pozitif gerekçe zayıf",
+        "Risk_Notes": ", ".join(risk_notes[:6]) if risk_notes else "Belirgin kırmızı bayrak yok",
+        "Hard_Reject": bool(len(hard_reject_reasons) > 0),
+    }
+    return result, None
+
+
+def evaluate_night_buy_candidates(universe_df: pd.DataFrame, daily_dict: dict) -> tuple[list[dict], list[dict]]:
+    final_candidates = []
+    rejected = []
+    if universe_df is None or universe_df.empty:
+        return final_candidates, rejected
+
+    for _, row in universe_df.iterrows():
+        symbol = row["symbol"]
+        yahoo_symbol = row["yahoo_symbol"]
+        try:
+            daily_df = daily_dict.get(yahoo_symbol)
+            if daily_df is None or daily_df.empty:
+                rejected.append({"Hisse": symbol, "Neden": "Günlük veri yok"})
+                continue
+            intraday_df = get_recent_intraday_full_data(
+                symbol=symbol,
+                yahoo_symbol=yahoo_symbol,
+                api_key_value=api_key,
+                secret_key_value=secret_key,
+                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+            )
+            candidate, reason = compute_night_buy_candidate(row, daily_df, intraday_df)
+            if candidate is None:
+                rejected.append({"Hisse": symbol, "Neden": reason or "Night feature üretilemedi"})
+                continue
+            if candidate["Grade"].startswith("Reject"):
+                rejected.append({"Hisse": symbol, "Neden": candidate.get("Risk_Notes", "Reject"), "Score": candidate.get("Final_Night_Score")})
+            else:
+                final_candidates.append(candidate)
+        except Exception as exc:
+            rejected.append({"Hisse": symbol, "Neden": f"Hata: {exc}"})
+            log_debug(f"Night evaluate error {symbol}: {exc}")
+
+    final_candidates = sorted(
+        final_candidates,
+        key=lambda x: (x["Final_Night_Score"], x["Demand_Pressure"], x["Squeeze_Proxy"]),
+        reverse=True,
+    )
+    return final_candidates, rejected
+# ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "⚡ Canlı Gün İçi Radar",
         "🧠 Intraday Trade Engine",
         "🔮 Kurumsal Swing Radar",
         "📊 VWAP Analizi ve Emir Merkezi",
+        "🌙 Night Buy Scanner",
     ]
 )
 
@@ -2520,6 +3112,127 @@ with tab4:
                             st.code(traceback.format_exc())
 
 
+
+
+# ============================================================
+# TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE
+# ============================================================
+with tab5:
+    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine")
+    st.write(
+        "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
+        "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı ve fakeout riskini birlikte puanlar."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        night_scan_mode = st.selectbox(
+            "Tarama modu",
+            ["afterhours", "premarket", "regular"],
+            index=0,
+            format_func=lambda x: {
+                "afterhours": "After-Hours / Gece",
+                "premarket": "Pre-Market",
+                "regular": "Regular Momentum",
+            }[x],
+        )
+    with c2:
+        night_universe_size = st.slider("Evren genişliği", min_value=20, max_value=150, value=80, step=10, key="night_universe_size")
+    with c3:
+        night_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=20.0, value=1.0, step=0.5, key="night_min_price")
+    with c4:
+        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=80.0, step=5.0, key="night_max_price")
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        night_min_volume = st.number_input("Min regular hacim", min_value=50_000, max_value=5_000_000, value=150_000, step=50_000, key="night_min_volume")
+    with c6:
+        min_night_score = st.slider("Min Night Score", min_value=0, max_value=100, value=70, step=5, key="min_night_score")
+    with c7:
+        max_fakeout = st.slider("Max Fakeout Risk", min_value=0, max_value=100, value=60, step=5, key="max_fakeout")
+
+    st.caption(
+        "Not: Bu ilk sürümde squeeze, gerçek short-float verisi olmadan düşük piyasa değeri + RVOL + AH hacim + kırılım davranışıyla proxy olarak hesaplanır. "
+        "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
+    )
+
+    if st.button("🌙 Night Buy Scanner'ı Çalıştır", key="btn_night_buy"):
+        try:
+            with st.spinner("1. Aşama: Night-buy evreni TradingView üzerinden taranıyor..."):
+                night_universe = fetch_night_buy_universe(
+                    scan_mode=night_scan_mode,
+                    max_records=night_universe_size,
+                    min_price=night_min_price,
+                    max_price=night_max_price,
+                    min_volume=int(night_min_volume),
+                )
+
+            if night_universe.empty:
+                st.warning("Night-buy evreni boş döndü. Seans kapalıysa veya TradingView postmarket verisi gelmiyorsa premarket/regular modunu dene.")
+            else:
+                st.info(f"İlk aşamada bulunan aday sayısı: {len(night_universe)}")
+                tickers = night_universe["yahoo_symbol"].dropna().unique().tolist()
+
+                with st.spinner("2. Aşama: Günlük veri indiriliyor..."):
+                    night_daily_dict = download_daily_data_chunked(
+                        tickers,
+                        period="260d",
+                        chunk_size=10,
+                        pause=1.0,
+                        alpaca_key=api_key,
+                        alpaca_secret=secret_key,
+                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+                    )
+
+                with st.spinner("3. Aşama: Night Pressure / Squeeze / Fakeout scoring yapılıyor..."):
+                    night_candidates, night_rejected = evaluate_night_buy_candidates(night_universe, night_daily_dict)
+
+                night_df = pd.DataFrame(night_candidates)
+                if not night_df.empty:
+                    night_df = night_df[
+                        (night_df["Final_Night_Score"] >= min_night_score) &
+                        (night_df["Fakeout_Risk"] <= max_fakeout) &
+                        (night_df["Hard_Reject"] == False)
+                    ].copy()
+                    night_df = night_df.sort_values(["Final_Night_Score", "Demand_Pressure", "Squeeze_Proxy"], ascending=False)
+
+                if night_df.empty:
+                    st.warning("Filtrelerden geçen A/B kalite Night Buy adayı çıkmadı. Reddedilenler bölümünü kontrol et.")
+                else:
+                    st.success(f"Night Buy uygun aday sayısı: {len(night_df)}")
+
+                    st.subheader("🏆 Night Buy Adayları")
+                    show_cols = [
+                        "Symbol", "Grade", "Final_Night_Score", "Demand_Pressure", "Technical_Alignment",
+                        "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Fakeout_Risk",
+                        "AH_Live_Price", "AH_Change_%", "RVOL20", "EMA9_gt_EMA20", "RSI14",
+                        "Night_Entry_Low", "Night_Entry_High", "Stop", "TP1", "TP2", "Why", "Risk_Notes"
+                    ]
+                    available_cols = [c for c in show_cols if c in night_df.columns]
+                    st.dataframe(night_df[available_cols].head(20), use_container_width=True)
+
+                    st.subheader("🥇 En Güçlü 3 Night Buy")
+                    st.dataframe(night_df[available_cols].head(3), use_container_width=True)
+
+                    csv_night = night_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Night Buy sonuçları CSV indir",
+                        data=csv_night,
+                        file_name=f"night_buy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                    )
+
+                with st.expander("Night Buy reddedilenler / watch only"):
+                    rej_df = pd.DataFrame(night_rejected)
+                    if not rej_df.empty:
+                        st.dataframe(rej_df, use_container_width=True)
+                    else:
+                        st.write("Kayıt yok.")
+
+        except Exception as exc:
+            st.error(f"Night Buy Scanner hatası: {exc}")
+            if DEBUG_MODE:
+                st.code(traceback.format_exc())
 st.write("---")
 st.caption(
     "Bu araç yatırım tavsiyesi değildir. Önce paper trading ile test edilmesi gerekir. "
