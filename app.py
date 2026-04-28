@@ -2545,14 +2545,22 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     tp1 = max(entry_low + 1.2 * risk, entry_low * (1 + target_pct))
     tp2 = max(entry_low + 2.4 * risk, entry_low * (1 + 1.75 * target_pct))
 
+    # Karar katmanları:
+    # - A/B+ gerçek işlem adayı değildir; önce küçük/paper test ile doğrulanmalıdır.
+    # - Paper Watchlist, 60-74 arası skoru kullanıcıya görünür kılar; sistem eğitim verisi toplamak içindir.
+    # - Hard reject varsa aday ana/watchlist tablosuna alınmaz, ancak reject bölümünde gerekçesi görünür.
     if final_score >= 85 and fakeout_risk <= 45 and not hard_reject_reasons:
         grade = "A"
+        status = "TRADE_CANDIDATE"
     elif final_score >= 75 and fakeout_risk <= 55 and not hard_reject_reasons:
         grade = "B+"
-    elif final_score >= 65 and fakeout_risk <= 60:
-        grade = "B / Watch"
+        status = "TRADE_CANDIDATE"
+    elif final_score >= 60 and fakeout_risk <= 60 and not hard_reject_reasons:
+        grade = "Paper Watchlist"
+        status = "PAPER_WATCHLIST"
     else:
         grade = "Reject / Watch Only"
+        status = "REJECT"
 
     why = []
     if demand_score >= 70:
@@ -2583,6 +2591,7 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "Symbol": symbol,
         "Description": row.get("description", ""),
         "Grade": grade,
+        "Status": status,
         "Final_Night_Score": round(final_score, 1),
         "Demand_Pressure": round(demand_score, 1),
         "Technical_Alignment": round(technical_score, 1),
@@ -2643,10 +2652,9 @@ def evaluate_night_buy_candidates(universe_df: pd.DataFrame, daily_dict: dict) -
             if candidate is None:
                 rejected.append({"Hisse": symbol, "Neden": reason or "Night feature üretilemedi"})
                 continue
-            if candidate["Grade"].startswith("Reject"):
-                rejected.append({"Hisse": symbol, "Neden": candidate.get("Risk_Notes", "Reject"), "Score": candidate.get("Final_Night_Score")})
-            else:
-                final_candidates.append(candidate)
+            # Tüm skorlanmış adayları ana listeye ekliyoruz.
+            # UI tarafında bunlar TRADE_CANDIDATE / PAPER_WATCHLIST / REJECT olarak ayrılır.
+            final_candidates.append(candidate)
         except Exception as exc:
             rejected.append({"Hisse": symbol, "Neden": f"Hata: {exc}"})
             log_debug(f"Night evaluate error {symbol}: {exc}")
@@ -3187,46 +3195,105 @@ with tab5:
                 with st.spinner("3. Aşama: Night Pressure / Squeeze / Fakeout scoring yapılıyor..."):
                     night_candidates, night_rejected = evaluate_night_buy_candidates(night_universe, night_daily_dict)
 
-                night_df = pd.DataFrame(night_candidates)
-                if not night_df.empty:
-                    night_df = night_df[
-                        (night_df["Final_Night_Score"] >= min_night_score) &
-                        (night_df["Fakeout_Risk"] <= max_fakeout) &
-                        (night_df["Hard_Reject"] == False)
-                    ].copy()
-                    night_df = night_df.sort_values(["Final_Night_Score", "Demand_Pressure", "Squeeze_Proxy"], ascending=False)
+                night_all_df = pd.DataFrame(night_candidates)
+                show_cols = [
+                    "Symbol", "Grade", "Status", "Final_Night_Score", "Demand_Pressure", "Technical_Alignment",
+                    "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Fakeout_Risk",
+                    "AH_Live_Price", "AH_Change_%", "RVOL20", "AH_Vol_to_Daily_%",
+                    "EMA9_gt_EMA20", "RSI14", "MACD_Rising",
+                    "Night_Entry_Low", "Night_Entry_High", "Stop", "TP1", "TP2", "Why", "Risk_Notes"
+                ]
 
-                if night_df.empty:
-                    st.warning("Filtrelerden geçen A/B kalite Night Buy adayı çıkmadı. Reddedilenler bölümünü kontrol et.")
+                if night_all_df.empty:
+                    trade_df = pd.DataFrame()
+                    watch_df = pd.DataFrame()
+                    rejected_scored_df = pd.DataFrame()
+                    st.warning("Night Buy scoring üretilemedi. Veri/bağlantı reddedilenler bölümünü kontrol et.")
                 else:
-                    st.success(f"Night Buy uygun aday sayısı: {len(night_df)}")
+                    night_all_df = night_all_df.sort_values(
+                        ["Final_Night_Score", "Demand_Pressure", "Squeeze_Proxy"],
+                        ascending=False,
+                    ).copy()
 
-                    st.subheader("🏆 Night Buy Adayları")
-                    show_cols = [
-                        "Symbol", "Grade", "Final_Night_Score", "Demand_Pressure", "Technical_Alignment",
-                        "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Fakeout_Risk",
-                        "AH_Live_Price", "AH_Change_%", "RVOL20", "EMA9_gt_EMA20", "RSI14",
-                        "Night_Entry_Low", "Night_Entry_High", "Stop", "TP1", "TP2", "Why", "Risk_Notes"
-                    ]
-                    available_cols = [c for c in show_cols if c in night_df.columns]
-                    st.dataframe(night_df[available_cols].head(20), use_container_width=True)
+                    trade_df = night_all_df[
+                        (night_all_df["Status"] == "TRADE_CANDIDATE") &
+                        (night_all_df["Final_Night_Score"] >= max(75, min_night_score)) &
+                        (night_all_df["Fakeout_Risk"] <= max_fakeout) &
+                        (night_all_df["Hard_Reject"] == False)
+                    ].copy()
 
-                    st.subheader("🥇 En Güçlü 3 Night Buy")
-                    st.dataframe(night_df[available_cols].head(3), use_container_width=True)
+                    watch_df = night_all_df[
+                        (night_all_df["Status"] == "PAPER_WATCHLIST") &
+                        (night_all_df["Final_Night_Score"] >= min_night_score) &
+                        (night_all_df["Fakeout_Risk"] <= max_fakeout) &
+                        (night_all_df["Hard_Reject"] == False)
+                    ].copy()
 
-                    csv_night = night_df.to_csv(index=False).encode("utf-8-sig")
+                    rejected_scored_df = night_all_df[
+                        ~night_all_df["Symbol"].isin(pd.concat([trade_df["Symbol"], watch_df["Symbol"]], ignore_index=True))
+                    ].copy()
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("A/B Night Buy adayı", len(trade_df))
+                    m2.metric("Paper Watchlist", len(watch_df))
+                    m3.metric("Reject / zayıf", len(rejected_scored_df) + len(night_rejected))
+
+                    available_cols = [c for c in show_cols if c in night_all_df.columns]
+
+                    if trade_df.empty:
+                        st.warning("Gerçek Night Buy adayı yok. Bu gece için sistem işlem baskısı yeterli görmedi.")
+                    else:
+                        st.success(f"A/B kalite Night Buy adayı: {len(trade_df)}")
+                        st.subheader("🏆 A/B Night Buy Adayları")
+                        st.dataframe(trade_df[available_cols].head(20), use_container_width=True)
+
+                        st.subheader("🥇 En Güçlü 3 Night Buy")
+                        st.dataframe(trade_df[available_cols].head(3), use_container_width=True)
+
+                    if watch_df.empty:
+                        st.info("Paper Watchlist adayı yok. Min Night Score değerini 55-60 bandına çekerek eğitim amaçlı izleme yapılabilir.")
+                    else:
+                        st.subheader("📝 Paper Watchlist — işlem değil, takip/eğitim")
+                        st.caption("Bu tablo 60-74 arası adayları gösterir. Gerçek işlem için değil; ertesi gün sonuç kaydı ve ağırlık kalibrasyonu içindir.")
+                        st.dataframe(watch_df[available_cols].head(25), use_container_width=True)
+
+                    csv_all = night_all_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        "📥 Night Buy sonuçları CSV indir",
-                        data=csv_night,
-                        file_name=f"night_buy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "📥 Tüm Night Buy skorlarını CSV indir",
+                        data=csv_all,
+                        file_name=f"night_buy_all_scored_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
                     )
 
-                with st.expander("Night Buy reddedilenler / watch only"):
+                    if not trade_df.empty:
+                        csv_trade = trade_df.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📥 Sadece A/B adayları CSV indir",
+                            data=csv_trade,
+                            file_name=f"night_buy_trade_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                        )
+
+                    if not watch_df.empty:
+                        csv_watch = watch_df.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📥 Paper Watchlist CSV indir",
+                            data=csv_watch,
+                            file_name=f"night_buy_paper_watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                        )
+
+                with st.expander("Night Buy reject / veri hatası / zayıf skor detayları"):
+                    if 'rejected_scored_df' in locals() and not rejected_scored_df.empty:
+                        reject_cols = [c for c in show_cols if c in rejected_scored_df.columns]
+                        st.write("Skorlandı ama işlem/watchlist filtresine girmedi:")
+                        st.dataframe(rejected_scored_df[reject_cols].head(100), use_container_width=True)
+
                     rej_df = pd.DataFrame(night_rejected)
                     if not rej_df.empty:
+                        st.write("Veri eksikliği veya hesaplama nedeniyle skorlanamayanlar:")
                         st.dataframe(rej_df, use_container_width=True)
-                    else:
+                    elif (('rejected_scored_df' not in locals()) or rejected_scored_df.empty):
                         st.write("Kayıt yok.")
 
         except Exception as exc:
