@@ -2548,7 +2548,27 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     # Karar katmanları:
     # - A/B+ gerçek işlem adayı değildir; önce küçük/paper test ile doğrulanmalıdır.
     # - Paper Watchlist, 60-74 arası skoru kullanıcıya görünür kılar; sistem eğitim verisi toplamak içindir.
-    # - Hard reject varsa aday ana/watchlist tablosuna alınmaz, ancak reject bölümünde gerekçesi görünür.
+    # - Aggressive Squeeze Watch, final skoru düşük kalsa bile squeeze/talep/AH basıncı yüksek olan riskli adayları ayrı gösterir.
+    # - Hard reject varsa aday ana/watchlist/aggressive tablosuna alınmaz, ancak reject bölümünde gerekçesi görünür.
+    aggressive_reasons = []
+    if squeeze_score >= 65:
+        aggressive_reasons.append("Squeeze proxy yüksek")
+    if demand_score >= 70:
+        aggressive_reasons.append("Talep basıncı yüksek")
+    if ah_strength >= 65 and technical_score >= 80 and demand_score >= 60:
+        aggressive_reasons.append("AH + teknik momentum güçlü")
+
+    aggressive_watch_ok = (
+        final_score < 60
+        and fakeout_risk <= 60
+        and not hard_reject_reasons
+        and (
+            squeeze_score >= 65
+            or demand_score >= 70
+            or (ah_strength >= 65 and technical_score >= 80 and demand_score >= 60)
+        )
+    )
+
     if final_score >= 85 and fakeout_risk <= 45 and not hard_reject_reasons:
         grade = "A"
         status = "TRADE_CANDIDATE"
@@ -2558,6 +2578,9 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     elif final_score >= 60 and fakeout_risk <= 60 and not hard_reject_reasons:
         grade = "Paper Watchlist"
         status = "PAPER_WATCHLIST"
+    elif aggressive_watch_ok:
+        grade = "Aggressive Squeeze Watch"
+        status = "AGGRESSIVE_SQUEEZE_WATCH"
     else:
         grade = "Reject / Watch Only"
         status = "REJECT"
@@ -2622,6 +2645,7 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "Risk_per_Share": round(risk, rnd),
         "Why": ", ".join(why[:5]) if why else "Net pozitif gerekçe zayıf",
         "Risk_Notes": ", ".join(risk_notes[:6]) if risk_notes else "Belirgin kırmızı bayrak yok",
+        "Aggressive_Reason": ", ".join(aggressive_reasons[:4]) if aggressive_reasons else "-",
         "Hard_Reject": bool(len(hard_reject_reasons) > 0),
     }
     return result, None
@@ -3201,12 +3225,13 @@ with tab5:
                     "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Fakeout_Risk",
                     "AH_Live_Price", "AH_Change_%", "RVOL20", "AH_Vol_to_Daily_%",
                     "EMA9_gt_EMA20", "RSI14", "MACD_Rising",
-                    "Night_Entry_Low", "Night_Entry_High", "Stop", "TP1", "TP2", "Why", "Risk_Notes"
+                    "Night_Entry_Low", "Night_Entry_High", "Stop", "TP1", "TP2", "Why", "Risk_Notes", "Aggressive_Reason"
                 ]
 
                 if night_all_df.empty:
                     trade_df = pd.DataFrame()
                     watch_df = pd.DataFrame()
+                    aggressive_df = pd.DataFrame()
                     rejected_scored_df = pd.DataFrame()
                     st.warning("Night Buy scoring üretilemedi. Veri/bağlantı reddedilenler bölümünü kontrol et.")
                 else:
@@ -3229,14 +3254,25 @@ with tab5:
                         (night_all_df["Hard_Reject"] == False)
                     ].copy()
 
-                    rejected_scored_df = night_all_df[
-                        ~night_all_df["Symbol"].isin(pd.concat([trade_df["Symbol"], watch_df["Symbol"]], ignore_index=True))
+                    aggressive_df = night_all_df[
+                        (night_all_df["Status"] == "AGGRESSIVE_SQUEEZE_WATCH") &
+                        (night_all_df["Fakeout_Risk"] <= max_fakeout) &
+                        (night_all_df["Hard_Reject"] == False)
                     ].copy()
 
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("A/B Night Buy adayı", len(trade_df))
+                    shown_symbols = pd.concat(
+                        [trade_df["Symbol"], watch_df["Symbol"], aggressive_df["Symbol"]],
+                        ignore_index=True
+                    )
+                    rejected_scored_df = night_all_df[
+                        ~night_all_df["Symbol"].isin(shown_symbols)
+                    ].copy()
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("A/B Night Buy", len(trade_df))
                     m2.metric("Paper Watchlist", len(watch_df))
-                    m3.metric("Reject / zayıf", len(rejected_scored_df) + len(night_rejected))
+                    m3.metric("Aggressive Squeeze", len(aggressive_df))
+                    m4.metric("Reject / zayıf", len(rejected_scored_df) + len(night_rejected))
 
                     available_cols = [c for c in show_cols if c in night_all_df.columns]
 
@@ -3256,6 +3292,16 @@ with tab5:
                         st.subheader("📝 Paper Watchlist — işlem değil, takip/eğitim")
                         st.caption("Bu tablo 60-74 arası adayları gösterir. Gerçek işlem için değil; ertesi gün sonuç kaydı ve ağırlık kalibrasyonu içindir.")
                         st.dataframe(watch_df[available_cols].head(25), use_container_width=True)
+
+                    if aggressive_df.empty:
+                        st.info("Aggressive Squeeze Watch adayı yok. Bu iyi bir şey olabilir; sistem riskli squeeze ihtimalini zorlamıyor.")
+                    else:
+                        st.subheader("🔥 Aggressive Squeeze Watch — yüksek riskli, gerçek işlem değil")
+                        st.caption(
+                            "Bu tablo final skoru 60 altı kalsa bile squeeze/talep/AH momentum basıncı yüksek olan adayları gösterir. "
+                            "Gece alım kararı değil; premarket/canlı teyit ve paper takip listesidir."
+                        )
+                        st.dataframe(aggressive_df[available_cols].head(25), use_container_width=True)
 
                     csv_all = night_all_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
@@ -3280,6 +3326,15 @@ with tab5:
                             "📥 Paper Watchlist CSV indir",
                             data=csv_watch,
                             file_name=f"night_buy_paper_watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                        )
+
+                    if not aggressive_df.empty:
+                        csv_aggressive = aggressive_df.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📥 Aggressive Squeeze Watch CSV indir",
+                            data=csv_aggressive,
+                            file_name=f"night_buy_aggressive_squeeze_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                             mime="text/csv",
                         )
 
