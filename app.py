@@ -2446,8 +2446,11 @@ def build_csv_daily_momentum_universe(
 ) -> tuple[pd.DataFrame, dict, dict]:
     """CSV ticker evreninden günlük momentum adayları üretir.
 
-    Not: Büyük evrende Render/Yahoo limitlerini aşmamak için max_tickers_to_scan kullanılır.
-    Bu fonksiyon günlük veri sözlüğünü de döndürür; UI tarafında aynı veri tekrar indirilmez.
+    v7 farkı:
+    - Önce STRICT günlük momentum filtresi denenir.
+    - STRICT aday çıkmazsa, tüm valid CSV hisseleri günlük momentum puanına göre sıralanır
+      ve LOOSE Daily Momentum Fallback olarak en iyi adaylar Night Buy skorlamasına gönderilir.
+    - Böylece ekran tamamen boş kalmaz; veri yok / aday yok / filtre çok sert ayrımı diagnostikte görünür.
     """
     raw_tickers = list(tickers_tuple or ())
     clean = _clean_ticker_list(raw_tickers)
@@ -2456,7 +2459,10 @@ def build_csv_daily_momentum_universe(
         "csv_scanned_tickers": 0,
         "csv_daily_data_ok": 0,
         "csv_daily_momentum_candidates": 0,
+        "csv_daily_momentum_candidates_strict": 0,
+        "csv_daily_momentum_candidates_loose": 0,
         "csv_universe_source": "CSV Daily Momentum",
+        "csv_fallback_mode": "-",
     }
 
     if not clean:
@@ -2464,11 +2470,11 @@ def build_csv_daily_momentum_universe(
 
     # Alfabetik listenin sadece başını taramak hareketli hisseleri kaçırabilir.
     # Bu yüzden CSV evrenini gün bazlı deterministik şekilde karıştırıyoruz.
-    # Aynı gün aynı sonuçları verir; farklı günlerde örneklem yenilenir.
     try:
         seed = int(datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d"))
     except Exception:
         seed = int(datetime.now().strftime("%Y%m%d"))
+
     if len(clean) > int(max_tickers_to_scan):
         scan_tickers = pd.Series(clean).sample(n=int(max_tickers_to_scan), random_state=seed).tolist()
         diagnostics["csv_sampling"] = f"daily_shuffle_seed_{seed}"
@@ -2489,7 +2495,9 @@ def build_csv_daily_momentum_universe(
     )
     diagnostics["csv_daily_data_ok"] = len(daily_dict)
 
-    rows = []
+    strict_rows = []
+    loose_rows = []
+
     for yahoo_symbol, df in daily_dict.items():
         try:
             if df is None or df.empty or len(df) < 80:
@@ -2503,17 +2511,20 @@ def build_csv_daily_momentum_universe(
                 continue
 
             row_score, notes, eligible = _daily_momentum_row_score(latest, min_volume=int(min_volume))
-            if not eligible:
-                continue
 
             volume = safe_float(latest.get("Volume", np.nan), np.nan)
+            dollar_volume = safe_float(latest.get("DollarVolume", np.nan), np.nan)
             avg_vol_20 = safe_float(latest.get("AvgVolume_20", np.nan), np.nan)
             rvol20 = volume / avg_vol_20 if pd.notna(volume) and pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
             prev_close = safe_float(latest.get("PrevClose", np.nan), np.nan)
             change_pct = (close - prev_close) / prev_close * 100 if pd.notna(prev_close) and prev_close > 0 else np.nan
+            vol_spike10 = safe_float(latest.get("VolSpike10", np.nan), np.nan)
+            close_pos = safe_float(latest.get("ClosePosition", np.nan), np.nan)
+            price_above_ema9 = bool(latest.get("Price_Above_EMA9", False))
+            ema9_gt_ema21 = bool(latest.get("EMA9_Above_EMA21", False))
+            breakout_flag = bool(latest.get("Breakout_Flag", False))
 
-            # Yahoo symbol zaten '-' formatında. Görsel symbol için '-' kullanımını koruyoruz; Alpaca tarafı bazı noktalı hisselerde veri vermezse Yahoo fallback çalışır.
-            rows.append({
+            base_row = {
                 "symbol": yahoo_symbol,
                 "yahoo_symbol": yahoo_symbol,
                 "description": "CSV Daily Momentum Fallback",
@@ -2528,14 +2539,59 @@ def build_csv_daily_momentum_universe(
                 "CSV_Momentum_Score": round(row_score, 1),
                 "CSV_Momentum_Notes": ", ".join(notes[:6]) if notes else "-",
                 "CSV_Return_1D_%": round(change_pct, 2) if pd.notna(change_pct) else np.nan,
+                "CSV_VolSpike10": round(vol_spike10, 2) if pd.notna(vol_spike10) else np.nan,
+                "CSV_ClosePosition": round(close_pos, 2) if pd.notna(close_pos) else np.nan,
+                "CSV_DollarVolume_M": round(dollar_volume / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
                 "Universe_Source": "CSV_DAILY_FALLBACK",
-            })
+            }
+
+            if eligible:
+                row = dict(base_row)
+                row["CSV_Fallback_Mode"] = "STRICT"
+                strict_rows.append(row)
+            else:
+                # LOOSE fallback: yalnızca skorlamaya aday üretmek için.
+                # Gerçek işlem kararı hâlâ Night Buy skorları ve risk filtreleriyle verilir.
+                loose_ok = (
+                    pd.notna(volume)
+                    and pd.notna(dollar_volume)
+                    and volume >= max(25_000, int(min_volume * 0.25))
+                    and dollar_volume >= 300_000
+                    and row_score >= 28
+                    and (
+                        (pd.notna(change_pct) and change_pct >= 0.5)
+                        or (pd.notna(vol_spike10) and vol_spike10 >= 1.1)
+                        or (pd.notna(close_pos) and close_pos >= 0.55)
+                        or price_above_ema9
+                        or ema9_gt_ema21
+                        or breakout_flag
+                    )
+                )
+                if loose_ok:
+                    row = dict(base_row)
+                    row["CSV_Fallback_Mode"] = "LOOSE"
+                    loose_rows.append(row)
         except Exception as exc:
             log_debug(f"CSV daily momentum parse error {yahoo_symbol}: {exc}")
             continue
 
-    out = pd.DataFrame(rows)
-    diagnostics["csv_daily_momentum_candidates"] = len(out)
+    diagnostics["csv_daily_momentum_candidates_strict"] = len(strict_rows)
+    diagnostics["csv_daily_momentum_candidates_loose"] = len(loose_rows)
+
+    if strict_rows:
+        out = pd.DataFrame(strict_rows)
+        diagnostics["csv_fallback_mode"] = "STRICT"
+        diagnostics["csv_daily_momentum_candidates"] = len(out)
+    elif loose_rows:
+        out = pd.DataFrame(loose_rows)
+        diagnostics["csv_fallback_mode"] = "LOOSE"
+        diagnostics["csv_universe_source"] = "CSV Loose Daily Momentum Fallback"
+        diagnostics["csv_daily_momentum_candidates"] = len(out)
+    else:
+        out = pd.DataFrame()
+        diagnostics["csv_fallback_mode"] = "NO_CANDIDATES"
+        diagnostics["csv_daily_momentum_candidates"] = 0
+
     if not out.empty:
         out = out.sort_values(
             ["CSV_Momentum_Score", "tv_rvol", "regular_volume"],
@@ -3659,7 +3715,7 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v6")
+    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v7")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
         "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
@@ -3699,10 +3755,10 @@ with tab5:
             "CSV max ticker tarama",
             min_value=100,
             max_value=8000,
-            value=600,
+            value=1000,
             step=100,
             key="csv_max_tickers",
-            help="CSV fallback aktifse ilk N sembol günlük momentum için taranır. Render Starter için 500-1000 güvenli aralıktır.",
+            help="CSV fallback aktifse N sembol günlük momentum için taranır. Render Starter için 600-1500 güvenli aralıktır; 2000+ yavaşlayabilir.",
         )
 
     c4, c5, c6, c7 = st.columns(4)
@@ -3733,7 +3789,7 @@ with tab5:
     )
 
     st.caption(
-        "v6: Hybrid Plus modunda TradingView + CSV Daily Momentum birleşik evren kullanılır. "
+        "v7: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
         "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
         "ön aday üretir; sonra Night Buy v4/v5 scoring aynı şekilde uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
@@ -3748,7 +3804,7 @@ with tab5:
             source_used = "-"
 
             # 1) TradingView evreni
-            if night_universe_source in ["hybrid", "tradingview"]:
+            if night_universe_source in ["hybrid_plus", "hybrid", "tradingview"]:
                 with st.spinner("1. Aşama: TradingView evreni taranıyor..."):
                     tv_universe = fetch_night_buy_universe(
                         scan_mode=night_scan_mode,
@@ -3835,7 +3891,7 @@ with tab5:
                             night_universe = csv_universe.copy()
                             source_used = "CSV Daily Momentum" if night_universe_source == "csv" else "CSV Daily Momentum Fallback"
                     elif night_universe.empty:
-                        st.warning("CSV Daily Momentum aday üretmedi. Filtreleri gevşet, CSV max ticker taramayı artır veya premarket/regular modu dene.")
+                        st.warning("CSV Daily Momentum STRICT/LOOSE fallback aday üretmedi. CSV max ticker taramayı artır, min regular hacmi düşür veya premarket/regular modu dene.")
                     elif night_universe_source == "hybrid_plus":
                         st.info("CSV Daily Momentum bu çalıştırmada aday üretmedi; TradingView evreniyle devam ediliyor.")
 
