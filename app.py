@@ -2258,6 +2258,280 @@ def fetch_night_buy_universe(
     return pd.DataFrame(rows)
 
 
+
+# ============================================================
+# NIGHT BUY v5: CSV DAILY MOMENTUM UNIVERSE / FALLBACK
+# ============================================================
+def _detect_csv_ticker_column(df: pd.DataFrame, preferred: str | None = None) -> str:
+    """CSV içinden sembol kolonunu bulur. Boşsa yaygın kolon adlarını dener; yoksa ilk kolonu alır."""
+    if df is None or df.empty:
+        raise ValueError("CSV boş görünüyor.")
+    if preferred and preferred in df.columns:
+        return preferred
+    candidates = ["Symbol", "symbol", "Ticker", "ticker", "Code", "code", "Sembol", "sembol"]
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return str(df.columns[0])
+
+
+def _clean_ticker_list(raw_values) -> list[str]:
+    out = []
+    seen = set()
+    for val in raw_values:
+        try:
+            ticker = str(val).strip().upper()
+        except Exception:
+            continue
+        if not ticker or ticker in {"NAN", "NONE", "NULL", "-"}:
+            continue
+        # Yahoo formatı: BRK.B -> BRK-B
+        ticker = ticker.replace(".", "-")
+        # Çok bariz uygun olmayan satırları ele.
+        if len(ticker) > 12 or " " in ticker:
+            continue
+        if ticker not in seen:
+            seen.add(ticker)
+            out.append(ticker)
+    return out
+
+
+def load_tickers_from_csv_dataframe(df: pd.DataFrame, column_name: str | None = None) -> list[str]:
+    col = _detect_csv_ticker_column(df, column_name)
+    return _clean_ticker_list(df[col].tolist())
+
+
+def load_tickers_from_uploaded_csv(uploaded_file, column_name: str | None = None) -> list[str]:
+    """Streamlit upload edilen CSV'den ticker listesi okur."""
+    if uploaded_file is None:
+        return []
+    try:
+        df = pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding="latin-1")
+    return load_tickers_from_csv_dataframe(df, column_name)
+
+
+@st.cache_data(ttl=3600)
+def load_tickers_from_repo_csv(csv_path: str = "nasdaq_nyse_tickers.csv", column_name: str | None = None) -> list[str]:
+    """Repo içinde nasdaq_nyse_tickers.csv varsa okur. Yoksa boş liste döner."""
+    try:
+        if not os.path.exists(csv_path):
+            return []
+        df = pd.read_csv(csv_path)
+        return load_tickers_from_csv_dataframe(df, column_name)
+    except Exception:
+        return []
+
+
+def _daily_momentum_row_score(latest: pd.Series, min_volume: int) -> tuple[float, list[str], bool]:
+    """CSV fallback evreni için günlük momentum ön skoru üretir."""
+    notes = []
+    score = 0.0
+
+    close = safe_float(latest.get("Close", np.nan), np.nan)
+    volume = safe_float(latest.get("Volume", np.nan), np.nan)
+    dollar_volume = safe_float(latest.get("DollarVolume", np.nan), np.nan)
+    return_1d_pct = safe_float(latest.get("Return_1D", np.nan), np.nan) * 100 if pd.notna(latest.get("Return_1D", np.nan)) else np.nan
+    return_3d_pct = safe_float(latest.get("Return_3D", np.nan), np.nan) * 100 if pd.notna(latest.get("Return_3D", np.nan)) else np.nan
+    vol_spike10 = safe_float(latest.get("VolSpike10", np.nan), np.nan)
+    close_pos = safe_float(latest.get("ClosePosition", np.nan), np.nan)
+    rsi = safe_float(latest.get("RSI14", np.nan), np.nan)
+    breakout_flag = bool(latest.get("Breakout_Flag", False))
+    breakout_pct = safe_float(latest.get("Breakout_Pct", np.nan), np.nan) * 100 if pd.notna(latest.get("Breakout_Pct", np.nan)) else np.nan
+    ema9_gt_ema21 = bool(latest.get("EMA9_Above_EMA21", False))
+    price_above_ema9 = bool(latest.get("Price_Above_EMA9", False))
+    ema_cross = bool(latest.get("EMA9_CrossUp_EMA21", False))
+
+    if pd.notna(return_1d_pct):
+        if return_1d_pct >= 10:
+            score += 22
+            notes.append("1D güçlü")
+        elif return_1d_pct >= 5:
+            score += 18
+            notes.append("1D pozitif")
+        elif return_1d_pct >= 2:
+            score += 10
+
+    if pd.notna(return_3d_pct):
+        if return_3d_pct >= 12:
+            score += 12
+            notes.append("3D momentum")
+        elif return_3d_pct > 0:
+            score += 6
+
+    if pd.notna(vol_spike10):
+        if vol_spike10 >= 5:
+            score += 22
+            notes.append("VolSpike 5x+")
+        elif vol_spike10 >= 3:
+            score += 17
+            notes.append("VolSpike 3x+")
+        elif vol_spike10 >= 2:
+            score += 12
+            notes.append("VolSpike 2x+")
+        elif vol_spike10 >= 1.4:
+            score += 6
+
+    if pd.notna(close_pos):
+        if close_pos >= 0.90:
+            score += 18
+            notes.append("Tepe kapanış")
+        elif close_pos >= 0.80:
+            score += 14
+            notes.append("Güçlü kapanış")
+        elif close_pos >= 0.65:
+            score += 6
+
+    if price_above_ema9:
+        score += 8
+    if ema9_gt_ema21:
+        score += 10
+        notes.append("EMA9>EMA21")
+    if ema_cross:
+        score += 8
+        notes.append("EMA cross")
+
+    if breakout_flag:
+        score += 12
+        notes.append("20D breakout")
+    elif pd.notna(breakout_pct) and breakout_pct >= -2:
+        score += 5
+
+    if pd.notna(dollar_volume):
+        if dollar_volume >= 20_000_000:
+            score += 10
+        elif dollar_volume >= 5_000_000:
+            score += 6
+        elif dollar_volume >= 2_000_000:
+            score += 3
+
+    # Aşırı şişme/kalitesiz hareket cezaları.
+    if pd.notna(rsi) and rsi >= 85:
+        score -= 10
+        notes.append("RSI aşırı")
+    if pd.notna(return_1d_pct) and return_1d_pct >= 35:
+        score -= 8
+        notes.append("1D aşırı prim")
+    if pd.notna(volume) and volume < min_volume:
+        score -= 15
+
+    # Ön elemeyi çok sert yapmıyoruz; amaç Night Buy motoruna kaliteli ama geniş aday vermek.
+    eligible = (
+        pd.notna(close)
+        and pd.notna(volume)
+        and pd.notna(dollar_volume)
+        and volume >= min_volume
+        and dollar_volume >= 1_000_000
+        and (
+            (pd.notna(return_1d_pct) and return_1d_pct >= 2 and pd.notna(vol_spike10) and vol_spike10 >= 1.4 and pd.notna(close_pos) and close_pos >= 0.55)
+            or (pd.notna(return_1d_pct) and return_1d_pct >= 5 and pd.notna(close_pos) and close_pos >= 0.50)
+            or (breakout_flag and pd.notna(vol_spike10) and vol_spike10 >= 1.2)
+            or (ema_cross and pd.notna(vol_spike10) and vol_spike10 >= 1.2)
+        )
+    )
+
+    return max(0.0, min(100.0, score)), notes, bool(eligible)
+
+
+@st.cache_data(ttl=1800)
+def build_csv_daily_momentum_universe(
+    tickers_tuple: tuple[str, ...],
+    max_records: int = 150,
+    min_price: float = 1.0,
+    max_price: float = 80.0,
+    min_volume: int = 150_000,
+    max_tickers_to_scan: int = 600,
+) -> tuple[pd.DataFrame, dict, dict]:
+    """CSV ticker evreninden günlük momentum adayları üretir.
+
+    Not: Büyük evrende Render/Yahoo limitlerini aşmamak için max_tickers_to_scan kullanılır.
+    Bu fonksiyon günlük veri sözlüğünü de döndürür; UI tarafında aynı veri tekrar indirilmez.
+    """
+    raw_tickers = list(tickers_tuple or ())
+    clean = _clean_ticker_list(raw_tickers)
+    diagnostics = {
+        "csv_total_tickers": len(clean),
+        "csv_scanned_tickers": 0,
+        "csv_daily_data_ok": 0,
+        "csv_daily_momentum_candidates": 0,
+        "csv_universe_source": "CSV Daily Momentum",
+    }
+
+    if not clean:
+        return pd.DataFrame(), {}, diagnostics
+
+    scan_tickers = clean[: int(max_tickers_to_scan)]
+    diagnostics["csv_scanned_tickers"] = len(scan_tickers)
+
+    # CSV fallback için Yahoo batch daha hızlıdır. Alpaca tek tek çok yavaşlayabilir.
+    daily_dict = download_daily_data_chunked(
+        scan_tickers,
+        period="260d",
+        chunk_size=50,
+        pause=0.8,
+        alpaca_key="",
+        alpaca_secret="",
+        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+    )
+    diagnostics["csv_daily_data_ok"] = len(daily_dict)
+
+    rows = []
+    for yahoo_symbol, df in daily_dict.items():
+        try:
+            if df is None or df.empty or len(df) < 80:
+                continue
+            dfi = calc_daily_indicators_for_night(df).dropna().copy()
+            if dfi.empty:
+                continue
+            latest = dfi.iloc[-1]
+            close = safe_float(latest.get("Close", np.nan), np.nan)
+            if pd.isna(close) or close < min_price or close > max_price:
+                continue
+
+            row_score, notes, eligible = _daily_momentum_row_score(latest, min_volume=int(min_volume))
+            if not eligible:
+                continue
+
+            volume = safe_float(latest.get("Volume", np.nan), np.nan)
+            avg_vol_20 = safe_float(latest.get("AvgVolume_20", np.nan), np.nan)
+            rvol20 = volume / avg_vol_20 if pd.notna(volume) and pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
+            prev_close = safe_float(latest.get("PrevClose", np.nan), np.nan)
+            change_pct = (close - prev_close) / prev_close * 100 if pd.notna(prev_close) and prev_close > 0 else np.nan
+
+            # Yahoo symbol zaten '-' formatında. Görsel symbol için '-' kullanımını koruyoruz; Alpaca tarafı bazı noktalı hisselerde veri vermezse Yahoo fallback çalışır.
+            rows.append({
+                "symbol": yahoo_symbol,
+                "yahoo_symbol": yahoo_symbol,
+                "description": "CSV Daily Momentum Fallback",
+                "live_price": close,
+                "live_change_pct": np.nan,
+                "live_volume": 0,
+                "regular_close": close,
+                "regular_volume": volume,
+                "tv_rvol": rvol20,
+                "tv_gap": safe_float(latest.get("Gap_pct", np.nan), np.nan) * 100 if pd.notna(latest.get("Gap_pct", np.nan)) else np.nan,
+                "market_cap": np.nan,
+                "CSV_Momentum_Score": round(row_score, 1),
+                "CSV_Momentum_Notes": ", ".join(notes[:6]) if notes else "-",
+                "CSV_Return_1D_%": round(change_pct, 2) if pd.notna(change_pct) else np.nan,
+                "Universe_Source": "CSV_DAILY_FALLBACK",
+            })
+        except Exception as exc:
+            log_debug(f"CSV daily momentum parse error {yahoo_symbol}: {exc}")
+            continue
+
+    out = pd.DataFrame(rows)
+    diagnostics["csv_daily_momentum_candidates"] = len(out)
+    if not out.empty:
+        out = out.sort_values(
+            ["CSV_Momentum_Score", "tv_rvol", "regular_volume"],
+            ascending=False,
+        ).head(max_records).reset_index(drop=True)
+
+    return out, daily_dict, diagnostics
+
 def get_recent_intraday_full_data(
     symbol: str,
     yahoo_symbol: str,
@@ -3370,16 +3644,29 @@ with tab4:
 
 
 # ============================================================
-# TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE
+# TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine")
+    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v5")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
-        "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı ve fakeout riskini birlikte puanlar."
+        "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
+        "ve fakeout riskini birlikte puanlar."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
+        night_universe_source = st.selectbox(
+            "Evren kaynağı",
+            ["hybrid", "tradingview", "csv"],
+            index=0,
+            format_func=lambda x: {
+                "hybrid": "Hybrid: TV boşsa CSV fallback",
+                "tradingview": "Sadece TradingView",
+                "csv": "Sadece CSV Daily Momentum",
+            }[x],
+            key="night_universe_source",
+        )
     with c1:
         night_scan_mode = st.selectbox(
             "Tarama modu",
@@ -3390,55 +3677,188 @@ with tab5:
                 "premarket": "Pre-Market",
                 "regular": "Regular Momentum",
             }[x],
+            key="night_scan_mode_v5",
         )
     with c2:
-        night_universe_size = st.slider("Evren genişliği", min_value=20, max_value=150, value=80, step=10, key="night_universe_size")
+        night_universe_size = st.slider("Sonuç evreni", min_value=20, max_value=150, value=100, step=10, key="night_universe_size")
     with c3:
-        night_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=20.0, value=1.0, step=0.5, key="night_min_price")
-    with c4:
-        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=80.0, step=5.0, key="night_max_price")
+        csv_max_tickers = st.number_input(
+            "CSV max ticker tarama",
+            min_value=100,
+            max_value=8000,
+            value=600,
+            step=100,
+            key="csv_max_tickers",
+            help="CSV fallback aktifse ilk N sembol günlük momentum için taranır. Render Starter için 500-1000 güvenli aralıktır.",
+        )
 
-    c5, c6, c7 = st.columns(3)
+    c4, c5, c6, c7 = st.columns(4)
+    with c4:
+        night_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=20.0, value=1.0, step=0.5, key="night_min_price")
     with c5:
-        night_min_volume = st.number_input("Min regular hacim", min_value=50_000, max_value=5_000_000, value=150_000, step=50_000, key="night_min_volume")
+        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=80.0, step=5.0, key="night_max_price")
     with c6:
-        min_night_score = st.slider("Min Night Score", min_value=0, max_value=100, value=70, step=5, key="min_night_score")
+        night_min_volume = st.number_input("Min regular hacim", min_value=25_000, max_value=5_000_000, value=150_000, step=25_000, key="night_min_volume")
     with c7:
+        min_night_score = st.slider("Min Night Score", min_value=0, max_value=100, value=60, step=5, key="min_night_score")
+
+    c8, c9 = st.columns(2)
+    with c8:
         max_fakeout = st.slider("Max Fakeout Risk", min_value=0, max_value=100, value=60, step=5, key="max_fakeout")
+    with c9:
+        csv_column_name = st.text_input(
+            "CSV sembol kolonu (boş=otomatik)",
+            value="",
+            key="csv_column_name",
+            help="CSV'de Symbol/Ticker gibi kolon varsa boş bırakabilirsin. Bulamazsa ilk kolonu kullanır.",
+        )
+
+    uploaded_ticker_csv = st.file_uploader(
+        "NASDAQ/NYSE ticker CSV yükle (opsiyonel). Repo içinde nasdaq_nyse_tickers.csv varsa yükleme yapmadan da kullanılabilir.",
+        type=["csv"],
+        key="night_ticker_csv_upload",
+    )
 
     st.caption(
-        "Not: Bu sürümde squeeze gerçek short-float verisi olmadan düşük piyasa değeri + RVOL/VolSpike + AH hacim + kırılım davranışıyla proxy olarak hesaplanır. "
-        "Yeni v4; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout ve TP0 Quick Profit ekler. "
+        "v5: TradingView postmarket evreni boşsa CSV Daily Momentum fallback kullanır. "
+        "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
+        "ön aday üretir; sonra Night Buy v4/v5 scoring aynı şekilde uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
     )
 
     if st.button("🌙 Night Buy Scanner'ı Çalıştır", key="btn_night_buy"):
         try:
-            with st.spinner("1. Aşama: Night-buy evreni TradingView üzerinden taranıyor..."):
-                night_universe = fetch_night_buy_universe(
-                    scan_mode=night_scan_mode,
-                    max_records=night_universe_size,
-                    min_price=night_min_price,
-                    max_price=night_max_price,
-                    min_volume=int(night_min_volume),
-                )
+            diagnostics = {}
+            night_universe = pd.DataFrame()
+            csv_daily_dict_prefetch = {}
+            tv_count = 0
+            source_used = "-"
+
+            # 1) TradingView evreni
+            if night_universe_source in ["hybrid", "tradingview"]:
+                with st.spinner("1. Aşama: TradingView evreni taranıyor..."):
+                    tv_universe = fetch_night_buy_universe(
+                        scan_mode=night_scan_mode,
+                        max_records=night_universe_size,
+                        min_price=night_min_price,
+                        max_price=night_max_price,
+                        min_volume=int(night_min_volume),
+                    )
+                tv_count = len(tv_universe)
+                diagnostics["tradingview_raw_count"] = tv_count
+
+                if not tv_universe.empty:
+                    tv_universe["Universe_Source"] = "TRADINGVIEW"
+                    night_universe = tv_universe.copy()
+                    source_used = "TradingView"
+
+            # 2) CSV fallback / CSV only
+            need_csv = (
+                night_universe_source == "csv"
+                or (night_universe_source == "hybrid" and night_universe.empty)
+            )
+
+            if need_csv:
+                csv_tickers = []
+                csv_source_note = ""
+
+                if uploaded_ticker_csv is not None:
+                    try:
+                        uploaded_ticker_csv.seek(0)
+                        csv_tickers = load_tickers_from_uploaded_csv(
+                            uploaded_ticker_csv,
+                            csv_column_name.strip() or None,
+                        )
+                        csv_source_note = "Uploaded CSV"
+                    except Exception as exc:
+                        st.error(f"CSV okuma hatası: {exc}")
+                        csv_tickers = []
+                else:
+                    csv_tickers = load_tickers_from_repo_csv(
+                        "nasdaq_nyse_tickers.csv",
+                        csv_column_name.strip() or None,
+                    )
+                    csv_source_note = "Repo nasdaq_nyse_tickers.csv"
+
+                diagnostics["csv_source"] = csv_source_note
+                diagnostics["csv_loaded_tickers"] = len(csv_tickers)
+
+                if not csv_tickers:
+                    if night_universe_source == "csv":
+                        st.warning(
+                            "CSV evreni seçildi ama ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle."
+                        )
+                    elif night_universe.empty:
+                        st.warning(
+                            "TradingView evreni boş döndü ve CSV fallback için ticker listesi bulunamadı. "
+                            "CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle."
+                        )
+                else:
+                    with st.spinner(
+                        f"CSV Daily Momentum fallback çalışıyor... İlk {min(len(csv_tickers), int(csv_max_tickers))} ticker taranıyor."
+                    ):
+                        csv_universe, csv_daily_dict_prefetch, csv_diag = build_csv_daily_momentum_universe(
+                            tuple(csv_tickers),
+                            max_records=night_universe_size,
+                            min_price=night_min_price,
+                            max_price=night_max_price,
+                            min_volume=int(night_min_volume),
+                            max_tickers_to_scan=int(csv_max_tickers),
+                        )
+                    diagnostics.update(csv_diag)
+
+                    if not csv_universe.empty:
+                        night_universe = csv_universe.copy()
+                        source_used = "CSV Daily Momentum Fallback"
+                    elif night_universe.empty:
+                        st.warning("CSV Daily Momentum fallback da aday üretmedi. Filtreleri gevşet veya daha geniş CSV evreni kullan.")
 
             if night_universe.empty:
-                st.warning("Night-buy evreni boş döndü. Seans kapalıysa veya TradingView postmarket verisi gelmiyorsa premarket/regular modunu dene.")
+                st.warning(
+                    "Night-buy evreni boş döndü. Bu durum aday yok anlamına değil, veri/evren oluşmadı anlamına gelebilir. "
+                    "CSV fallback için ticker CSV yüklemeyi veya regular/premarket modu denemeyi düşün."
+                )
+
+                with st.expander("🔎 Evren diagnostik"):
+                    st.json({
+                        "source_used": source_used,
+                        "tradingview_raw_count": tv_count,
+                        **diagnostics,
+                    })
             else:
-                st.info(f"İlk aşamada bulunan aday sayısı: {len(night_universe)}")
+                st.info(f"Evren kaynağı: {source_used} | İlk aşama aday sayısı: {len(night_universe)}")
+
+                with st.expander("🔎 Evren diagnostik"):
+                    st.json({
+                        "source_used": source_used,
+                        "tradingview_raw_count": tv_count,
+                        "final_universe_count": len(night_universe),
+                        **diagnostics,
+                    })
+                    st.dataframe(night_universe.head(25), use_container_width=True)
+
                 tickers = night_universe["yahoo_symbol"].dropna().unique().tolist()
 
-                with st.spinner("2. Aşama: Günlük veri indiriliyor..."):
-                    night_daily_dict = download_daily_data_chunked(
-                        tickers,
-                        period="260d",
-                        chunk_size=10,
-                        pause=1.0,
-                        alpaca_key=api_key,
-                        alpaca_secret=secret_key,
-                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                    )
+                # CSV fallback zaten günlük veriyi indirdiyse tekrar indirme.
+                if csv_daily_dict_prefetch:
+                    night_daily_dict = dict(csv_daily_dict_prefetch)
+                    missing_tickers = [t for t in tickers if t not in night_daily_dict]
+                else:
+                    night_daily_dict = {}
+                    missing_tickers = tickers
+
+                if missing_tickers:
+                    with st.spinner("2. Aşama: Günlük veri indiriliyor..."):
+                        downloaded_dict = download_daily_data_chunked(
+                            missing_tickers,
+                            period="260d",
+                            chunk_size=10,
+                            pause=1.0,
+                            alpaca_key=api_key,
+                            alpaca_secret=secret_key,
+                            alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+                        )
+                        night_daily_dict.update(downloaded_dict)
 
                 with st.spinner("3. Aşama: Night Pressure / Squeeze / Fakeout scoring yapılıyor..."):
                     night_candidates, night_rejected = evaluate_night_buy_candidates(night_universe, night_daily_dict)
@@ -3583,6 +4003,7 @@ with tab5:
             st.error(f"Night Buy Scanner hatası: {exc}")
             if DEBUG_MODE:
                 st.code(traceback.format_exc())
+
 st.write("---")
 st.caption(
     "Bu araç yatırım tavsiyesi değildir. Önce paper trading ile test edilmesi gerekir. "
