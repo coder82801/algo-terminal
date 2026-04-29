@@ -2462,7 +2462,19 @@ def build_csv_daily_momentum_universe(
     if not clean:
         return pd.DataFrame(), {}, diagnostics
 
-    scan_tickers = clean[: int(max_tickers_to_scan)]
+    # Alfabetik listenin sadece başını taramak hareketli hisseleri kaçırabilir.
+    # Bu yüzden CSV evrenini gün bazlı deterministik şekilde karıştırıyoruz.
+    # Aynı gün aynı sonuçları verir; farklı günlerde örneklem yenilenir.
+    try:
+        seed = int(datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d"))
+    except Exception:
+        seed = int(datetime.now().strftime("%Y%m%d"))
+    if len(clean) > int(max_tickers_to_scan):
+        scan_tickers = pd.Series(clean).sample(n=int(max_tickers_to_scan), random_state=seed).tolist()
+        diagnostics["csv_sampling"] = f"daily_shuffle_seed_{seed}"
+    else:
+        scan_tickers = clean[: int(max_tickers_to_scan)]
+        diagnostics["csv_sampling"] = "full_or_short_list"
     diagnostics["csv_scanned_tickers"] = len(scan_tickers)
 
     # CSV fallback için Yahoo batch daha hızlıdır. Alpaca tek tek çok yavaşlayabilir.
@@ -3647,7 +3659,7 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v5")
+    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v6")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
         "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
@@ -3658,9 +3670,10 @@ with tab5:
     with c0:
         night_universe_source = st.selectbox(
             "Evren kaynağı",
-            ["hybrid", "tradingview", "csv"],
+            ["hybrid_plus", "hybrid", "tradingview", "csv"],
             index=0,
             format_func=lambda x: {
+                "hybrid_plus": "Hybrid Plus: TV + CSV birleşik",
                 "hybrid": "Hybrid: TV boşsa CSV fallback",
                 "tradingview": "Sadece TradingView",
                 "csv": "Sadece CSV Daily Momentum",
@@ -3720,7 +3733,7 @@ with tab5:
     )
 
     st.caption(
-        "v5: TradingView postmarket evreni boşsa CSV Daily Momentum fallback kullanır. "
+        "v6: Hybrid Plus modunda TradingView + CSV Daily Momentum birleşik evren kullanılır. "
         "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
         "ön aday üretir; sonra Night Buy v4/v5 scoring aynı şekilde uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
@@ -3752,9 +3765,11 @@ with tab5:
                     night_universe = tv_universe.copy()
                     source_used = "TradingView"
 
-            # 2) CSV fallback / CSV only
+            # 2) CSV fallback / CSV only / Hybrid Plus
+            # v6 farkı: Hybrid Plus modunda TV sonuç verse bile CSV Daily Momentum da ayrıca çalışır ve evrenler birleştirilir.
             need_csv = (
                 night_universe_source == "csv"
+                or night_universe_source == "hybrid_plus"
                 or (night_universe_source == "hybrid" and night_universe.empty)
             )
 
@@ -3808,10 +3823,21 @@ with tab5:
                     diagnostics.update(csv_diag)
 
                     if not csv_universe.empty:
-                        night_universe = csv_universe.copy()
-                        source_used = "CSV Daily Momentum Fallback"
+                        if not night_universe.empty and night_universe_source == "hybrid_plus":
+                            # TV + CSV birleşik evren. Aynı sembol iki kere gelirse tekilleştir.
+                            night_universe = pd.concat([night_universe, csv_universe], ignore_index=True)
+                            if "yahoo_symbol" in night_universe.columns:
+                                night_universe = night_universe.drop_duplicates(subset=["yahoo_symbol"], keep="first").reset_index(drop=True)
+                            else:
+                                night_universe = night_universe.drop_duplicates().reset_index(drop=True)
+                            source_used = "TradingView + CSV Daily Momentum"
+                        else:
+                            night_universe = csv_universe.copy()
+                            source_used = "CSV Daily Momentum" if night_universe_source == "csv" else "CSV Daily Momentum Fallback"
                     elif night_universe.empty:
-                        st.warning("CSV Daily Momentum fallback da aday üretmedi. Filtreleri gevşet veya daha geniş CSV evreni kullan.")
+                        st.warning("CSV Daily Momentum aday üretmedi. Filtreleri gevşet, CSV max ticker taramayı artır veya premarket/regular modu dene.")
+                    elif night_universe_source == "hybrid_plus":
+                        st.info("CSV Daily Momentum bu çalıştırmada aday üretmedi; TradingView evreniyle devam ediliyor.")
 
             if night_universe.empty:
                 st.warning(
