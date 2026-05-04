@@ -3150,14 +3150,112 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     if hard_reject_reasons:
         risk_notes.extend(hard_reject_reasons[:3])
 
+    # ---------------- Gece giriş sinyali / execution gate ----------------
+    # Amaç: Aday üretmek ile gerçekten geceden alım sinyali vermeyi ayırmak.
+    # Next Day adayları ancak bu katmandan YES_NOW / SMALL_SIZE geçerse gece alım için ciddiye alınır.
     rnd = _price_round(ah_price)
-    rth_instruction = "Açılış entry altında olursa alma; entry reclaim + 5dk tutunma bekle. TP0 gelirse kısmi kâr düşün."
+
+    current_vs_entry_low_pct = _safe_pct(ah_price, entry_low) if entry_low and entry_low > 0 else np.nan
+    current_vs_entry_high_pct = _safe_pct(ah_price, entry_high) if entry_high and entry_high > 0 else np.nan
+
+    in_entry_zone = (
+        pd.notna(current_vs_entry_low_pct)
+        and pd.notna(current_vs_entry_high_pct)
+        and current_vs_entry_low_pct >= -0.35
+        and current_vs_entry_high_pct <= 0.60
+    )
+    below_entry_zone = pd.notna(current_vs_entry_low_pct) and current_vs_entry_low_pct < -0.35
+    above_entry_zone = pd.notna(current_vs_entry_high_pct) and current_vs_entry_high_pct > 0.60
+
+    # Çok üstten kovalama filtresi. Düşük fiyatlı hisselerde tolerans biraz daha geniş.
+    chase_limit_pct = 3.0 if ah_price < 10 else 1.75
+    too_far_to_chase = pd.notna(current_vs_entry_high_pct) and current_vs_entry_high_pct > chase_limit_pct
+
+    ah_confirmed = (
+        ah_strength >= 55
+        or (pd.notna(ah_change_pct) and ah_change_pct >= 1.5 and pd.notna(ah_volume_to_daily_score_pct) and ah_volume_to_daily_score_pct >= 1.0)
+        or (pd.notna(ah_vwap) and ah_price > ah_vwap and pd.notna(reg_vwap) and ah_price > reg_vwap)
+    )
+
+    signal_score = (
+        0.22 * final_score
+        + 0.18 * ah_strength
+        + 0.17 * demand_score
+        + 0.15 * technical_score
+        + 0.10 * daily_momentum_score
+        + 0.08 * squeeze_score
+        + 0.10 * liquidity_score
+        - 0.35 * fakeout_risk
+    )
+    signal_score = float(max(0, min(100, signal_score)))
+
+    # Gece alım sinyali: gerçek işlem için YES_NOW; daha zayıf yapı için SMALL_SIZE/PAPER_ONLY;
+    # uygun değilse WAIT_RECLAIM / WAIT_PULLBACK / NO_NIGHT_ENTRY.
+    if hard_reject_reasons:
+        night_entry_signal = "NO_NIGHT_ENTRY"
+        night_action = "Gece alma: hard reject var."
+    elif status == "TRADE_CANDIDATE" and signal_score >= 70 and fakeout_risk <= 50 and ah_confirmed and in_entry_zone and not too_far_to_chase:
+        night_entry_signal = "YES_NOW"
+        night_action = "Gece giriş sinyali VAR: entry bölgesinde küçük/planlı pozisyon düşünülebilir."
+    elif status == "TRADE_CANDIDATE" and signal_score >= 70 and ah_confirmed and below_entry_zone:
+        night_entry_signal = "WAIT_RECLAIM"
+        night_action = "Bekle: fiyat entry altında; entry reclaim + 5dk tutunma gelmeden alma."
+    elif status == "TRADE_CANDIDATE" and signal_score >= 70 and above_entry_zone:
+        night_entry_signal = "WAIT_PULLBACK"
+        night_action = "Bekle: fiyat entry bölgesinin üstünde; kovalamak yerine pullback/retest bekle."
+    elif status == "PAPER_WATCHLIST" and signal_score >= 62 and ah_confirmed and in_entry_zone and fakeout_risk <= 55:
+        night_entry_signal = "PAPER_OR_TINY"
+        night_action = "Sadece paper/çok küçük deneme: A/B kalitesinde gece sinyali değil."
+    elif status == "AGGRESSIVE_SQUEEZE_WATCH" and signal_score >= 58 and ah_confirmed and fakeout_risk <= 55:
+        night_entry_signal = "AGGRESSIVE_WAIT_CONFIRM"
+        night_action = "Agresif squeeze takibi: gece alım değil; premarket/canlı teyit bekle."
+    elif below_entry_zone:
+        night_entry_signal = "WAIT_RECLAIM"
+        night_action = "Bekle: entry altında; reclaim olmadan gece alma."
+    elif above_entry_zone or too_far_to_chase:
+        night_entry_signal = "WAIT_PULLBACK"
+        night_action = "Bekle: entry bölgesi kaçmış; pullback/retest olmadan kovalamama."
+    else:
+        night_entry_signal = "NO_NIGHT_ENTRY"
+        night_action = "Gece giriş sinyali yok: aday olsa bile execution onayı yok."
+
+    # Entry sonrası takip filtresi: MTRX gibi entry görüp 0.5R bile gitmeyenleri zayıf trigger sayacağız.
+    follow_through_05r = round(entry_low + 0.5 * risk, rnd)
+    follow_through_075r = round(entry_low + 0.75 * risk, rnd)
+    setup_invalidation = round(max(0.01, min(stop_price, entry_low - 1.75 * risk)), rnd)
+
+    if night_entry_signal == "YES_NOW":
+        rth_instruction = (
+            "Gece giriş sinyali var. Ertesi gün entry üstü kalıcılık izle; "
+            "0.5R gelmezse weak trigger, TP0 gelirse kısmi kâr düşün."
+        )
+    elif night_entry_signal == "PAPER_OR_TINY":
+        rth_instruction = (
+            "Gerçek A/B sinyal değil. Paper veya çok küçük deneme dışında alma; "
+            "açılış entry altında olursa reclaim + 5dk tutunma bekle."
+        )
+    else:
+        rth_instruction = (
+            "Gece alma. Açılış/after-hours entry altında olursa alma; "
+            "entry reclaim + 5dk tutunma ve 0.5R follow-through bekle."
+        )
 
     result = {
         "Symbol": symbol,
         "Description": row.get("description", ""),
         "Grade": grade,
         "Status": status,
+        "Night_Entry_Signal": night_entry_signal,
+        "Night_Action": night_action,
+        "Night_Signal_Score": round(signal_score, 1),
+        "AH_Confirmed": bool(ah_confirmed),
+        "In_Entry_Zone": bool(in_entry_zone),
+        "Too_Far_To_Chase": bool(too_far_to_chase),
+        "Current_vs_Entry_Low_%": round(current_vs_entry_low_pct, 2) if pd.notna(current_vs_entry_low_pct) else np.nan,
+        "Current_vs_Entry_High_%": round(current_vs_entry_high_pct, 2) if pd.notna(current_vs_entry_high_pct) else np.nan,
+        "Follow_Through_0_5R": follow_through_05r,
+        "Follow_Through_0_75R": follow_through_075r,
+        "Setup_Invalidation": setup_invalidation,
         "Final_Night_Score": round(final_score, 1),
         "Demand_Pressure": round(demand_score, 1),
         "Technical_Alignment": round(technical_score, 1),
@@ -3243,9 +3341,19 @@ def evaluate_night_buy_candidates(universe_df: pd.DataFrame, daily_dict: dict) -
             rejected.append({"Hisse": symbol, "Neden": f"Hata: {exc}"})
             log_debug(f"Night evaluate error {symbol}: {exc}")
 
+    signal_rank_map = {
+        "YES_NOW": 5,
+        "PAPER_OR_TINY": 4,
+        "WAIT_RECLAIM": 3,
+        "WAIT_PULLBACK": 2,
+        "AGGRESSIVE_WAIT_CONFIRM": 2,
+        "NO_NIGHT_ENTRY": 0,
+    }
     final_candidates = sorted(
         final_candidates,
         key=lambda x: (
+            signal_rank_map.get(x.get("Night_Entry_Signal", "NO_NIGHT_ENTRY"), 0),
+            x.get("Night_Signal_Score", 0),
             x["Final_Night_Score"],
             x["Demand_Pressure"],
             x.get("Daily_Momentum_Quality", 0),
@@ -3715,7 +3823,7 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v7")
+    st.subheader("🌙 Night Buy Scanner — Overnight Pressure Engine v8")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
         "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
@@ -3947,14 +4055,19 @@ with tab5:
 
                 night_all_df = pd.DataFrame(night_candidates)
                 show_cols = [
-                    "Symbol", "Grade", "Status", "Final_Night_Score",
+                    "Symbol", "Grade", "Status", "Night_Entry_Signal", "Night_Action", "Night_Signal_Score",
+                    "AH_Confirmed", "In_Entry_Zone", "Too_Far_To_Chase",
+                    "Final_Night_Score",
                     "Demand_Pressure", "Technical_Alignment", "Daily_Momentum_Quality",
                     "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Liquidity_Quality", "Fakeout_Risk",
                     "AH_Live_Price", "AH_Change_%", "Return_1D_%", "Return_3D_%", "Return_5D_%",
                     "RVOL20", "VolSpike10", "DollarVolume_M", "ClosePosition", "AH_Vol_to_Daily_%",
                     "EMA9_gt_EMA20", "EMA9_gt_EMA21", "EMA9_CrossUp_EMA21", "RSI14", "MACD_Rising",
                     "Breakout_Flag", "Breakout_Pct_%", "ATR_pct",
-                    "Night_Entry_Low", "Night_Entry_High", "Stop", "TP0_Quick", "TP1", "TP2",
+                    "Night_Entry_Low", "Night_Entry_High", "Stop", "Setup_Invalidation",
+                    "Follow_Through_0_5R", "Follow_Through_0_75R",
+                    "TP0_Quick", "TP1", "TP2",
+                    "Current_vs_Entry_Low_%", "Current_vs_Entry_High_%",
                     "RTH_Instruction", "Why", "Risk_Notes", "Aggressive_Reason"
                 ]
 
@@ -3965,10 +4078,24 @@ with tab5:
                     rejected_scored_df = pd.DataFrame()
                     st.warning("Night Buy scoring üretilemedi. Veri/bağlantı reddedilenler bölümünü kontrol et.")
                 else:
+                    signal_rank_map_ui = {
+                        "YES_NOW": 5,
+                        "PAPER_OR_TINY": 4,
+                        "WAIT_RECLAIM": 3,
+                        "WAIT_PULLBACK": 2,
+                        "AGGRESSIVE_WAIT_CONFIRM": 2,
+                        "NO_NIGHT_ENTRY": 0,
+                    }
+                    night_all_df["_SignalRank"] = night_all_df["Night_Entry_Signal"].map(signal_rank_map_ui).fillna(0) if "Night_Entry_Signal" in night_all_df.columns else 0
                     night_all_df = night_all_df.sort_values(
-                        ["Final_Night_Score", "Demand_Pressure", "Daily_Momentum_Quality", "Squeeze_Proxy"],
+                        ["_SignalRank", "Night_Signal_Score", "Final_Night_Score", "Demand_Pressure", "Daily_Momentum_Quality", "Squeeze_Proxy"],
                         ascending=False,
                     ).copy()
+
+                    night_signal_df = night_all_df[
+                        (night_all_df["Night_Entry_Signal"] == "YES_NOW") &
+                        (night_all_df["Hard_Reject"] == False)
+                    ].copy() if "Night_Entry_Signal" in night_all_df.columns else pd.DataFrame()
 
                     trade_df = night_all_df[
                         (night_all_df["Status"] == "TRADE_CANDIDATE") &
@@ -3998,13 +4125,22 @@ with tab5:
                         ~night_all_df["Symbol"].isin(shown_symbols)
                     ].copy()
 
-                    m1, m2, m3, m4 = st.columns(4)
+                    m0, m1, m2, m3, m4 = st.columns(5)
+                    m0.metric("Gece Giriş Sinyali", len(night_signal_df))
                     m1.metric("A/B Night Buy", len(trade_df))
                     m2.metric("Paper Watchlist", len(watch_df))
                     m3.metric("Aggressive Squeeze", len(aggressive_df))
                     m4.metric("Reject / zayıf", len(rejected_scored_df) + len(night_rejected))
 
                     available_cols = [c for c in show_cols if c in night_all_df.columns]
+
+                    if night_signal_df.empty:
+                        st.warning("Bu gece doğrudan giriş sinyali yok. Aday çıksa bile entry/reclaim/pullback onayı beklenmeli.")
+                    else:
+                        st.success(f"Gece giriş sinyali veren aday: {len(night_signal_df)}")
+                        st.subheader("✅ Gece Giriş Sinyali — YES_NOW")
+                        st.caption("Bu tablo aday seçimi değil, execution onayıdır. Yine de pozisyon küçük, stop ve TP0/TP1 planı net olmalı.")
+                        st.dataframe(night_signal_df[available_cols].head(10), use_container_width=True)
 
                     if trade_df.empty:
                         st.warning("Gerçek Night Buy adayı yok. Bu gece için sistem işlem baskısı yeterli görmedi.")
