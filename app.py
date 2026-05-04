@@ -3362,16 +3362,214 @@ def evaluate_night_buy_candidates(universe_df: pd.DataFrame, daily_dict: dict) -
         reverse=True,
     )
     return final_candidates, rejected
+
+
+# ============================================================
+# RUNNER LAB / ULTRA MOMENTUM LAB — ONLY PAPER
+# ============================================================
+def _runner_sample_tickers(tickers: list[str], max_tickers: int, seed: int | None = None) -> list[str]:
+    """CSV evrenini her seferinde alfabetik ilk N'e kilitlememek için örnekler."""
+    if not tickers:
+        return []
+    clean = list(dict.fromkeys([str(t).strip().upper().replace('.', '-') for t in tickers if str(t).strip()]))
+    if max_tickers is None or max_tickers <= 0 or len(clean) <= max_tickers:
+        return clean
+    try:
+        rng = np.random.default_rng(seed if seed is not None else int(datetime.now().strftime('%Y%m%d')))
+        idx = rng.choice(len(clean), size=int(max_tickers), replace=False)
+        return [clean[i] for i in sorted(idx)]
+    except Exception:
+        return clean[:int(max_tickers)]
+
+
+def _runner_pool_score(runner_day_count: int, max_runner_gain_pct: float, days_since_last_run: int) -> float:
+    """Geçmiş runner DNA'sını 0-100 arası özetler."""
+    count_score = min(35.0, float(runner_day_count) * 12.0)
+    gain_score = min(40.0, max(0.0, float(max_runner_gain_pct) - 50.0) / 2.5)
+    if days_since_last_run <= 7:
+        recency_score = 25.0
+    elif days_since_last_run <= 30:
+        recency_score = 18.0
+    elif days_since_last_run <= 90:
+        recency_score = 10.0
+    else:
+        recency_score = 4.0
+    return round(min(100.0, count_score + gain_score + recency_score), 1)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_runner_pool_from_tickers_cached(
+    tickers_tuple: tuple,
+    lookback_period: str = '180d',
+    min_price: float = 1.0,
+    max_price: float = 20.0,
+    min_runner_gain_pct: float = 50.0,
+    min_rvol20: float = 5.0,
+    min_volume: int = 500_000,
+    min_runner_days: int = 1,
+    chunk_size: int = 50,
+    pause: float = 0.8,
+) -> pd.DataFrame:
+    """Geçmişte SKK tipi ultra momentum günü üretmiş hisselerden runner havuzu oluşturur.
+
+    LAB_ONLY: Bu havuz gerçek alım sinyali değildir. Sadece paper/istatistik radarına kaynak sağlar.
+    """
+    tickers = list(tickers_tuple or [])
+    if not tickers:
+        return pd.DataFrame()
+
+    daily_dict = download_daily_data_chunked(
+        tickers,
+        period=lookback_period,
+        chunk_size=chunk_size,
+        pause=pause,
+        alpaca_key='',
+        alpaca_secret='',
+        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
+    )
+    if not daily_dict:
+        return pd.DataFrame()
+
+    try:
+        today = datetime.now(ZoneInfo('America/New_York')).date()
+    except Exception:
+        today = datetime.utcnow().date()
+
+    rows = []
+    for yahoo_symbol, df in daily_dict.items():
+        try:
+            if df is None or df.empty or len(df) < 40:
+                continue
+            dfi = df.copy()
+            dfi['PrevClose'] = dfi['Close'].shift(1)
+            dfi['ChangePct'] = (dfi['Close'] / dfi['PrevClose'] - 1.0) * 100.0
+            dfi['AvgVol20'] = dfi['Volume'].rolling(20).mean()
+            dfi['RVOL20'] = dfi['Volume'] / dfi['AvgVol20'].replace(0, np.nan)
+            dfi['DollarVolume'] = dfi['Close'] * dfi['Volume']
+            runner_mask = (
+                (dfi['Close'] >= min_price)
+                & (dfi['Close'] <= max_price)
+                & (dfi['ChangePct'] >= min_runner_gain_pct)
+                & (dfi['RVOL20'] >= min_rvol20)
+                & (dfi['Volume'] >= min_volume)
+            )
+            runner_days = dfi[runner_mask].dropna(subset=['ChangePct', 'RVOL20', 'Volume'])
+            count = len(runner_days)
+            if count < int(min_runner_days):
+                continue
+            max_gain = float(runner_days['ChangePct'].max())
+            max_rvol = float(runner_days['RVOL20'].max())
+            max_dollar_vol = float(runner_days['DollarVolume'].max()) if 'DollarVolume' in runner_days.columns else np.nan
+            last_idx = runner_days.index[-1]
+            try:
+                last_date = last_idx.date()
+            except Exception:
+                last_date = pd.to_datetime(last_idx).date()
+            days_since_last = int((today - last_date).days)
+            rows.append({
+                'symbol': str(yahoo_symbol).strip().upper(),
+                'yahoo_symbol': str(yahoo_symbol).strip().upper(),
+                'runner_day_count': int(count),
+                'max_runner_gain_pct': round(max_gain, 2),
+                'max_runner_rvol20': round(max_rvol, 2),
+                'max_runner_dollar_volume_M': round(max_dollar_vol / 1_000_000, 2) if pd.notna(max_dollar_vol) else np.nan,
+                'last_runner_date': last_date.isoformat(),
+                'days_since_last_run': days_since_last,
+            })
+        except Exception as exc:
+            log_debug(f'Runner pool hesap hatası {yahoo_symbol}: {exc}')
+            continue
+
+    pool_df = pd.DataFrame(rows)
+    if pool_df.empty:
+        return pool_df
+    pool_df['Runner_DNA_Score'] = pool_df.apply(
+        lambda r: _runner_pool_score(r['runner_day_count'], r['max_runner_gain_pct'], r['days_since_last_run']), axis=1
+    )
+    return pool_df.sort_values(
+        ['Runner_DNA_Score', 'runner_day_count', 'max_runner_gain_pct'], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def scan_intraday_runners_cached(
+    session_name: str,
+    runner_pool_records: tuple,
+    max_records: int = 60,
+    min_price: float = 1.0,
+    max_price: float = 20.0,
+    min_live_change_pct: float = 20.0,
+) -> pd.DataFrame:
+    """Canlı en hareketli hisseler ile geçmiş Runner DNA havuzunu birleştirir."""
+    if not runner_pool_records:
+        return pd.DataFrame()
+    runner_pool_df = pd.DataFrame(list(runner_pool_records))
+    if runner_pool_df.empty or 'yahoo_symbol' not in runner_pool_df.columns:
+        return pd.DataFrame()
+
+    universe_df = fetch_intraday_trade_universe(
+        session_name=session_name,
+        max_records=max_records,
+        min_price=min_price,
+        max_price=max_price,
+    )
+    if universe_df is None or universe_df.empty:
+        return pd.DataFrame()
+
+    df = universe_df.copy()
+    df = df[df['live_change_pct'].fillna(-999) >= float(min_live_change_pct)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    merged = df.merge(
+        runner_pool_df,
+        how='inner',
+        on='yahoo_symbol',
+        suffixes=('', '_runner'),
+    )
+    if merged.empty:
+        return merged
+
+    # Ultra momentum skoru: canlı hareket + hacim + geçmiş runner DNA.
+    merged['Live_Change_Score'] = np.minimum(45.0, merged['live_change_pct'].fillna(0).clip(lower=0) * 0.9)
+    merged['Live_Volume_Score'] = np.minimum(20.0, np.log10(merged['live_volume'].fillna(0).clip(lower=1)) * 4.0)
+    merged['Runner_Lab_Score'] = (
+        0.45 * merged['Live_Change_Score']
+        + 0.25 * merged['Live_Volume_Score']
+        + 0.30 * merged['Runner_DNA_Score'].fillna(0)
+    ).round(1)
+    merged['LAB_ONLY'] = True
+    merged['Risk_Label'] = 'EXTREME / PAPER ONLY'
+    merged['Runner_Action'] = np.where(
+        (merged['live_change_pct'].fillna(0) >= 50) & (merged['Runner_DNA_Score'].fillna(0) >= 60),
+        'PAPER_ULTRA_WATCH',
+        'PAPER_WATCH',
+    )
+
+    rename_map = {
+        'symbol': 'Symbol',
+        'description': 'Company',
+        'live_price': 'Live_Price',
+        'live_change_pct': 'Live_Change_%',
+        'live_volume': 'Live_Volume',
+        'market_cap': 'MarketCap',
+    }
+    merged = merged.rename(columns=rename_map)
+    return merged.sort_values(
+        ['Runner_Lab_Score', 'Live_Change_%', 'Runner_DNA_Score'], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
 # ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "⚡ Canlı Gün İçi Radar",
         "🧠 Intraday Trade Engine",
         "🔮 Kurumsal Swing Radar",
         "📊 VWAP Analizi ve Emir Merkezi",
         "🌙 Night Buy Scanner",
+        "🔥 Runner Lab / Ultra Momentum",
     ]
 )
 
@@ -4221,6 +4419,174 @@ with tab5:
             st.error(f"Night Buy Scanner hatası: {exc}")
             if DEBUG_MODE:
                 st.code(traceback.format_exc())
+
+
+
+# ============================================================
+# TAB 6 - RUNNER LAB / ULTRA MOMENTUM LAB (ONLY PAPER)
+# ============================================================
+with tab6:
+    st.subheader("🔥 Runner Lab / Ultra Momentum Lab — SKK Tipi Koşucular")
+    st.write(
+        "Bu modül geçmişte +%50 ve üzeri ultra momentum günü üretmiş hisselerden bir **Runner DNA havuzu** oluşturur; "
+        "sonra bugünkü premarket/regular/after-hours hareketli hisselerle bu havuzu kesiştirir. "
+        "Ana strateji sinyali değildir; sadece paper trading, istatistik ve ultra risk radar modülüdür."
+    )
+    st.warning("Runner Lab sonuçları **gerçek alım sinyali değildir**. SKK tipi hisselerde halt, spread, tepeden yakalanma ve ani -%50 riskleri yüksektir.")
+
+    r0, r1, r2, r3 = st.columns(4)
+    with r0:
+        runner_session = st.selectbox(
+            "Tarama seansı",
+            ["regular", "premarket", "afterhours"],
+            index=0,
+            format_func=lambda x: {"regular": "Regular", "premarket": "Pre-Market", "afterhours": "After-Hours"}[x],
+            key="runner_session",
+        )
+    with r1:
+        runner_min_change = st.slider("Min canlı değişim (%)", 10, 100, 25, 5, key="runner_min_change")
+    with r2:
+        runner_tv_records = st.slider("Canlı TV evreni", 20, 150, 80, 10, key="runner_tv_records")
+    with r3:
+        runner_max_tickers = st.number_input("Runner pool CSV max ticker", 100, 8000, 1200, 100, key="runner_max_tickers")
+
+    r4, r5, r6, r7 = st.columns(4)
+    with r4:
+        runner_lookback = st.selectbox("Geçmiş tarama", ["90d", "120d", "180d", "1y"], index=2, key="runner_lookback")
+    with r5:
+        runner_min_gain = st.slider("Runner günü min artış (%)", 30, 150, 50, 5, key="runner_min_gain")
+    with r6:
+        runner_min_rvol = st.slider("Runner günü min RVOL20", 2.0, 20.0, 5.0, 0.5, key="runner_min_rvol")
+    with r7:
+        runner_min_volume = st.number_input("Runner günü min hacim", 100_000, 10_000_000, 500_000, 100_000, key="runner_min_volume")
+
+    r8, r9, r10 = st.columns(3)
+    with r8:
+        runner_min_price = st.number_input("Min fiyat ($)", 0.3, 20.0, 1.0, 0.5, key="runner_min_price")
+    with r9:
+        runner_max_price = st.number_input("Max fiyat ($)", 2.0, 100.0, 20.0, 1.0, key="runner_max_price")
+    with r10:
+        runner_seed_mode = st.selectbox(
+            "CSV örnekleme",
+            ["daily_random", "first_n"],
+            index=0,
+            format_func=lambda x: "Günlük rastgele örneklem" if x == "daily_random" else "İlk N sembol",
+            key="runner_seed_mode",
+        )
+
+    runner_uploaded_csv = st.file_uploader(
+        "Runner Lab için ticker CSV yükle (opsiyonel). Repo içindeki nasdaq_nyse_tickers.csv otomatik kullanılabilir.",
+        type=["csv"],
+        key="runner_ticker_csv_upload",
+    )
+    runner_csv_col = st.text_input("Runner CSV sembol kolonu (boş=otomatik)", value="", key="runner_csv_col")
+
+    def _load_runner_tickers_for_ui():
+        if runner_uploaded_csv is not None:
+            try:
+                runner_uploaded_csv.seek(0)
+                return load_tickers_from_uploaded_csv(runner_uploaded_csv, runner_csv_col.strip() or None), "Uploaded CSV"
+            except Exception as exc:
+                st.error(f"Runner CSV okuma hatası: {exc}")
+                return [], "Uploaded CSV hata"
+        return load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", runner_csv_col.strip() or None), "Repo nasdaq_nyse_tickers.csv"
+
+    if st.button("🏗 Runner DNA Havuzunu Oluştur / Güncelle", key="btn_build_runner_pool_v9"):
+        tickers, ticker_source = _load_runner_tickers_for_ui()
+        if not tickers:
+            st.error("Runner Lab için ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
+        else:
+            seed = int(datetime.now().strftime('%Y%m%d')) if runner_seed_mode == "daily_random" else None
+            sampled = _runner_sample_tickers(tickers, int(runner_max_tickers), seed=seed)
+            with st.spinner(f"Runner DNA havuzu oluşturuluyor... Kaynak: {ticker_source}; taranan sembol: {len(sampled)}"):
+                pool_df = build_runner_pool_from_tickers_cached(
+                    tuple(sampled),
+                    lookback_period=runner_lookback,
+                    min_price=float(runner_min_price),
+                    max_price=float(runner_max_price),
+                    min_runner_gain_pct=float(runner_min_gain),
+                    min_rvol20=float(runner_min_rvol),
+                    min_volume=int(runner_min_volume),
+                    min_runner_days=1,
+                )
+            st.session_state["runner_pool_df_v9"] = pool_df
+            st.info(
+                f"Ticker kaynağı: {ticker_source} | Toplam sembol: {len(tickers)} | Taranan: {len(sampled)} | "
+                f"Runner DNA havuzu: {0 if pool_df is None else len(pool_df)}"
+            )
+            if pool_df is None or pool_df.empty:
+                st.warning("Runner DNA havuzu boş döndü. Min artış/RVOL/hacim eşiklerini düşür veya CSV max ticker değerini artır.")
+            else:
+                st.success(f"Runner DNA havuzuna alınan hisse sayısı: {len(pool_df)}")
+                st.dataframe(pool_df.head(50), use_container_width=True)
+                st.download_button(
+                    "📥 Runner DNA havuzunu CSV indir",
+                    data=pool_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"runner_dna_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+
+    st.divider()
+    if st.button("🔥 Runner Lab'i Çalıştır", key="btn_run_runner_lab_v9"):
+        pool_df = st.session_state.get("runner_pool_df_v9", pd.DataFrame())
+        if pool_df is None or pool_df.empty:
+            tickers, ticker_source = _load_runner_tickers_for_ui()
+            if not tickers:
+                st.error("Runner havuzu yok ve CSV bulunamadı. Önce CSV yükle veya repo dosyasını kontrol et.")
+                pool_df = pd.DataFrame()
+            else:
+                seed = int(datetime.now().strftime('%Y%m%d')) if runner_seed_mode == "daily_random" else None
+                sampled = _runner_sample_tickers(tickers, int(runner_max_tickers), seed=seed)
+                with st.spinner("Runner havuzu cache'te yok; önce havuz oluşturuluyor..."):
+                    pool_df = build_runner_pool_from_tickers_cached(
+                        tuple(sampled),
+                        lookback_period=runner_lookback,
+                        min_price=float(runner_min_price),
+                        max_price=float(runner_max_price),
+                        min_runner_gain_pct=float(runner_min_gain),
+                        min_rvol20=float(runner_min_rvol),
+                        min_volume=int(runner_min_volume),
+                        min_runner_days=1,
+                    )
+                st.session_state["runner_pool_df_v9"] = pool_df
+
+        if pool_df is None or pool_df.empty:
+            st.warning("Runner havuzu boş olduğu için intraday runner taraması yapılamadı.")
+        else:
+            records = tuple(pool_df.to_dict("records"))
+            with st.spinner("Canlı intraday movers + Runner DNA havuzu birleştiriliyor..."):
+                runners_df = scan_intraday_runners_cached(
+                    session_name=runner_session,
+                    runner_pool_records=records,
+                    max_records=int(runner_tv_records),
+                    min_price=float(runner_min_price),
+                    max_price=float(runner_max_price),
+                    min_live_change_pct=float(runner_min_change),
+                )
+            if runners_df is None or runners_df.empty:
+                st.warning("Bugün için Runner Lab adayı bulunamadı. Min canlı değişim eşiğini düşür veya seansı değiştir.")
+            else:
+                st.success(f"Runner Lab adayı: {len(runners_df)} — sadece paper / ultra risk")
+                show_runner_cols = [
+                    "Symbol", "Company", "Live_Price", "Live_Change_%", "Live_Volume", "MarketCap",
+                    "Runner_Lab_Score", "Runner_DNA_Score", "Runner_Action", "Risk_Label", "LAB_ONLY",
+                    "runner_day_count", "max_runner_gain_pct", "max_runner_rvol20", "max_runner_dollar_volume_M",
+                    "last_runner_date", "days_since_last_run",
+                ]
+                available_runner_cols = [c for c in show_runner_cols if c in runners_df.columns]
+                st.dataframe(runners_df[available_runner_cols].head(50), use_container_width=True)
+                st.download_button(
+                    "📥 Runner Lab adaylarını CSV indir",
+                    data=runners_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"runner_lab_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+
+    st.info(
+        "Runner Lab ana alım motoru değildir. Sonuçlar Night Buy YES_NOW veya Intraday Trade Engine teyidi olmadan gerçek işlem sinyali sayılmaz. "
+        "Ama SKK tipi ultra momentum hisseleri için istatistik ve erken radar sağlar."
+    )
+
 
 st.write("---")
 st.caption(
