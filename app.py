@@ -4273,7 +4273,7 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Overnight 15% Profit Engine v11 — %15 Hard Gate")
+    st.subheader("🌙 Overnight 15% Profit Engine v12 — %15 Hard Gate + No-Trade Diagnostics")
     st.info("Ana kural: modellenmiş +%15 hedef potansiyeli yoksa sistem YES_NOW / AL sinyali üretmez. Next Day ve Runner Lab çıktıları sadece watchlist/paper radar kabul edilir.")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
@@ -4348,9 +4348,9 @@ with tab5:
     )
 
     st.caption(
-        "v7: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
+        "v12: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
         "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
-        "ön aday üretir; sonra Overnight 15% Profit Engine v11 scoring aynı şekilde uygulanır. "
+        "ön aday üretir; sonra Overnight 15% Profit Engine v12 scoring aynı şekilde uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
     )
 
@@ -4455,13 +4455,17 @@ with tab5:
                         st.info("CSV Daily Momentum bu çalıştırmada aday üretmedi; TradingView evreniyle devam ediliyor.")
 
             if night_universe.empty:
+                st.error("⛔ BU GECE ALIM YOK — %15 hedefli Night Buy evreni oluşmadı.")
                 st.warning(
                     "Night-buy evreni boş döndü. Bu durum aday yok anlamına değil, veri/evren oluşmadı anlamına gelebilir. "
-                    "CSV fallback için ticker CSV yüklemeyi veya regular/premarket modu denemeyi düşün."
+                    "CSV fallback için ticker CSV yüklemeyi, CSV max ticker değerini artırmayı veya regular/premarket modu denemeyi düşün."
                 )
+                st.info("Karar: Trade_Allowed=False. Sistem herhangi bir AL / YES_NOW sinyali üretmedi.")
 
-                with st.expander("🔎 Evren diagnostik"):
+                with st.expander("🔎 Evren diagnostik", expanded=True):
                     st.json({
+                        "decision": "NO_TRADE",
+                        "reason": "night_universe_empty",
                         "source_used": source_used,
                         "tradingview_raw_count": tv_count,
                         **diagnostics,
@@ -4528,7 +4532,21 @@ with tab5:
                     watch_df = pd.DataFrame()
                     aggressive_df = pd.DataFrame()
                     rejected_scored_df = pd.DataFrame()
+                    st.error("⛔ BU GECE ALIM YOK — skorlanabilir %15 Night Buy adayı üretilemedi.")
                     st.warning("Night Buy scoring üretilemedi. Veri/bağlantı reddedilenler bölümünü kontrol et.")
+                    st.info("Karar: Trade_Allowed=False. Sistem herhangi bir AL / YES_NOW sinyali üretmedi.")
+                    with st.expander("🔎 No-Trade diagnostik", expanded=True):
+                        st.json({
+                            "decision": "NO_TRADE",
+                            "reason": "night_scoring_empty",
+                            "universe_count": int(len(night_universe)),
+                            "downloaded_daily_count": int(len(night_daily_dict)),
+                            "rejected_count": int(len(night_rejected)),
+                            **diagnostics,
+                        })
+                        rej_df = pd.DataFrame(night_rejected)
+                        if not rej_df.empty:
+                            st.dataframe(rej_df.head(100), use_container_width=True)
                 else:
                     signal_rank_map_ui = {
                         "YES_NOW": 5,
@@ -4589,7 +4607,25 @@ with tab5:
 
                     available_cols = [c for c in show_cols if c in night_all_df.columns]
 
-                    if night_signal_df.empty:
+                    if night_signal_df.empty and trade_df.empty:
+                        st.error("⛔ BU GECE ALIM YOK — %15 hard gate + gece giriş teyidi geçen aday bulunamadı.")
+                        st.info("Bu sonuç sistem hatası değil; %15 potansiyel/teyit yetersiz olduğu için alım önerisi üretilmedi.")
+                        closest_sort_cols = [c for c in ["Target15_Score", "Expected_Target_%", "Night_Signal_Score", "Final_Night_Score"] if c in night_all_df.columns]
+                        if closest_sort_cols:
+                            closest_df = night_all_df.sort_values(closest_sort_cols, ascending=False).copy()
+                        else:
+                            closest_df = night_all_df.copy()
+                        closest_cols = [c for c in [
+                            "Symbol", "Night_Entry_Signal", "Trade_Allowed", "Expected_Target_%", "TP15",
+                            "Target15_Score", "Has_15pct_Upside", "No_Trade_Reason",
+                            "Final_Night_Score", "Night_Signal_Score", "Demand_Pressure",
+                            "Daily_Momentum_Quality", "Squeeze_Proxy", "AH_Strength",
+                            "Fakeout_Risk", "Hard_Reject", "Risk_Notes"
+                        ] if c in closest_df.columns]
+                        st.subheader("🔎 %15 kapısına en yakın ama reddedilen adaylar")
+                        st.caption("Burası alım listesi değildir; neden sinyal üretilmediğini görmek ve paper eğitim verisi toplamak içindir.")
+                        st.dataframe(closest_df[closest_cols].head(30), use_container_width=True)
+                    elif night_signal_df.empty:
                         st.warning("Bu gece %15 hard gate geçen doğrudan giriş sinyali yok. Aday çıksa bile alım önerilmez.")
                     else:
                         st.success(f"Gece giriş sinyali veren aday: {len(night_signal_df)}")
