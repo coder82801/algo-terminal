@@ -50,6 +50,15 @@ MIN_REAL_SIGNAL_SCORE = 75.0
 MIN_REAL_FINAL_SCORE = 80.0
 MAX_REAL_FAKEOUT_RISK = 45.0
 
+# v14 D+1 %15 Profit Engine: ertesi gün +%15 hedef için ayrı ve daha sert kapı.
+MIN_D1_15_TARGET_SCORE = 78.0
+MIN_D1_DEMAND_PRESSURE = 75.0
+MIN_D1_AH_STRENGTH = 60.0
+MIN_D1_RUNNER_SQUEEZE = 65.0
+MIN_D1_LIQUIDITY_SCORE = 50.0
+MIN_D1_DAILY_MOMENTUM = 60.0
+MAX_D1_FAKEOUT_RISK = 45.0
+
 
 # ============================================================
 # YARDIMCI FONKSİYONLAR
@@ -3234,12 +3243,52 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     price_watch_only = pd.notna(ah_price) and MAX_PRICE_FOR_REAL_NIGHT_BUY < ah_price <= MAX_PRICE_FOR_WATCH_ONLY
     price_hard_reject_for_strategy = pd.notna(ah_price) and ah_price > MAX_PRICE_FOR_WATCH_ONLY
 
+    # v14 — D+1 %15 hedef katkıları: sadece teorik hedef değil, ertesi gün hedefe gidebilecek
+    # talep/squeeze/runner baskısını da kapı şartı yapıyoruz.
+    runner_squeeze_contribution = float(max(
+        squeeze_score,
+        0.50 * squeeze_score + 0.30 * demand_score + 0.20 * ah_strength,
+        0.45 * daily_momentum_score + 0.35 * squeeze_score + 0.20 * demand_score,
+    ))
+    liquidity_ok = bool(liquidity_score >= MIN_D1_LIQUIDITY_SCORE and (pd.isna(dollar_volume) or dollar_volume >= 1_000_000))
+    if liquidity_score < 45 or (pd.notna(dollar_volume) and dollar_volume < 750_000):
+        spread_risk = "HIGH"
+    elif liquidity_score < 60 or (pd.notna(dollar_volume) and dollar_volume < 2_000_000):
+        spread_risk = "MEDIUM"
+    else:
+        spread_risk = "LOW"
+
+    d1_15_target_score = (
+        0.22 * target15_score
+        + 0.18 * max(0, min(100, demand_score))
+        + 0.14 * max(0, min(100, daily_momentum_score))
+        + 0.14 * max(0, min(100, runner_squeeze_contribution))
+        + 0.12 * max(0, min(100, ah_strength))
+        + 0.10 * max(0, min(100, technical_score))
+        + 0.06 * max(0, min(100, liquidity_score))
+        + 0.04 * max(0, min(100, channel_score))
+        - 0.30 * max(0, min(100, fakeout_risk))
+    )
+    if pd.notna(expected_target_pct) and expected_target_pct >= 20:
+        d1_15_target_score += 4
+    if pd.notna(atr_pct) and 5 <= atr_pct <= 16:
+        d1_15_target_score += 3
+    if pd.notna(ah_change_pct) and 2 <= ah_change_pct <= 18:
+        d1_15_target_score += 3
+    d1_15_target_score = float(max(0, min(100, d1_15_target_score)))
+    d1_15_probability_proxy = float(max(0, min(95, d1_15_target_score * 0.82)))
+
     has_15pct_upside = (
         expected_target_pct >= MIN_REQUIRED_PROFIT_PCT
         and target15_score >= MIN_15_TARGET_SCORE
+        and d1_15_target_score >= MIN_D1_15_TARGET_SCORE
+        and demand_score >= MIN_D1_DEMAND_PRESSURE
+        and daily_momentum_score >= MIN_D1_DAILY_MOMENTUM
+        and runner_squeeze_contribution >= MIN_D1_RUNNER_SQUEEZE
+        and ah_strength >= MIN_D1_AH_STRENGTH
         and price_ok_for_real_trade
-        and fakeout_risk <= MAX_REAL_FAKEOUT_RISK
-        and liquidity_score >= 45
+        and fakeout_risk <= MAX_D1_FAKEOUT_RISK
+        and liquidity_ok
         and not price_hard_reject_for_strategy
     )
 
@@ -3248,6 +3297,16 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         no_trade_reasons.append("%15 hedef alanı modellenmedi")
     if target15_score < MIN_15_TARGET_SCORE:
         no_trade_reasons.append("%15 hedef fizibilite skoru yetersiz")
+    if d1_15_target_score < MIN_D1_15_TARGET_SCORE:
+        no_trade_reasons.append("D+1 %15 hedef skoru yetersiz")
+    if demand_score < MIN_D1_DEMAND_PRESSURE:
+        no_trade_reasons.append("Talep basıncı D+1 %15 için yetersiz")
+    if daily_momentum_score < MIN_D1_DAILY_MOMENTUM:
+        no_trade_reasons.append("Günlük momentum D+1 %15 için yetersiz")
+    if runner_squeeze_contribution < MIN_D1_RUNNER_SQUEEZE:
+        no_trade_reasons.append("Runner/squeeze katkısı yetersiz")
+    if ah_strength < MIN_D1_AH_STRENGTH:
+        no_trade_reasons.append("AH/premarket baskısı yetersiz")
     if not price_ok_for_real_trade:
         if price_watch_only:
             no_trade_reasons.append("Fiyat 20$ üstü: %15 gece stratejisi için watch-only")
@@ -3257,8 +3316,8 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
             no_trade_reasons.append("Fiyat 1$ altında veya veri bozuk")
     if fakeout_risk > MAX_REAL_FAKEOUT_RISK:
         no_trade_reasons.append("Fakeout riski %15 stratejisi için yüksek")
-    if liquidity_score < 45:
-        no_trade_reasons.append("Likidite kalitesi yetersiz")
+    if not liquidity_ok:
+        no_trade_reasons.append("Likidite/spread kalitesi yetersiz")
 
     # A/B aday dahi olsa %15 kapısından geçemiyorsa gerçek trade adayı olmaktan çıkar.
     if status == "TRADE_CANDIDATE" and not has_15pct_upside:
@@ -3320,6 +3379,15 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     chase_limit_pct = 3.0 if ah_price < 10 else 1.75
     too_far_to_chase = pd.notna(current_vs_entry_high_pct) and current_vs_entry_high_pct > chase_limit_pct
 
+    if in_entry_zone:
+        entry_zone_status = "IN_ENTRY_ZONE"
+    elif below_entry_zone:
+        entry_zone_status = "BELOW_ENTRY_WAIT_RECLAIM"
+    elif above_entry_zone or too_far_to_chase:
+        entry_zone_status = "ABOVE_ENTRY_WAIT_PULLBACK"
+    else:
+        entry_zone_status = "UNCLEAR"
+
     ah_confirmed = (
         ah_strength >= 55
         or (pd.notna(ah_change_pct) and ah_change_pct >= 1.5 and pd.notna(ah_volume_to_daily_score_pct) and ah_volume_to_daily_score_pct >= 1.0)
@@ -3338,6 +3406,27 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     )
     signal_score = float(max(0, min(100, signal_score)))
 
+    d1_15_gate_passed = bool(
+        has_15pct_upside
+        and signal_score >= MIN_REAL_SIGNAL_SCORE
+        and final_score >= MIN_REAL_FINAL_SCORE
+        and d1_15_target_score >= MIN_D1_15_TARGET_SCORE
+        and ah_confirmed
+        and in_entry_zone
+        and not too_far_to_chase
+        and fakeout_risk <= MAX_D1_FAKEOUT_RISK
+        and liquidity_ok
+    )
+    if has_15pct_upside and not d1_15_gate_passed:
+        if signal_score < MIN_REAL_SIGNAL_SCORE:
+            no_trade_reasons.append("Gece giriş sinyal skoru yetersiz")
+        if not ah_confirmed:
+            no_trade_reasons.append("AH/reclaim teyidi yok")
+        if not in_entry_zone:
+            no_trade_reasons.append("Fiyat giriş bölgesinde değil")
+        if too_far_to_chase:
+            no_trade_reasons.append("Fiyat kovalanamayacak kadar uzak")
+
     # Gece alım sinyali: gerçek işlem için YES_NOW; daha zayıf yapı için SMALL_SIZE/PAPER_ONLY;
     # uygun değilse WAIT_RECLAIM / WAIT_PULLBACK / NO_NIGHT_ENTRY.
     trade_allowed = False
@@ -3347,10 +3436,10 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     elif not has_15pct_upside:
         night_entry_signal = "NO_15_GATE"
         night_action = "%15 hard gate geçilmedi: alım önerilmez. " + ("; ".join(no_trade_reasons[:4]) if no_trade_reasons else "")
-    elif status == "TRADE_CANDIDATE" and signal_score >= MIN_REAL_SIGNAL_SCORE and final_score >= MIN_REAL_FINAL_SCORE and fakeout_risk <= MAX_REAL_FAKEOUT_RISK and ah_confirmed and in_entry_zone and not too_far_to_chase:
+    elif status == "TRADE_CANDIDATE" and d1_15_gate_passed:
         night_entry_signal = "YES_NOW"
         trade_allowed = True
-        night_action = "Gece giriş sinyali VAR: %15 hedef kapısı geçti; küçük/planlı paper pozisyon düşünülebilir."
+        night_action = "D+1 %15 giriş sinyali VAR: %15 hedef kapısı + gece giriş teyidi geçti; şimdilik yalnızca planlı paper pozisyon düşünülebilir."
     elif status == "TRADE_CANDIDATE" and signal_score >= MIN_REAL_SIGNAL_SCORE and ah_confirmed and below_entry_zone:
         night_entry_signal = "WAIT_RECLAIM"
         night_action = "Bekle: fiyat entry altında; entry reclaim + 5dk tutunma gelmeden alma."
@@ -3408,8 +3497,15 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "TP15_Required_Move_%": round(tp15_required_move_pct, 2),
         "TP15_R_Multiple": round(tp15_r_multiple, 2) if pd.notna(tp15_r_multiple) else np.nan,
         "Target15_Score": round(target15_score, 1),
+        "D1_15_Target_Score": round(d1_15_target_score, 1),
+        "D1_15_Probability_Proxy": round(d1_15_probability_proxy, 1),
+        "Runner_Squeeze_Contribution": round(runner_squeeze_contribution, 1),
+        "Liquidity_OK": bool(liquidity_ok),
+        "Spread_Risk": spread_risk,
+        "Entry_Zone_Status": entry_zone_status,
+        "D1_15_Gate_Passed": bool(d1_15_gate_passed),
         "Has_15pct_Upside": bool(has_15pct_upside),
-        "No_Trade_Reason": "; ".join(no_trade_reasons[:6]) if no_trade_reasons else "-",
+        "No_Trade_Reason": "; ".join(no_trade_reasons[:8]) if no_trade_reasons else "-",
         "AH_Confirmed": bool(ah_confirmed),
         "In_Entry_Zone": bool(in_entry_zone),
         "Too_Far_To_Chase": bool(too_far_to_chase),
@@ -4273,9 +4369,9 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Overnight 15% Profit Engine v13 — %15 Hard Gate + CSV Diagnostics")
-    st.info("Ana kural: modellenmiş +%15 hedef potansiyeli yoksa sistem YES_NOW / AL sinyali üretmez. Next Day ve Runner Lab çıktıları sadece watchlist/paper radar kabul edilir.")
-    st.warning("Gerçek giriş için yalnızca Trade_Allowed=True + Night_Entry_Signal=YES_NOW + Expected_Target_%≥15 birlikte aranır. Diğer tüm tablolar eğitim/paper izleme amaçlıdır.")
+    st.subheader("🚀 D+1 15% Profit Engine v14 — %15 Hard Gate + CSV Diagnostics")
+    st.info("Ana kural: ertesi gün premarket veya normal seansta +%15 modellenmiş hedef potansiyeli yoksa sistem YES_NOW / AL sinyali üretmez. Next Day ve Runner Lab çıktıları sadece watchlist/paper radar kabul edilir.")
+    st.warning("Gerçek giriş için yalnızca Trade_Allowed=True + Night_Entry_Signal=YES_NOW + D1_15_Gate_Passed=True + Expected_Target_%≥15 birlikte aranır. Diğer tüm tablolar eğitim/paper izleme amaçlıdır.")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
         "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
@@ -4315,10 +4411,10 @@ with tab5:
             "CSV max ticker tarama",
             min_value=100,
             max_value=8000,
-            value=1000,
+            value=600,
             step=100,
             key="csv_max_tickers",
-            help="CSV fallback aktifse N sembol günlük momentum için taranır. Render Starter için 600-1500 güvenli aralıktır; 2000+ yavaşlayabilir.",
+            help="CSV fallback aktifse N sembol günlük momentum için taranır. Render Starter için 300-800 güvenli aralıktır; 1000+ yavaşlayabilir.",
         )
 
     c4, c5, c6, c7 = st.columns(4)
@@ -4349,9 +4445,9 @@ with tab5:
     )
 
     st.caption(
-        "v13: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
+        "v14: D+1 %15 hedef için Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
         "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
-        "ön aday üretir; sonra Overnight 15% Profit Engine v13 scoring aynı şekilde uygulanır. "
+        "ön aday üretir; sonra D+1 15% Profit Engine v14 scoring ve %15 hard gate uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
     )
 
@@ -4512,8 +4608,10 @@ with tab5:
                 night_all_df = pd.DataFrame(night_candidates)
                 show_cols = [
                     "Symbol", "Grade", "Status", "Night_Entry_Signal", "Trade_Allowed", "Night_Action", "Night_Signal_Score",
-                    "Expected_Target_%", "TP15", "TP15_Required_Move_%", "TP15_R_Multiple", "Target15_Score", "Has_15pct_Upside", "No_Trade_Reason",
-                    "AH_Confirmed", "In_Entry_Zone", "Too_Far_To_Chase",
+                    "Expected_Target_%", "TP15", "TP15_Required_Move_%", "TP15_R_Multiple", "Target15_Score",
+                    "D1_15_Target_Score", "D1_15_Probability_Proxy", "D1_15_Gate_Passed",
+                    "Runner_Squeeze_Contribution", "Has_15pct_Upside", "No_Trade_Reason",
+                    "AH_Confirmed", "In_Entry_Zone", "Entry_Zone_Status", "Too_Far_To_Chase", "Liquidity_OK", "Spread_Risk",
                     "Final_Night_Score",
                     "Demand_Pressure", "Technical_Alignment", "Daily_Momentum_Quality",
                     "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Liquidity_Quality", "Fakeout_Risk",
@@ -4567,6 +4665,7 @@ with tab5:
                     night_signal_df = night_all_df[
                         (night_all_df["Night_Entry_Signal"] == "YES_NOW") &
                         (night_all_df["Trade_Allowed"] == True) &
+                        (night_all_df.get("D1_15_Gate_Passed", False) == True) &
                         (night_all_df["Hard_Reject"] == False)
                     ].copy() if "Night_Entry_Signal" in night_all_df.columns and "Trade_Allowed" in night_all_df.columns else pd.DataFrame()
 
@@ -4575,6 +4674,7 @@ with tab5:
                         (night_all_df["Final_Night_Score"] >= max(MIN_REAL_FINAL_SCORE, min_night_score)) &
                         (night_all_df["Fakeout_Risk"] <= min(max_fakeout, MAX_REAL_FAKEOUT_RISK)) &
                         (night_all_df["Has_15pct_Upside"] == True) &
+                        (night_all_df.get("D1_15_Gate_Passed", False) == True) &
                         (night_all_df["Hard_Reject"] == False)
                     ].copy() if "Trade_Allowed" in night_all_df.columns else pd.DataFrame()
 
@@ -4609,16 +4709,17 @@ with tab5:
                     available_cols = [c for c in show_cols if c in night_all_df.columns]
 
                     if night_signal_df.empty and trade_df.empty:
-                        st.error("⛔ BU GECE ALIM YOK — %15 hard gate + gece giriş teyidi geçen aday bulunamadı.")
+                        st.error("⛔ BU GECE ALIM YOK — D+1 %15 hard gate + gece giriş teyidi geçen aday bulunamadı.")
                         st.info("Bu sonuç sistem hatası değil; %15 potansiyel/teyit yetersiz olduğu için alım önerisi üretilmedi.")
-                        closest_sort_cols = [c for c in ["Target15_Score", "Expected_Target_%", "Night_Signal_Score", "Final_Night_Score"] if c in night_all_df.columns]
+                        closest_sort_cols = [c for c in ["D1_15_Target_Score", "Target15_Score", "Expected_Target_%", "Night_Signal_Score", "Final_Night_Score"] if c in night_all_df.columns]
                         if closest_sort_cols:
                             closest_df = night_all_df.sort_values(closest_sort_cols, ascending=False).copy()
                         else:
                             closest_df = night_all_df.copy()
                         closest_cols = [c for c in [
                             "Symbol", "Night_Entry_Signal", "Trade_Allowed", "Expected_Target_%", "TP15",
-                            "Target15_Score", "Has_15pct_Upside", "No_Trade_Reason",
+                            "Target15_Score", "D1_15_Target_Score", "D1_15_Gate_Passed", "Runner_Squeeze_Contribution",
+                            "Has_15pct_Upside", "No_Trade_Reason",
                             "Final_Night_Score", "Night_Signal_Score", "Demand_Pressure",
                             "Daily_Momentum_Quality", "Squeeze_Proxy", "AH_Strength",
                             "Fakeout_Risk", "Hard_Reject", "Risk_Notes"
@@ -4638,18 +4739,18 @@ with tab5:
                         st.warning("Bu gece %15 hard gate geçen doğrudan giriş sinyali yok. Aday çıksa bile alım önerilmez.")
                     else:
                         st.success(f"Gece giriş sinyali veren aday: {len(night_signal_df)}")
-                        st.subheader("✅ %15 Hard Gate Geçen Gece Giriş Sinyali — YES_NOW")
+                        st.subheader("✅ D+1 %15 Hard Gate Geçen Gece Giriş Sinyali — YES_NOW")
                         st.caption("Bu tablo aday seçimi değil, %15 hedef + execution onayıdır. Şimdilik yalnızca paper; gerçek para için uzun başarı kaydı şart.")
                         st.dataframe(night_signal_df[available_cols].head(10), use_container_width=True)
 
                     if trade_df.empty:
-                        st.warning("%15 hedefli gerçek Night Buy adayı yok. Bu gece için sistem alım baskısını yeterli görmedi.")
+                        st.warning("D+1 %15 hedefli gerçek Night Buy adayı yok. Bu gece için sistem alım baskısını yeterli görmedi.")
                     else:
                         st.success(f"A/B kalite Night Buy adayı: {len(trade_df)}")
-                        st.subheader("🏆 %15 Hedefli Night Buy Adayları")
+                        st.subheader("🏆 D+1 %15 Hedefli Night Buy Adayları")
                         st.dataframe(trade_df[available_cols].head(20), use_container_width=True)
 
-                        st.subheader("🥇 En Güçlü 3 %15 Night Buy")
+                        st.subheader("🥇 En Güçlü 3 D+1 %15 Night Buy")
                         st.dataframe(trade_df[available_cols].head(3), use_container_width=True)
 
                     if watch_df.empty:
