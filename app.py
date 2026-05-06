@@ -4273,8 +4273,9 @@ with tab4:
 # TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
 # ============================================================
 with tab5:
-    st.subheader("🌙 Overnight 15% Profit Engine v12 — %15 Hard Gate + No-Trade Diagnostics")
+    st.subheader("🌙 Overnight 15% Profit Engine v13 — %15 Hard Gate + CSV Diagnostics")
     st.info("Ana kural: modellenmiş +%15 hedef potansiyeli yoksa sistem YES_NOW / AL sinyali üretmez. Next Day ve Runner Lab çıktıları sadece watchlist/paper radar kabul edilir.")
+    st.warning("Gerçek giriş için yalnızca Trade_Allowed=True + Night_Entry_Signal=YES_NOW + Expected_Target_%≥15 birlikte aranır. Diğer tüm tablolar eğitim/paper izleme amaçlıdır.")
     st.write(
         "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
         "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
@@ -4324,7 +4325,7 @@ with tab5:
     with c4:
         night_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=20.0, value=1.0, step=0.5, key="night_min_price")
     with c5:
-        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=80.0, step=5.0, key="night_max_price")
+        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=20.0, step=5.0, key="night_max_price")
     with c6:
         night_min_volume = st.number_input("Min regular hacim", min_value=25_000, max_value=5_000_000, value=150_000, step=25_000, key="night_min_volume")
     with c7:
@@ -4348,9 +4349,9 @@ with tab5:
     )
 
     st.caption(
-        "v12: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
+        "v13: Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
         "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
-        "ön aday üretir; sonra Overnight 15% Profit Engine v12 scoring aynı şekilde uygulanır. "
+        "ön aday üretir; sonra Overnight 15% Profit Engine v13 scoring aynı şekilde uygulanır. "
         "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
     )
 
@@ -4624,7 +4625,15 @@ with tab5:
                         ] if c in closest_df.columns]
                         st.subheader("🔎 %15 kapısına en yakın ama reddedilen adaylar")
                         st.caption("Burası alım listesi değildir; neden sinyal üretilmediğini görmek ve paper eğitim verisi toplamak içindir.")
-                        st.dataframe(closest_df[closest_cols].head(30), use_container_width=True)
+                        closest_export_df = closest_df[closest_cols].head(100).copy()
+                        st.dataframe(closest_export_df.head(30), use_container_width=True)
+                        st.download_button(
+                            "📥 %15 kapısına en yakın reddedilenleri CSV indir",
+                            data=closest_export_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"night_buy_closest_rejected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="download_closest_rejected_v13",
+                        )
                     elif night_signal_df.empty:
                         st.warning("Bu gece %15 hard gate geçen doğrudan giriş sinyali yok. Aday çıksa bile alım önerilmez.")
                     else:
@@ -4699,12 +4708,27 @@ with tab5:
                     if 'rejected_scored_df' in locals() and not rejected_scored_df.empty:
                         reject_cols = [c for c in show_cols if c in rejected_scored_df.columns]
                         st.write("Skorlandı ama işlem/watchlist filtresine girmedi:")
-                        st.dataframe(rejected_scored_df[reject_cols].head(100), use_container_width=True)
+                        rejected_export_df = rejected_scored_df[reject_cols].head(300).copy()
+                        st.dataframe(rejected_export_df.head(100), use_container_width=True)
+                        st.download_button(
+                            "📥 Skorlanıp elenenleri CSV indir",
+                            data=rejected_export_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"night_buy_rejected_scored_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="download_rejected_scored_v13",
+                        )
 
                     rej_df = pd.DataFrame(night_rejected)
                     if not rej_df.empty:
                         st.write("Veri eksikliği veya hesaplama nedeniyle skorlanamayanlar:")
                         st.dataframe(rej_df, use_container_width=True)
+                        st.download_button(
+                            "📥 Veri/hata nedeniyle skorlanamayanları CSV indir",
+                            data=rej_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"night_buy_data_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="download_night_data_errors_v13",
+                        )
                     elif (('rejected_scored_df' not in locals()) or rejected_scored_df.empty):
                         st.write("Kayıt yok.")
 
