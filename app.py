@@ -4841,17 +4841,22 @@ with tab5:
 
 
 # ============================================================
-# TAB 6 - RUNNER LAB / ULTRA MOMENTUM LAB (ONLY PAPER)
+# TAB 6 - RUNNER LAB / ULTRA MOMENTUM LAB v15 (FAST FRESH-FIRST)
 # ============================================================
 with tab6:
-    st.subheader("🔥 Runner Lab / Ultra Momentum Lab v10 — SKK Tipi Koşucular")
+    st.subheader("🔥 Runner Lab / Ultra Momentum Lab v15 — Fast Fresh Runner")
     st.write(
-        "Bu modül geçmişte +%50 ve üzeri ultra momentum günü üretmiş hisselerden bir **Runner DNA havuzu** oluşturur; "
-        "sonra bugünkü premarket/regular/after-hours hareketli hisselerle bu havuzu kesiştirir. "
-        "Ana strateji sinyali değildir; sadece paper trading, istatistik ve ultra risk radar modülüdür."
+        "Bu modül SKK tipi ultra momentum hisselerini **hızlı canlı radar** mantığıyla izler. "
+        "v15'te Runner Lab'i çalıştırmak artık önce ağır tarihsel DNA havuzu kurmaya çalışmaz; "
+        "önce TradingView canlı mover evreninden taze runner adaylarını getirir. "
+        "Geçmiş Runner DNA havuzu ayrı ve opsiyonel bir işlemdir."
     )
-    st.warning("Runner Lab sonuçları **gerçek alım sinyali değildir**. SKK tipi hisselerde halt, spread, tepeden yakalanma ve ani -%50 riskleri yüksektir.")
+    st.warning(
+        "Runner Lab sonuçları gerçek alım sinyali değildir. Buradaki hisseler LAB_ONLY / PAPER_ONLY kabul edilir. "
+        "Gerçek/paper işlem düşünülse bile ayrıca Night Buy YES_NOW, D+1 %15 gate veya Intraday/VWAP teyidi gerekir."
+    )
 
+    st.markdown("### 1) Hızlı canlı runner radarı")
     r0, r1, r2, r3 = st.columns(4)
     with r0:
         runner_session = st.selectbox(
@@ -4859,110 +4864,80 @@ with tab6:
             ["regular", "premarket", "afterhours"],
             index=0,
             format_func=lambda x: {"regular": "Regular", "premarket": "Pre-Market", "afterhours": "After-Hours"}[x],
-            key="runner_session",
+            key="runner_session_v15",
         )
     with r1:
-        runner_min_change = st.slider("Min canlı değişim (%)", 10, 100, 25, 5, key="runner_min_change")
+        runner_min_change = st.slider("Min canlı değişim (%)", 5, 100, 20, 5, key="runner_min_change_v15")
     with r2:
-        runner_tv_records = st.slider("Canlı TV evreni", 20, 150, 80, 10, key="runner_tv_records")
+        runner_tv_records = st.slider("Canlı TV evreni", 20, 150, 150, 10, key="runner_tv_records_v15")
     with r3:
-        runner_max_tickers = st.number_input("Runner pool CSV max ticker", 100, 8000, 1200, 100, key="runner_max_tickers")
-
-    r4, r5, r6, r7 = st.columns(4)
-    with r4:
-        runner_lookback = st.selectbox("Geçmiş tarama", ["90d", "120d", "180d", "1y"], index=2, key="runner_lookback")
-    with r5:
-        runner_min_gain = st.slider("Runner günü min artış (%)", 30, 150, 50, 5, key="runner_min_gain")
-    with r6:
-        runner_min_rvol = st.slider("Runner günü min RVOL20", 2.0, 20.0, 5.0, 0.5, key="runner_min_rvol")
-    with r7:
-        runner_min_volume = st.number_input("Runner günü min hacim", 100_000, 10_000_000, 500_000, 100_000, key="runner_min_volume")
-
-    r8, r9, r10 = st.columns(3)
-    with r8:
-        runner_min_price = st.number_input("Min fiyat ($)", 0.3, 20.0, 1.0, 0.5, key="runner_min_price")
-    with r9:
-        runner_max_price = st.number_input("Max fiyat ($)", 2.0, 100.0, 20.0, 1.0, key="runner_max_price")
-    with r10:
-        runner_seed_mode = st.selectbox(
-            "CSV örnekleme",
-            ["daily_random", "first_n"],
-            index=0,
-            format_func=lambda x: "Günlük rastgele örneklem" if x == "daily_random" else "İlk N sembol",
-            key="runner_seed_mode",
+        runner_allow_fresh = st.checkbox(
+            "Taze intraday runnerları göster",
+            value=True,
+            help="Açık kalmalı. Geçmiş Runner DNA havuzu olmasa bile canlı % hareket edenleri LAB_ONLY olarak gösterir.",
+            key="runner_allow_fresh_v15",
         )
 
-    runner_allow_fresh = st.checkbox(
-        "Runner DNA yoksa taze intraday runnerları da göster",
-        value=True,
-        help="SKK gibi ilk kez koşan hisseleri boş DNA havuzu nedeniyle kaçırmamak için canlı güçlü hareket edenleri LAB_ONLY olarak gösterir.",
-        key="runner_allow_fresh",
+    r4, r5 = st.columns(2)
+    with r4:
+        runner_min_price = st.number_input("Min fiyat ($)", 0.3, 20.0, 1.0, 0.5, key="runner_min_price_v15")
+    with r5:
+        runner_max_price = st.number_input("Max fiyat ($)", 2.0, 100.0, 20.0, 1.0, key="runner_max_price_v15")
+
+    st.info(
+        "v15 Fast Mode: **Runner Lab'i Çalıştır** butonu önce canlı mover listesini tarar. "
+        "Bu işlem normalde kısa sürmelidir. Tarihsel DNA havuzu otomatik kurulmaz; istersen aşağıdaki opsiyonel bölümden ayrıca oluşturulur."
     )
 
-    runner_uploaded_csv = st.file_uploader(
-        "Runner Lab için ticker CSV yükle (opsiyonel). Repo içindeki nasdaq_nyse_tickers.csv otomatik kullanılabilir.",
-        type=["csv"],
-        key="runner_ticker_csv_upload",
-    )
-    runner_csv_col = st.text_input("Runner CSV sembol kolonu (boş=otomatik)", value="", key="runner_csv_col")
+    st.markdown("### 2) Opsiyonel geçmiş Runner DNA havuzu")
+    with st.expander("🏗 Geçmiş Runner DNA havuzu ayarları / opsiyonel", expanded=False):
+        d0, d1, d2, d3 = st.columns(4)
+        with d0:
+            runner_lookback = st.selectbox("Geçmiş tarama", ["90d", "120d", "180d", "1y"], index=3, key="runner_lookback_v15")
+        with d1:
+            runner_min_gain = st.slider("Runner günü min artış (%)", 15, 150, 25, 5, key="runner_min_gain_v15")
+        with d2:
+            runner_min_rvol = st.slider("Runner günü min RVOL20", 1.0, 20.0, 1.5, 0.5, key="runner_min_rvol_v15")
+        with d3:
+            runner_min_volume = st.number_input("Runner günü min hacim", 50_000, 10_000_000, 200_000, 50_000, key="runner_min_volume_v15")
 
-    def _load_runner_tickers_for_ui():
-        if runner_uploaded_csv is not None:
-            try:
-                runner_uploaded_csv.seek(0)
-                return load_tickers_from_uploaded_csv(runner_uploaded_csv, runner_csv_col.strip() or None), "Uploaded CSV"
-            except Exception as exc:
-                st.error(f"Runner CSV okuma hatası: {exc}")
-                return [], "Uploaded CSV hata"
-        return load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", runner_csv_col.strip() or None), "Repo nasdaq_nyse_tickers.csv"
-
-    if st.button("🏗 Runner DNA Havuzunu Oluştur / Güncelle", key="btn_build_runner_pool_v10"):
-        tickers, ticker_source = _load_runner_tickers_for_ui()
-        if not tickers:
-            st.error("Runner Lab için ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
-        else:
-            seed = int(datetime.now().strftime('%Y%m%d')) if runner_seed_mode == "daily_random" else None
-            sampled = _runner_sample_tickers(tickers, int(runner_max_tickers), seed=seed)
-            with st.spinner(f"Runner DNA havuzu oluşturuluyor... Kaynak: {ticker_source}; taranan sembol: {len(sampled)}"):
-                pool_df = build_runner_pool_from_tickers_cached(
-                    tuple(sampled),
-                    lookback_period=runner_lookback,
-                    min_price=float(runner_min_price),
-                    max_price=float(runner_max_price),
-                    min_runner_gain_pct=float(runner_min_gain),
-                    min_rvol20=float(runner_min_rvol),
-                    min_volume=int(runner_min_volume),
-                    min_runner_days=1,
-                )
-            st.session_state["runner_pool_df_v10"] = pool_df
-            st.info(
-                f"Ticker kaynağı: {ticker_source} | Toplam sembol: {len(tickers)} | Taranan: {len(sampled)} | "
-                f"Runner DNA havuzu: {0 if pool_df is None else len(pool_df)}"
+        d4, d5 = st.columns(2)
+        with d4:
+            runner_max_tickers = st.number_input("Runner pool CSV max ticker", 100, 8000, 500, 100, key="runner_max_tickers_v15")
+        with d5:
+            runner_seed_mode = st.selectbox(
+                "CSV örnekleme",
+                ["daily_random", "first_n"],
+                index=0,
+                format_func=lambda x: "Günlük rastgele örneklem" if x == "daily_random" else "İlk N sembol",
+                key="runner_seed_mode_v15",
             )
-            if pool_df is None or pool_df.empty:
-                st.warning("Runner DNA havuzu boş döndü. v10 loose DNA katmanı da sonuç üretmediyse min artış/RVOL/hacim eşiklerini düşür, CSV max ticker değerini artır veya taze runner fallback ile canlı radar kullan.")
-            else:
-                st.success(f"Runner DNA havuzuna alınan hisse sayısı: {len(pool_df)}")
-                st.dataframe(pool_df.head(50), use_container_width=True)
-                st.download_button(
-                    "📥 Runner DNA havuzunu CSV indir",
-                    data=pool_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"runner_dna_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                )
 
-    st.divider()
-    if st.button("🔥 Runner Lab'i Çalıştır", key="btn_run_runner_lab_v10"):
-        pool_df = st.session_state.get("runner_pool_df_v10", pd.DataFrame())
-        if pool_df is None or pool_df.empty:
-            tickers, ticker_source = _load_runner_tickers_for_ui()
+        runner_uploaded_csv = st.file_uploader(
+            "Runner DNA için ticker CSV yükle (opsiyonel). Repo içindeki nasdaq_nyse_tickers.csv otomatik kullanılabilir.",
+            type=["csv"],
+            key="runner_ticker_csv_upload_v15",
+        )
+        runner_csv_col = st.text_input("Runner CSV sembol kolonu (boş=otomatik)", value="", key="runner_csv_col_v15")
+
+        def _load_runner_tickers_for_ui_v15():
+            if runner_uploaded_csv is not None:
+                try:
+                    runner_uploaded_csv.seek(0)
+                    return load_tickers_from_uploaded_csv(runner_uploaded_csv, runner_csv_col.strip() or None), "Uploaded CSV"
+                except Exception as exc:
+                    st.error(f"Runner CSV okuma hatası: {exc}")
+                    return [], "Uploaded CSV hata"
+            return load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", runner_csv_col.strip() or None), "Repo nasdaq_nyse_tickers.csv"
+
+        if st.button("🏗 Runner DNA Havuzunu Oluştur / Güncelle", key="btn_build_runner_pool_v15"):
+            tickers, ticker_source = _load_runner_tickers_for_ui_v15()
             if not tickers:
-                st.error("Runner havuzu yok ve CSV bulunamadı. Önce CSV yükle veya repo dosyasını kontrol et.")
-                pool_df = pd.DataFrame()
+                st.error("Runner Lab için ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
             else:
                 seed = int(datetime.now().strftime('%Y%m%d')) if runner_seed_mode == "daily_random" else None
                 sampled = _runner_sample_tickers(tickers, int(runner_max_tickers), seed=seed)
-                with st.spinner("Runner havuzu cache'te yok; önce havuz oluşturuluyor..."):
+                with st.spinner(f"Runner DNA havuzu oluşturuluyor... Kaynak: {ticker_source}; taranan sembol: {len(sampled)}"):
                     pool_df = build_runner_pool_from_tickers_cached(
                         tuple(sampled),
                         lookback_period=runner_lookback,
@@ -4972,15 +4947,54 @@ with tab6:
                         min_rvol20=float(runner_min_rvol),
                         min_volume=int(runner_min_volume),
                         min_runner_days=1,
+                        chunk_size=25,
+                        pause=0.3,
                     )
-                st.session_state["runner_pool_df_v10"] = pool_df
+                st.session_state["runner_pool_df_v15"] = pool_df
+                st.info(
+                    f"Ticker kaynağı: {ticker_source} | Toplam sembol: {len(tickers)} | Taranan: {len(sampled)} | "
+                    f"Runner DNA havuzu: {0 if pool_df is None else len(pool_df)}"
+                )
+                if pool_df is None or pool_df.empty:
+                    st.warning(
+                        "Runner DNA havuzu boş döndü. Bu kritik değil; v15 canlı taze runner radarı geçmiş DNA olmadan da çalışır. "
+                        "DNA havuzu için eşikleri düşürmek veya CSV max ticker değerini artırmak denenebilir."
+                    )
+                else:
+                    st.success(f"Runner DNA havuzuna alınan hisse sayısı: {len(pool_df)}")
+                    st.dataframe(pool_df.head(50), use_container_width=True)
+                    st.download_button(
+                        "📥 Runner DNA havuzunu CSV indir",
+                        data=pool_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"runner_dna_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_runner_dna_pool_v15",
+                    )
 
+    st.divider()
+    if st.button("🔥 Runner Lab'i Çalıştır — Fast Fresh", key="btn_run_runner_lab_v15"):
         runners_frames = []
-        if pool_df is None or pool_df.empty:
-            st.warning("Runner DNA havuzu boş. v10 taze intraday runner fallback devreye alınabilir.")
-        else:
+        diagnostics = []
+
+        # 1) Fresh intraday runner first. No historical download here.
+        if runner_allow_fresh:
+            with st.spinner("Canlı TradingView mover evreni taranıyor — tarihsel DNA indirilmiyor..."):
+                fresh_df = scan_fresh_intraday_runners_cached(
+                    session_name=runner_session,
+                    max_records=int(runner_tv_records),
+                    min_price=float(runner_min_price),
+                    max_price=float(runner_max_price),
+                    min_live_change_pct=float(runner_min_change),
+                )
+            diagnostics.append({"Aşama": "Fresh Intraday Runner", "Aday": 0 if fresh_df is None else len(fresh_df)})
+            if fresh_df is not None and not fresh_df.empty:
+                runners_frames.append(fresh_df)
+
+        # 2) Optional historical DNA bonus, only if already cached/session state exists.
+        pool_df = st.session_state.get("runner_pool_df_v15", pd.DataFrame())
+        if pool_df is not None and not pool_df.empty:
             records = tuple(pool_df.to_dict("records"))
-            with st.spinner("Canlı intraday movers + Runner DNA havuzu birleştiriliyor..."):
+            with st.spinner("Cache'teki Runner DNA havuzu canlı mover listesiyle eşleştiriliyor..."):
                 dna_runners_df = scan_intraday_runners_cached(
                     session_name=runner_session,
                     runner_pool_records=records,
@@ -4989,26 +5003,27 @@ with tab6:
                     max_price=float(runner_max_price),
                     min_live_change_pct=float(runner_min_change),
                 )
+            diagnostics.append({"Aşama": "Runner DNA Match", "Aday": 0 if dna_runners_df is None else len(dna_runners_df)})
             if dna_runners_df is not None and not dna_runners_df.empty:
                 runners_frames.append(dna_runners_df)
+        else:
+            diagnostics.append({"Aşama": "Runner DNA Match", "Aday": "Havuz yok — atlandı"})
 
-        if runner_allow_fresh:
-            with st.spinner("Taze intraday runner fallback taranıyor..."):
-                fresh_df = scan_fresh_intraday_runners_cached(
-                    session_name=runner_session,
-                    max_records=int(runner_tv_records),
-                    min_price=float(runner_min_price),
-                    max_price=float(runner_max_price),
-                    min_live_change_pct=float(runner_min_change),
-                )
-            if fresh_df is not None and not fresh_df.empty:
-                runners_frames.append(fresh_df)
+        st.markdown("#### Runner Lab diagnostik")
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
 
         if not runners_frames:
-            st.warning("Bugün için Runner Lab adayı bulunamadı. Min canlı değişim eşiğini düşür, seansı değiştir veya TV evrenini artır.")
+            st.warning(
+                "Runner Lab canlı aday bulamadı. Bu sistem hatası olmak zorunda değil: seçilen seansta TV mover listesinde "
+                "min canlı değişim/fiyat aralığı filtresini geçen hisse olmayabilir. Min canlı değişimi %10–15'e düşür, "
+                "TV evrenini 150 yap veya seansı premarket/regular/afterhours olarak doğru seç."
+            )
         else:
             runners_df = pd.concat(runners_frames, ignore_index=True, sort=False)
             if 'Symbol' in runners_df.columns:
+                # DNA eşleşenler fresh'ten daha değerli olsun; varsa daha yüksek skorlu kalsın.
+                if 'Runner_Lab_Score' in runners_df.columns:
+                    runners_df = runners_df.sort_values(['Runner_Lab_Score'], ascending=False)
                 runners_df = runners_df.drop_duplicates(subset=['Symbol'], keep='first')
             if 'Runner_Lab_Score' in runners_df.columns:
                 runners_df = runners_df.sort_values(['Runner_Lab_Score'], ascending=False).reset_index(drop=True)
@@ -5020,17 +5035,19 @@ with tab6:
                 "last_runner_date", "days_since_last_run",
             ]
             available_runner_cols = [c for c in show_runner_cols if c in runners_df.columns]
-            st.dataframe(runners_df[available_runner_cols].head(50), use_container_width=True)
+            st.dataframe(runners_df[available_runner_cols].head(60), use_container_width=True)
             st.download_button(
                 "📥 Runner Lab adaylarını CSV indir",
                 data=runners_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"runner_lab_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"runner_lab_fast_v15_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
+                key="download_runner_lab_v15",
             )
 
     st.info(
-        "Runner Lab ana alım motoru değildir. Sonuçlar Night Buy YES_NOW veya Intraday Trade Engine teyidi olmadan gerçek işlem sinyali sayılmaz. "
-        "Ama SKK tipi ultra momentum hisseleri için istatistik ve erken radar sağlar. v10 ayrıca geçmiş DNA yoksa taze intraday runnerları LAB_ONLY olarak gösterebilir."
+        "v15 Fast Runner Lab: Runner Lab'i çalıştırmak artık önce 1200 sembollük tarihsel veri indirmez. "
+        "Önce canlı runnerları gösterir; geçmiş Runner DNA havuzu varsa sadece bonus eşleşme olarak kullanır. "
+        "Sonuçlar LAB_ONLY / PAPER_ONLY olup ana alım sinyali değildir."
     )
 
 
