@@ -1755,22 +1755,40 @@ def compute_intraday_trade_levels(features: dict, setup_type: str) -> dict:
 
 
 @st.cache_data(ttl=30)
-def fetch_intraday_trade_universe(session_name: str, max_records: int = 30, min_price: float = 1.0, max_price: float = 100.0):
+def fetch_intraday_trade_universe(
+    session_name: str,
+    max_records: int = 30,
+    min_price: float = 1.0,
+    max_price: float = 100.0,
+    exclude_stale_regular: bool = False,
+):
+    active_session = get_active_session_et()
+    session_name = (session_name or 'regular').lower()
+
+    # Fresh Runner Catcher güvenlik kuralı:
+    # ABD regular seansı kapalıyken TradingView 'change/close/volume' kolonları çoğu zaman
+    # bir önceki normal seansın hareketini gösterir. Bu durumda Regular seçimi fresh runner sayılmamalı.
+    if exclude_stale_regular and session_name == 'regular' and active_session != 'regular':
+        return pd.DataFrame()
+
     if session_name == 'premarket':
         sort_field = 'premarket_change'
         vol_field = 'premarket_volume'
         price_field = 'premarket_close'
         min_vol = 50000
+        data_status = 'FRESH_PREMARKET' if active_session == 'premarket' else 'PREMARKET_SELECTED_OUTSIDE_SESSION'
     elif session_name == 'afterhours':
         sort_field = 'postmarket_change'
         vol_field = 'postmarket_volume'
         price_field = 'postmarket_close'
         min_vol = 50000
+        data_status = 'FRESH_AFTERHOURS' if active_session == 'afterhours' else 'AFTERHOURS_SELECTED_OUTSIDE_SESSION'
     else:
         sort_field = 'change'
         vol_field = 'volume'
         price_field = 'close'
         min_vol = 150000
+        data_status = 'FRESH_REGULAR' if active_session == 'regular' else 'PREVIOUS_REGULAR_POSSIBLE_STALE'
 
     filters = [
         {'left': price_field, 'operation': 'in_range', 'right': [min_price, max_price]},
@@ -1801,6 +1819,9 @@ def fetch_intraday_trade_universe(session_name: str, max_records: int = 30, min_
                 'live_change_pct': safe_float(d[3], np.nan),
                 'live_volume': safe_float(d[4], np.nan),
                 'market_cap': safe_float(d[5], np.nan) if len(d) > 5 else np.nan,
+                'change_source': session_name.upper(),
+                'data_status': data_status,
+                'active_session_et': active_session,
             })
         except Exception as exc:
             log_debug(f'Intraday universe parse error: {exc}')
@@ -3787,6 +3808,7 @@ def scan_intraday_runners_cached(
     min_price: float = 1.0,
     max_price: float = 20.0,
     min_live_change_pct: float = 20.0,
+    exclude_stale_regular: bool = True,
 ) -> pd.DataFrame:
     """Canlı en hareketli hisseler ile geçmiş Runner DNA havuzunu birleştirir."""
     if not runner_pool_records:
@@ -3800,6 +3822,7 @@ def scan_intraday_runners_cached(
         max_records=max_records,
         min_price=min_price,
         max_price=max_price,
+        exclude_stale_regular=exclude_stale_regular,
     )
     if universe_df is None or universe_df.empty:
         return pd.DataFrame()
@@ -3856,6 +3879,7 @@ def scan_fresh_intraday_runners_cached(
     min_price: float = 1.0,
     max_price: float = 20.0,
     min_live_change_pct: float = 20.0,
+    exclude_stale_regular: bool = True,
 ) -> pd.DataFrame:
     """v10: Geçmiş runner DNA olmasa bile bugünkü ultra momentum hisselerini LAB_ONLY olarak gösterir.
 
@@ -3867,6 +3891,7 @@ def scan_fresh_intraday_runners_cached(
         max_records=max_records,
         min_price=min_price,
         max_price=max_price,
+        exclude_stale_regular=exclude_stale_regular,
     )
     if universe_df is None or universe_df.empty:
         return pd.DataFrame()
@@ -4841,13 +4866,13 @@ with tab5:
 
 
 # ============================================================
-# TAB 6 - RUNNER LAB / ULTRA MOMENTUM LAB v15 (FAST FRESH-FIRST)
+# TAB 6 - FRESH RUNNER CATCHER v16 (ACTIVE SESSION GUARD)
 # ============================================================
 with tab6:
-    st.subheader("🔥 Runner Lab / Ultra Momentum Lab v15 — Fast Fresh Runner")
+    st.subheader("🔥 Fresh Runner Catcher v16 — Active Session Guard")
     st.write(
         "Bu modül SKK tipi ultra momentum hisselerini **hızlı canlı radar** mantığıyla izler. "
-        "v15'te Runner Lab'i çalıştırmak artık önce ağır tarihsel DNA havuzu kurmaya çalışmaz; "
+        "v16'da Runner Lab önce aktif seansı otomatik algılar; premarket saatinde dünkü regular hareketleri fresh runner saymaz; "
         "önce TradingView canlı mover evreninden taze runner adaylarını getirir. "
         "Geçmiş Runner DNA havuzu ayrı ve opsiyonel bir işlemdir."
     )
@@ -4857,15 +4882,29 @@ with tab6:
     )
 
     st.markdown("### 1) Hızlı canlı runner radarı")
+    active_runner_session = get_active_session_et()
+    session_labels = {
+        "auto": "Otomatik aktif seans",
+        "premarket": "Pre-Market",
+        "regular": "Regular",
+        "afterhours": "After-Hours",
+    }
     r0, r1, r2, r3 = st.columns(4)
     with r0:
-        runner_session = st.selectbox(
+        runner_session_choice = st.selectbox(
             "Tarama seansı",
-            ["regular", "premarket", "afterhours"],
+            ["auto", "premarket", "regular", "afterhours"],
             index=0,
-            format_func=lambda x: {"regular": "Regular", "premarket": "Pre-Market", "afterhours": "After-Hours"}[x],
-            key="runner_session_v15",
+            format_func=lambda x: session_labels[x],
+            key="runner_session_v16",
         )
+        if runner_session_choice == "auto":
+            if active_runner_session in ["premarket", "regular", "afterhours"]:
+                runner_session = active_runner_session
+            else:
+                runner_session = "premarket"
+        else:
+            runner_session = runner_session_choice
     with r1:
         runner_min_change = st.slider("Min canlı değişim (%)", 5, 100, 20, 5, key="runner_min_change_v15")
     with r2:
@@ -4884,8 +4923,26 @@ with tab6:
     with r5:
         runner_max_price = st.number_input("Max fiyat ($)", 2.0, 100.0, 20.0, 1.0, key="runner_max_price_v15")
 
+    runner_exclude_stale_regular = st.checkbox(
+        "Regular kapalıyken dünkü regular hareketleri fresh sayma",
+        value=True,
+        help="Açık kalmalı. Pre-market saatinde Regular seçilirse dünkü regular gainerları taze runner diye göstermeyi engeller.",
+        key="runner_exclude_stale_regular_v16",
+    )
+
+    st.caption(
+        f"Aktif ABD seansı: **{active_runner_session.upper()}** | Kullanılan tarama seansı: **{runner_session.upper()}**"
+    )
+    if runner_session_choice != "auto" and active_runner_session in ["premarket", "regular", "afterhours"] and runner_session != active_runner_session:
+        st.warning(
+            "Seçtiğin seans aktif ABD seansıyla uyuşmuyor. Özellikle pre-market saatinde Regular seçersen "
+            "dünkü normal seans hareketleri fresh runner gibi görünebilir."
+        )
+    if active_runner_session == "closed":
+        st.warning("ABD piyasası şu an kapalı görünüyor. Fresh runner taraması sınırlı/boş dönebilir.")
+
     st.info(
-        "v15 Fast Mode: **Runner Lab'i Çalıştır** butonu önce canlı mover listesini tarar. "
+        "v16 Active Session Guard: **Runner Lab'i Çalıştır** butonu önce canlı mover listesini tarar. "
         "Bu işlem normalde kısa sürmelidir. Tarihsel DNA havuzu otomatik kurulmaz; istersen aşağıdaki opsiyonel bölümden ayrıca oluşturulur."
     )
 
@@ -4972,9 +5029,13 @@ with tab6:
                     )
 
     st.divider()
-    if st.button("🔥 Runner Lab'i Çalıştır — Fast Fresh", key="btn_run_runner_lab_v15"):
+    if st.button("🔥 Runner Lab'i Çalıştır — Active Fresh", key="btn_run_runner_lab_v16"):
         runners_frames = []
-        diagnostics = []
+        diagnostics = [
+            {"Aşama": "Active Session", "Aday": active_runner_session},
+            {"Aşama": "Selected Session", "Aday": runner_session},
+            {"Aşama": "Exclude Stale Regular", "Aday": bool(runner_exclude_stale_regular)},
+        ]
 
         # 1) Fresh intraday runner first. No historical download here.
         if runner_allow_fresh:
@@ -4985,6 +5046,7 @@ with tab6:
                     min_price=float(runner_min_price),
                     max_price=float(runner_max_price),
                     min_live_change_pct=float(runner_min_change),
+                    exclude_stale_regular=bool(runner_exclude_stale_regular),
                 )
             diagnostics.append({"Aşama": "Fresh Intraday Runner", "Aday": 0 if fresh_df is None else len(fresh_df)})
             if fresh_df is not None and not fresh_df.empty:
@@ -5002,6 +5064,7 @@ with tab6:
                     min_price=float(runner_min_price),
                     max_price=float(runner_max_price),
                     min_live_change_pct=float(runner_min_change),
+                    exclude_stale_regular=bool(runner_exclude_stale_regular),
                 )
             diagnostics.append({"Aşama": "Runner DNA Match", "Aday": 0 if dna_runners_df is None else len(dna_runners_df)})
             if dna_runners_df is not None and not dna_runners_df.empty:
@@ -5015,7 +5078,7 @@ with tab6:
         if not runners_frames:
             st.warning(
                 "Runner Lab canlı aday bulamadı. Bu sistem hatası olmak zorunda değil: seçilen seansta TV mover listesinde "
-                "min canlı değişim/fiyat aralığı filtresini geçen hisse olmayabilir. Min canlı değişimi %10–15'e düşür, "
+                "min canlı değişim/fiyat aralığı veya aktif seans filtresini geçen hisse olmayabilir. Pre-market saatinde Regular değil Pre-Market/Auto seç; min canlı değişimi %10–15'e düşür, "
                 "TV evrenini 150 yap veya seansı premarket/regular/afterhours olarak doğru seç."
             )
         else:
@@ -5030,6 +5093,7 @@ with tab6:
             st.success(f"Runner Lab adayı: {len(runners_df)} — sadece paper / ultra risk")
             show_runner_cols = [
                 "Symbol", "Company", "Live_Price", "Live_Change_%", "Live_Volume", "MarketCap",
+                "change_source", "data_status", "active_session_et",
                 "Runner_Lab_Score", "Runner_DNA_Score", "Runner_Action", "Risk_Label", "LAB_ONLY",
                 "runner_pool_tier", "runner_day_count", "max_runner_gain_pct", "max_runner_rvol20", "max_runner_dollar_volume_M",
                 "last_runner_date", "days_since_last_run",
@@ -5039,13 +5103,13 @@ with tab6:
             st.download_button(
                 "📥 Runner Lab adaylarını CSV indir",
                 data=runners_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"runner_lab_fast_v15_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"fresh_runner_catcher_v16_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 key="download_runner_lab_v15",
             )
 
     st.info(
-        "v15 Fast Runner Lab: Runner Lab'i çalıştırmak artık önce 1200 sembollük tarihsel veri indirmez. "
+        "v16 Fresh Runner Catcher: Runner Lab'i çalıştırmak artık önce 1200 sembollük tarihsel veri indirmez. "
         "Önce canlı runnerları gösterir; geçmiş Runner DNA havuzu varsa sadece bonus eşleşme olarak kullanır. "
         "Sonuçlar LAB_ONLY / PAPER_ONLY olup ana alım sinyali değildir."
     )
