@@ -5427,15 +5427,16 @@ def render_v17_multimodule_tab(
 # ============================================================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
-        "⚡ Canlı Gün İçi Radar",
-        "🧠 Intraday Trade Engine",
-        "🔮 Kurumsal Swing Radar",
-        "📊 VWAP Analizi ve Emir Merkezi",
-        "🌙 Night Buy Scanner",
-        "🔥 Runner Lab / Ultra Momentum",
-        "🐋 v17 Whale/Catalyst Engine",
+        "⚡ Radar",
+        "🧠 Intraday",
+        "🔮 Swing",
+        "📊 VWAP",
+        "🌙 Night",
+        "🔥 Runner",
+        "🐋 v17",
     ]
 )
+
 
 
 # ============================================================
