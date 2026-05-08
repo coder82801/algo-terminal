@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v17 TEST - Yeni Kod Çalışıyor")
-st.sidebar.success("v17 build aktif")
+st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + Çoklu Seans VWAP)")
+
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
@@ -5211,6 +5211,12 @@ def render_v17_multimodule_tab(
         value=False,
         key="v17_run_daily_backtest",
     )
+    manual_tickers_text = st.text_input(
+        "Manuel semboller (opsiyonel)",
+        value="",
+        key="v17_manual_tickers",
+        help="Evren bos donerse veya belirli hisseleri test etmek istersen RXT,AEHL,YMAT gibi virgulle yaz.",
+    )
     active_session = v17_active_session_et()
     preferred_session = active_session if session_name == "auto" else session_name
     st.caption(f"Aktif ABD seansi: {active_session.upper()} | Kullanilan seans: {preferred_session.upper()}")
@@ -5251,8 +5257,57 @@ def render_v17_multimodule_tab(
             night_df["Universe_Source"] = "NIGHT_UNIVERSE"
             universe_frames.append(night_df)
 
+    manual_tickers = []
+    if manual_tickers_text.strip():
+        seen_manual = set()
+        for raw_symbol in manual_tickers_text.replace(";", ",").replace(" ", ",").split(","):
+            symbol = raw_symbol.strip().upper().replace(".", "-")
+            if not symbol or symbol in seen_manual:
+                continue
+            seen_manual.add(symbol)
+            manual_tickers.append(symbol)
+
+    if manual_tickers:
+        manual_df = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "yahoo_symbol": symbol,
+                    "description": "Manual v17 ticker",
+                    "live_price": np.nan,
+                    "live_change_pct": np.nan,
+                    "live_volume": np.nan,
+                    "market_cap": np.nan,
+                    "Universe_Source": "MANUAL",
+                }
+                for symbol in manual_tickers
+            ]
+        )
+        diagnostics.append({"source": "manual_tickers", "count": len(manual_df)})
+        universe_frames.append(manual_df)
+
+    # After-hours ilk dakikalarda TradingView postmarket kolonlari bos donebilir.
+    # Bu durumda sistemi tamamen bos birakmak yerine regular momentum fallback deneriz.
     if not universe_frames:
-        st.warning("Evren bos. Seans, min degisim veya fiyat araligini genislet.")
+        with st.spinner("After-hours evren bos; regular momentum fallback deneniyor..."):
+            fallback_df = fetch_night_buy_universe(
+                scan_mode="regular",
+                max_records=int(max_records),
+                min_price=float(min_price),
+                max_price=float(max_price),
+                min_volume=50_000,
+            )
+        diagnostics.append({"source": "regular_fallback", "count": 0 if fallback_df is None else len(fallback_df)})
+        if fallback_df is not None and not fallback_df.empty:
+            fallback_df = fallback_df.copy()
+            fallback_df["Universe_Source"] = "REGULAR_FALLBACK"
+            universe_frames.append(fallback_df)
+
+    if not universe_frames:
+        st.warning(
+            "Evren bos. After-hours yeni baslamis olabilir veya TradingView postmarket kolonlari bos donuyor olabilir. "
+            "Manuel sembol kutusuna RXT,AEHL,YMAT gibi hisseleri yazip tekrar calistir."
+        )
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
         return
 
@@ -5260,7 +5315,14 @@ def render_v17_multimodule_tab(
     if "yahoo_symbol" in universe_df.columns:
         universe_df = universe_df.drop_duplicates(subset=["yahoo_symbol"], keep="first")
     if "live_change_pct" in universe_df.columns and min_live_change > 0:
-        universe_df = universe_df[universe_df["live_change_pct"].fillna(-999) >= float(min_live_change)].copy()
+        keep_sources = {"MANUAL", "REGULAR_FALLBACK"}
+        source_series = universe_df.get("Universe_Source", pd.Series("", index=universe_df.index)).fillna("")
+        change_series = universe_df["live_change_pct"]
+        universe_df = universe_df[
+            source_series.isin(keep_sources)
+            | change_series.isna()
+            | (change_series >= float(min_live_change))
+        ].copy()
 
     if universe_df.empty:
         st.warning("Min canli degisim filtresinden sonra evren bos kaldi.")
@@ -5427,16 +5489,15 @@ def render_v17_multimodule_tab(
 # ============================================================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
-        "⚡ Radar",
-        "🧠 Intraday",
-        "🔮 Swing",
-        "📊 VWAP",
-        "🌙 Night",
-        "🔥 Runner",
-        "🐋 v17",
+        "⚡ Canlı Gün İçi Radar",
+        "🧠 Intraday Trade Engine",
+        "🔮 Kurumsal Swing Radar",
+        "📊 VWAP Analizi ve Emir Merkezi",
+        "🌙 Night Buy Scanner",
+        "🔥 Runner Lab / Ultra Momentum",
+        "🐋 v17 Whale/Catalyst Engine",
     ]
 )
-
 
 
 # ============================================================
