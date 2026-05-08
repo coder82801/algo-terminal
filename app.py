@@ -18,7 +18,9 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + Çoklu Seans VWAP)")
+st.title("🎯 NextDay Scanner Pro v17 TEST - Yeni Kod Çalışıyor")
+st.sidebar.success("v17 build aktif")
+
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -5489,15 +5491,16 @@ def render_v17_multimodule_tab(
 # ============================================================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
-        "⚡ Canlı Gün İçi Radar",
-        "🧠 Intraday Trade Engine",
-        "🔮 Kurumsal Swing Radar",
-        "📊 VWAP Analizi ve Emir Merkezi",
-        "🌙 Night Buy Scanner",
-        "🔥 Runner Lab / Ultra Momentum",
-        "🐋 v17 Whale/Catalyst Engine",
+        "⚡ Radar",
+        "🧠 Intraday",
+        "🔮 Swing",
+        "📊 VWAP",
+        "🌙 Night",
+        "🔥 Runner",
+        "🐋 v17",
     ]
 )
+
 
 
 # ============================================================
@@ -6672,6 +6675,17 @@ with tab6:
 # ============================================================
 # TAB 7 - v17 WHALE / CATALYST / CLEAN / AGGRESSIVE ENGINE
 # ============================================================
+with tab7:
+    render_v17_multimodule_tab(
+        st=st,
+        fetch_intraday_trade_universe=fetch_intraday_trade_universe,
+        fetch_night_buy_universe=fetch_night_buy_universe,
+        download_daily_data_chunked=download_daily_data_chunked,
+        get_recent_intraday_full_data=get_recent_intraday_full_data,
+        api_key=api_key,
+        secret_key=secret_key,
+        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+    )
 with tab7:
     render_v17_multimodule_tab(
         st=st,
