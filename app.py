@@ -18,9 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v17 TEST - Yeni Kod Çalışıyor")
+st.title("🎯 NextDay Scanner Pro v17 (Clean + Catalyst + Whale + Runner)")
 st.sidebar.success("v17 build aktif")
-
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -4562,6 +4561,23 @@ def v17_score_catalyst_runner(f: dict) -> tuple[float, list[str]]:
     if pd.notna(f.get("price_to_active_vwap_pct", np.nan)) and f["price_to_active_vwap_pct"] < -0.5:
         score -= 18
 
+    # Catalyst runner icin fiyat momentumunun pozitif olmasi zorunluya yakin.
+    # Yuksek hacim/VWAP tek basina yeterli degil; aksi halde OIO gibi dusen hisseler
+    # hatali sekilde runner sinyali alabilir.
+    ah_change = f.get("ah_change_pct", np.nan)
+    premarket_change = f.get("premarket_change_pct", np.nan)
+    positive_runner_momentum = (
+        (pd.notna(change) and change >= 10.0)
+        or (pd.notna(ah_change) and ah_change >= 3.0)
+        or (pd.notna(premarket_change) and premarket_change >= 8.0)
+    )
+    if pd.notna(change) and change <= 0:
+        score = min(score, 55.0)
+        notes.append("change negatif: runner buy yok")
+    elif not positive_runner_momentum:
+        score = min(score, 68.0)
+        notes.append("pozitif runner momentumu teyitsiz")
+
     return float(max(0, min(100, score))), notes
 
 
@@ -4770,7 +4786,7 @@ def v17_trade_plan(
         "TP15": tp15,
         "TP20": tp20,
         "TP30": tp30,
-        "Main_Shares_2k": main_pos["shares"],
+        "Paper_Main_Shares": main_pos["shares"],
         "Main_Dollar_Size": main_pos["dollar_size"],
         "Main_Risk_Dollars": main_pos["risk_dollars"],
         "Aggressive_Shares_100": aggressive_pos["shares"],
@@ -4790,10 +4806,24 @@ def v17_signal_from_scores(
     above_vwap = f.get("above_active_vwap") or f.get("above_reg_vwap")
     active_pos = f.get("active_range_position", np.nan)
     buy_pressure = f.get("buy_pressure_ratio", np.nan)
+    change = f.get("change_vs_prev_close_pct", np.nan)
+    ah_change = f.get("ah_change_pct", np.nan)
+    premarket_change = f.get("premarket_change_pct", np.nan)
+    catalyst_momentum_ok = (
+        (pd.notna(change) and change >= 10.0)
+        or (pd.notna(ah_change) and ah_change >= 3.0)
+        or (pd.notna(premarket_change) and premarket_change >= 8.0)
+    )
+    aggressive_momentum_ok = pd.notna(change) and change >= 20.0
 
     if clean_score >= 76 and fakeout_risk <= 48 and above_vwap:
-        return "CLEAN_BUY", "MAIN_2000_CONTROLLED"
-    if catalyst_score >= 78 and above_vwap and (pd.isna(active_pos) or active_pos >= 0.50):
+        return "CLEAN_BUY", "PAPER_MAIN_CONTROLLED"
+    if (
+        catalyst_score >= 78
+        and catalyst_momentum_ok
+        and above_vwap
+        and (pd.isna(active_pos) or active_pos >= 0.50)
+    ):
         return "CATALYST_RUNNER_BUY", "MAIN_OR_HALF_SIZE"
     if (
         whale_score >= 78
@@ -4802,7 +4832,7 @@ def v17_signal_from_scores(
         and fakeout_risk <= 65
     ):
         return "WHALE_FOOTPRINT_BUY", "MAIN_OR_HALF_SIZE"
-    if aggressive_score >= 75 and above_vwap:
+    if aggressive_score >= 75 and aggressive_momentum_ok and above_vwap:
         return "AGGRESSIVE_100DOLLAR_ONLY", "AGGRESSIVE_100"
     if catalyst_score >= 62 or whale_score >= 62 or clean_score >= 60:
         return "WATCH_CONFIRMATION", "WATCHLIST"
@@ -5166,7 +5196,7 @@ def render_v17_multimodule_tab(
     st.subheader("v17 Multi-Module: Clean + Catalyst + Whale + Aggressive")
     st.write(
         "Ana fikir: temiz devam hisseleri ile agresif runner hisseleri ayni sepete atma. "
-        "CLEAN_BUY ana 2000$ planina, AGGRESSIVE_100DOLLAR_ONLY ise kucuk/paper denemeye gider."
+        "CLEAN_BUY paper ana takip listesine, AGGRESSIVE_100DOLLAR_ONLY ise sadece kucuk/paper denemeye gider."
     )
     st.warning(
         "Bu modul yatirim tavsiyesi degildir. Whale_Footprint gercek emir defteri degil, OHLCV uzerinden proxy skorudur."
@@ -5203,7 +5233,7 @@ def render_v17_multimodule_tab(
     with c6:
         max_price = st.number_input("Max fiyat", 2.0, 500.0, 30.0, 1.0, key="v17_max_price")
     with c7:
-        account_size = st.number_input("Ana hesap/paper $", 100.0, 100_000.0, 2000.0, 100.0, key="v17_account")
+        account_size = st.number_input("Paper hesap buyuklugu ($)", 100.0, 100_000.0, 2000.0, 100.0, key="v17_account")
     with c8:
         aggressive_budget = st.number_input("Agresif deneme $", 10.0, 5_000.0, 100.0, 10.0, key="v17_aggressive_budget")
 
@@ -5395,7 +5425,7 @@ def render_v17_multimodule_tab(
         "TP15",
         "TP20",
         "TP30",
-        "Main_Shares_2k",
+        "Paper_Main_Shares",
         "Main_Dollar_Size",
         "Aggressive_Shares_100",
         "Active_Vol_to_Daily_%",
@@ -5404,6 +5434,7 @@ def render_v17_multimodule_tab(
         "Buy_Pressure_Ratio",
         "Whale_Absorption_Proxy",
         "Above_Active_VWAP",
+        "Above_Regular_VWAP",
         "Active_Range_Position",
         "Price_to_High_%",
         "Price_to_EMA9_%",
@@ -5416,7 +5447,16 @@ def render_v17_multimodule_tab(
 
     clean_df = out[out["Signal"].eq("CLEAN_BUY")].copy()
     catalyst_df = out[out["Signal"].eq("CATALYST_RUNNER_BUY")].copy()
-    whale_df = out[out["Signal"].eq("WHALE_FOOTPRINT_BUY")].copy()
+    whale_df = out[
+        out["Signal"].eq("WHALE_FOOTPRINT_BUY")
+        | (
+            (out["Whale_Footprint_Score"].fillna(0) >= 82)
+            & (
+                (out.get("Above_Active_VWAP", False) == True)
+                | (out.get("Above_Regular_VWAP", False) == True)
+            )
+        )
+    ].copy()
     aggressive_df = out[out["Signal"].eq("AGGRESSIVE_100DOLLAR_ONLY")].copy()
     watch_df = out[out["Signal"].isin(["WATCH_CONFIRMATION", "NO_TRADE"])].copy()
 
@@ -5428,13 +5468,17 @@ def render_v17_multimodule_tab(
     m5.metric("Watch/No", len(watch_df))
 
     if not clean_df.empty:
-        st.subheader("Clean Continuation - ana 2000$ plan")
+        st.subheader("Clean Continuation - paper ana takip listesi")
         st.dataframe(clean_df[show_cols].head(30), use_container_width=True)
     if not catalyst_df.empty:
         st.subheader("Catalyst Runner - RXT tipi erken/aktif momentum")
         st.dataframe(catalyst_df[show_cols].head(30), use_container_width=True)
     if not whale_df.empty:
         st.subheader("Whale Footprint Proxy - balina izi adaylari")
+        st.caption(
+            "Bu tablo sinyal onceliginden bagimsizdir: ana sinyal CLEAN_BUY olsa bile "
+            "Whale_Footprint_Score yuksekse burada ayrica gorunur."
+        )
         st.dataframe(whale_df[show_cols].head(30), use_container_width=True)
     if not aggressive_df.empty:
         st.subheader("Aggressive Supernova - sadece 100$ / paper")
@@ -5500,7 +5544,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "🐋 v17",
     ]
 )
-
 
 
 # ============================================================
@@ -6675,17 +6718,6 @@ with tab6:
 # ============================================================
 # TAB 7 - v17 WHALE / CATALYST / CLEAN / AGGRESSIVE ENGINE
 # ============================================================
-with tab7:
-    render_v17_multimodule_tab(
-        st=st,
-        fetch_intraday_trade_universe=fetch_intraday_trade_universe,
-        fetch_night_buy_universe=fetch_night_buy_universe,
-        download_daily_data_chunked=download_daily_data_chunked,
-        get_recent_intraday_full_data=get_recent_intraday_full_data,
-        api_key=api_key,
-        secret_key=secret_key,
-        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-    )
 with tab7:
     render_v17_multimodule_tab(
         st=st,
