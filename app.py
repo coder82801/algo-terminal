@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro (Kurumsal Motor + Çoklu Seans VWAP)")
-
+st.title("🎯 NextDay Scanner Pro v17 TEST - Yeni Kod Çalışıyor")
+st.sidebar.success("v17 build aktif")
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
 env_api_key = os.getenv("ALPACA_API_KEY", "")
