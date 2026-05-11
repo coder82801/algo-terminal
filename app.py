@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v17 (Clean + Catalyst + Whale + Runner)")
-st.sidebar.success("v17 build aktif")
+st.title("🎯 NextDay Scanner Pro v18 (Microcap Trap Guard + Clean/Catalyst/Whale/Runner)")
+st.sidebar.success("v18 build aktif — Microcap Trap Guard aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -60,6 +60,17 @@ MIN_D1_LIQUIDITY_SCORE = 50.0
 MIN_D1_DAILY_MOMENTUM = 60.0
 MAX_D1_FAKEOUT_RISK = 45.0
 
+# v18 Microcap Trap Guard / CLIK Hard Reject
+# Amaç: CLIK tipi düşük piyasa değerli, Çin/HK/Cayman riskli, high'dan sert çöken
+# micro/nanocap runner hisseleri alım sinyali üretmeden elemek.
+MICROCAP_HARD_REJECT_MARKET_CAP = 50_000_000       # <50M$: nanocap hard reject
+MICROCAP_LAB_ONLY_MARKET_CAP = 100_000_000         # 50-100M$: lab/paper only
+MICROCAP_STRICT_REVIEW_MARKET_CAP = 300_000_000    # 100-300M$: sıkı teyit/paper review
+CHINA_HK_MICROCAP_REJECT_CAP = 100_000_000         # Çin/HK/Cayman + <100M$: hard reject
+FAILED_RUNNER_HARD_DROP_PCT = -35.0                # high'dan -35% ve fazlası: hard reject
+FAILED_RUNNER_VWAP_DROP_PCT = -25.0                # high'dan -25% + VWAP altı: hard reject
+PENNY_MICROCAP_REJECT_PRICE = 1.0                  # <$1 + microcap: hard reject
+
 
 # ============================================================
 # YARDIMCI FONKSİYONLAR
@@ -91,6 +102,125 @@ def format_price(x: float) -> str:
     if x < 10:
         return f"{x:.3f}"
     return f"{x:.2f}"
+
+
+def detect_china_hk_microcap_risk(symbol: str = "", description: str = "") -> bool:
+    """Çin/HK/Cayman/offshore microcap riskini basit metin/proxy ile yakalar.
+    Bu tek başına yatırım yasağı değildir; piyasa değeri/fade ile birleşince hard reject olur.
+    """
+    text = f"{symbol or ''} {description or ''}".upper()
+    keywords = [
+        " CHINA", "CHINESE", "PRC", "MAINLAND", "HONG KONG", " HK ",
+        "CAYMAN", "CAYMAN ISLAND", "BVI", "BRITISH VIRGIN",
+        "HOLDINGS LIMITED", "HOLDING LIMITED", "LIMITED ADR",
+        "SHENZHEN", "SHANGHAI", "BEIJING", "GUANGZHOU", "HANGZHOU",
+    ]
+    return any(k in text for k in keywords)
+
+
+def market_cap_bucket(market_cap: float) -> str:
+    if pd.isna(market_cap) or market_cap <= 0:
+        return "UNKNOWN"
+    if market_cap < MICROCAP_HARD_REJECT_MARKET_CAP:
+        return "NANOCAP_<50M"
+    if market_cap < MICROCAP_LAB_ONLY_MARKET_CAP:
+        return "MICROCAP_50_100M"
+    if market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
+        return "MICROCAP_100_300M"
+    if market_cap < 1_000_000_000:
+        return "SMALLCAP_300M_1B"
+    return "NORMAL_1B_PLUS"
+
+
+def microcap_trap_guard(
+    symbol: str = "",
+    description: str = "",
+    market_cap: float = np.nan,
+    price: float = np.nan,
+    price_to_high_pct: float = np.nan,
+    below_vwap: bool = False,
+    return1d_pct: float = np.nan,
+    change_pct: float = np.nan,
+) -> dict:
+    """CLIK tipi runner/fade tuzaklarını alım sinyalinden çıkarır.
+
+    Karar seviyeleri:
+    - HARD_REJECT: hiçbir modülde alım/paper ana trade sinyali üretme.
+    - LAB_ONLY: yalnızca gözlem/lab; alım sinyali üretme.
+    - STRICT_REVIEW: çok sıkı teyit/paper review; otomatik alım sinyali üretme.
+    - PASS: mikrocap tuzak filtresinden geçer; diğer strateji filtreleri karar verir.
+    """
+    market_cap = safe_float(market_cap, np.nan)
+    price = safe_float(price, np.nan)
+    price_to_high_pct = safe_float(price_to_high_pct, np.nan)
+    return1d_pct = safe_float(return1d_pct, np.nan)
+    change_pct = safe_float(change_pct, np.nan)
+
+    china_hk_risk = detect_china_hk_microcap_risk(symbol, description)
+    bucket = market_cap_bucket(market_cap)
+    reasons = []
+    hard = False
+    lab_only = False
+    strict_review = False
+
+    if pd.notna(market_cap) and market_cap > 0:
+        if market_cap < MICROCAP_HARD_REJECT_MARKET_CAP:
+            hard = True
+            reasons.append("MarketCap <50M nanocap hard reject")
+        elif market_cap < MICROCAP_LAB_ONLY_MARKET_CAP:
+            lab_only = True
+            reasons.append("MarketCap 50-100M: lab/paper only")
+        elif market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
+            strict_review = True
+            reasons.append("MarketCap 100-300M: strict review only")
+
+        if china_hk_risk and market_cap < CHINA_HK_MICROCAP_REJECT_CAP:
+            hard = True
+            reasons.append("China/HK/Cayman microcap <100M hard reject")
+
+        if pd.notna(price) and price < PENNY_MICROCAP_REJECT_PRICE and market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
+            hard = True
+            reasons.append("<$1 + microcap/nanocap hard reject")
+    else:
+        reasons.append("MarketCap unknown: size risk not verified")
+
+    if pd.notna(price_to_high_pct):
+        if price_to_high_pct <= FAILED_RUNNER_HARD_DROP_PCT:
+            hard = True
+            reasons.append("High'dan -35%+ fade: failed runner hard reject")
+        elif price_to_high_pct <= FAILED_RUNNER_VWAP_DROP_PCT and below_vwap:
+            hard = True
+            reasons.append("High'dan -25%+ ve VWAP altı: failed runner")
+        elif price_to_high_pct <= FAILED_RUNNER_VWAP_DROP_PCT:
+            lab_only = True
+            reasons.append("High'dan -25%+ fade: no chase/lab only")
+
+    if pd.notna(return1d_pct) and return1d_pct >= 100 and pd.notna(price_to_high_pct) and price_to_high_pct <= -20:
+        hard = True
+        reasons.append("+100% spike sonrası sert fade: trap runner")
+
+    if pd.notna(change_pct) and change_pct >= 100 and pd.notna(price_to_high_pct) and price_to_high_pct <= -20:
+        hard = True
+        reasons.append("Canlı +100% spike sonrası high'dan kopma")
+
+    if hard:
+        decision = "HARD_REJECT"
+    elif lab_only:
+        decision = "LAB_ONLY"
+    elif strict_review:
+        decision = "STRICT_REVIEW"
+    else:
+        decision = "PASS"
+
+    return {
+        "decision": decision,
+        "hard_reject": decision == "HARD_REJECT",
+        "trade_allowed": decision == "PASS",
+        "reasons": reasons,
+        "reason_text": "; ".join(reasons) if reasons else "PASS",
+        "market_cap_bucket": bucket,
+        "china_hk_risk": bool(china_hk_risk),
+    }
 
 
 def get_api(api_key_value, secret_key_value):
@@ -2877,6 +3007,29 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     if pd.isna(ah_change_pct) and pd.notna(live_change_pct):
         ah_change_pct = live_change_pct
 
+    # v18 Microcap Trap Guard — Night/D+1 alım kapısı
+    market_cap = safe_float(row.get("market_cap", np.nan), np.nan)
+    description = row.get("description", "")
+    ah_price_to_high_pct = (
+        (ah_price - ah_high) / ah_high * 100.0
+        if pd.notna(ah_high) and ah_high > 0 and pd.notna(ah_price)
+        else np.nan
+    )
+    below_vwap_for_guard = bool(
+        (pd.notna(ah_vwap) and ah_price < ah_vwap)
+        or (pd.notna(reg_vwap) and ah_price < reg_vwap)
+    )
+    microcap_guard = microcap_trap_guard(
+        symbol=symbol,
+        description=description,
+        market_cap=market_cap,
+        price=ah_price,
+        price_to_high_pct=ah_price_to_high_pct,
+        below_vwap=below_vwap_for_guard,
+        return1d_pct=return_1d_pct,
+        change_pct=ah_change_pct,
+    )
+
     price_to_ema9_pct = _safe_pct(ah_price, ema9) if pd.notna(ema9) else np.nan
 
     # AH hacim oranını ham ve skorlamada kullanılan kapalı değer olarak ayrı tutuyoruz.
@@ -3152,6 +3305,10 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         hard_reject_reasons.append("Fiyat < 1$")
     if pd.notna(dollar_volume) and dollar_volume < 750_000:
         hard_reject_reasons.append("Dolar hacmi çok düşük")
+    if microcap_guard["decision"] == "HARD_REJECT":
+        hard_reject_reasons.append("Microcap Trap Guard: " + microcap_guard["reason_text"])
+    elif microcap_guard["decision"] in {"LAB_ONLY", "STRICT_REVIEW"}:
+        hard_reject_reasons.append("Microcap Trap Guard: " + microcap_guard["reason_text"])
 
     # Giriş bölgesi: AH VWAP ve son fiyatın üzerinde kontrollü bölge.
     entry_base_candidates = [ah_price]
@@ -3527,6 +3684,12 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "Entry_Zone_Status": entry_zone_status,
         "D1_15_Gate_Passed": bool(d1_15_gate_passed),
         "Has_15pct_Upside": bool(has_15pct_upside),
+        "MarketCap_M": round(market_cap / 1_000_000, 2) if pd.notna(market_cap) else np.nan,
+        "MarketCap_Bucket": microcap_guard["market_cap_bucket"],
+        "China_HK_Risk": bool(microcap_guard["china_hk_risk"]),
+        "Microcap_Guard_Decision": microcap_guard["decision"],
+        "Microcap_Trap_Reasons": microcap_guard["reason_text"],
+        "High_to_Current_Drop_%": round(ah_price_to_high_pct, 2) if pd.notna(ah_price_to_high_pct) else np.nan,
         "No_Trade_Reason": "; ".join(no_trade_reasons[:8]) if no_trade_reasons else "-",
         "AH_Confirmed": bool(ah_confirmed),
         "In_Entry_Zone": bool(in_entry_zone),
@@ -3851,11 +4014,40 @@ def scan_intraday_runners_cached(
         + 0.30 * merged['Runner_DNA_Score'].fillna(0)
     ).round(1)
     merged['LAB_ONLY'] = True
-    merged['Risk_Label'] = 'EXTREME / PAPER ONLY'
-    merged['Runner_Action'] = np.where(
+    guard_records = merged.apply(
+        lambda r: microcap_trap_guard(
+            symbol=r.get('symbol', ''),
+            description=r.get('description', ''),
+            market_cap=r.get('market_cap', np.nan),
+            price=r.get('live_price', np.nan),
+            price_to_high_pct=np.nan,
+            below_vwap=False,
+            change_pct=r.get('live_change_pct', np.nan),
+        ),
+        axis=1,
+    )
+    merged['Microcap_Guard_Decision'] = [g['decision'] for g in guard_records]
+    merged['Microcap_Trap_Reasons'] = [g['reason_text'] for g in guard_records]
+    merged['MarketCap_Bucket'] = [g['market_cap_bucket'] for g in guard_records]
+    merged['China_HK_Risk'] = [g['china_hk_risk'] for g in guard_records]
+    merged['Microcap_Trap_Guard'] = merged['Microcap_Guard_Decision'].eq('HARD_REJECT')
+    base_action = np.where(
         (merged['live_change_pct'].fillna(0) >= 50) & (merged['Runner_DNA_Score'].fillna(0) >= 60),
         'PAPER_ULTRA_WATCH',
         'PAPER_WATCH',
+    )
+    merged['Runner_Action'] = np.select(
+        [
+            merged['Microcap_Guard_Decision'].eq('HARD_REJECT'),
+            merged['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']),
+        ],
+        ['TRAP_RUNNER_NO_TRADE', 'MICROCAP_LAB_ONLY'],
+        default=base_action,
+    )
+    merged['Risk_Label'] = np.where(
+        merged['Microcap_Guard_Decision'].eq('HARD_REJECT'),
+        'TRAP / NO_TRADE',
+        np.where(merged['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']), 'MICROCAP LAB ONLY', 'EXTREME / PAPER ONLY')
     )
 
     rename_map = {
@@ -3915,11 +4107,40 @@ def scan_fresh_intraday_runners_cached(
     df['Live_Volume_Score'] = np.minimum(25.0, np.log10(df['live_volume'].fillna(0).clip(lower=1)) * 4.0)
     df['Runner_Lab_Score'] = (0.70 * df['Live_Change_Score'] + 0.30 * df['Live_Volume_Score']).round(1)
     df['LAB_ONLY'] = True
-    df['Risk_Label'] = 'EXTREME / FRESH PAPER ONLY'
-    df['Runner_Action'] = np.where(
+    guard_records = df.apply(
+        lambda r: microcap_trap_guard(
+            symbol=r.get('symbol', ''),
+            description=r.get('description', ''),
+            market_cap=r.get('market_cap', np.nan),
+            price=r.get('live_price', np.nan),
+            price_to_high_pct=np.nan,
+            below_vwap=False,
+            change_pct=r.get('live_change_pct', np.nan),
+        ),
+        axis=1,
+    )
+    df['Microcap_Guard_Decision'] = [g['decision'] for g in guard_records]
+    df['Microcap_Trap_Reasons'] = [g['reason_text'] for g in guard_records]
+    df['MarketCap_Bucket'] = [g['market_cap_bucket'] for g in guard_records]
+    df['China_HK_Risk'] = [g['china_hk_risk'] for g in guard_records]
+    df['Microcap_Trap_Guard'] = df['Microcap_Guard_Decision'].eq('HARD_REJECT')
+    base_action = np.where(
         df['live_change_pct'].fillna(0) >= 50,
         'PAPER_FRESH_ULTRA_WATCH',
         'PAPER_FRESH_WATCH',
+    )
+    df['Runner_Action'] = np.select(
+        [
+            df['Microcap_Guard_Decision'].eq('HARD_REJECT'),
+            df['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']),
+        ],
+        ['TRAP_RUNNER_NO_TRADE', 'MICROCAP_LAB_ONLY'],
+        default=base_action,
+    )
+    df['Risk_Label'] = np.where(
+        df['Microcap_Guard_Decision'].eq('HARD_REJECT'),
+        'TRAP / NO_TRADE',
+        np.where(df['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']), 'MICROCAP LAB ONLY', 'EXTREME / FRESH PAPER ONLY')
     )
 
     rename_map = {
@@ -4287,6 +4508,22 @@ def v17_compute_candidate_features(
         )
     )
 
+    # v18 Microcap Trap Guard — v17 Clean/Catalyst/Whale/Runner kapısı
+    below_vwap_for_guard = bool(
+        (pd.notna(active_vwap) and active_price < active_vwap)
+        or (pd.notna(reg_vwap) and active_price < reg_vwap)
+    )
+    microcap_guard = microcap_trap_guard(
+        symbol=symbol,
+        description=row_get("description", row_get("Company", "")),
+        market_cap=market_cap,
+        price=active_price,
+        price_to_high_pct=price_to_active_high_pct,
+        below_vwap=below_vwap_for_guard,
+        return1d_pct=v17_safe_float(last.get("Return1D")) * 100.0 if pd.notna(last.get("Return1D")) else np.nan,
+        change_pct=change_vs_prev_close_pct,
+    )
+
     return {
         "symbol": symbol or yahoo_symbol,
         "yahoo_symbol": yahoo_symbol or symbol,
@@ -4336,6 +4573,12 @@ def v17_compute_candidate_features(
         "avg_dollar_vol20": avg_dollar_vol20,
         "dollar_volume": dollar_volume,
         "market_cap": market_cap,
+        "market_cap_bucket": microcap_guard["market_cap_bucket"],
+        "china_hk_risk": bool(microcap_guard["china_hk_risk"]),
+        "microcap_guard_decision": microcap_guard["decision"],
+        "microcap_trap_reasons": microcap_guard["reason_text"],
+        "microcap_trap_guard": bool(microcap_guard["decision"] == "HARD_REJECT"),
+        "high_to_current_drop_pct": price_to_active_high_pct,
         "return1d_pct": v17_safe_float(last.get("Return1D")) * 100.0 if pd.notna(last.get("Return1D")) else np.nan,
         "return3d_pct": v17_safe_float(last.get("Return3D")) * 100.0 if pd.notna(last.get("Return3D")) else np.nan,
         "return5d_pct": v17_safe_float(last.get("Return5D")) * 100.0 if pd.notna(last.get("Return5D")) else np.nan,
@@ -4390,6 +4633,20 @@ def v17_fakeout_risk(f: dict) -> float:
         risk += 12
     if pd.notna(price) and price < 1:
         risk += 18
+
+    guard_decision = f.get("microcap_guard_decision", "PASS")
+    high_drop = f.get("high_to_current_drop_pct", np.nan)
+    if guard_decision == "HARD_REJECT":
+        risk += 35
+    elif guard_decision == "LAB_ONLY":
+        risk += 22
+    elif guard_decision == "STRICT_REVIEW":
+        risk += 12
+    if pd.notna(high_drop):
+        if high_drop <= FAILED_RUNNER_HARD_DROP_PCT:
+            risk += 30
+        elif high_drop <= FAILED_RUNNER_VWAP_DROP_PCT:
+            risk += 18
 
     return float(max(0, min(100, risk)))
 
@@ -4764,7 +5021,7 @@ def v17_trade_plan(
             "TP +15%: 40-50% sat; +20/+30%: bir parca daha sat; kalan pozisyonu "
             "5dk EMA9 veya VWAP altina kapanis gelene kadar trail et."
         )
-    elif module_signal == "AGGRESSIVE_100DOLLAR_ONLY":
+    elif module_signal == "PAPER_AGGRESSIVE_100DOLLAR_ONLY":
         exit_plan = (
             "Sadece kucuk butce/paper: +15% hizli kismi kar; VWAP kaybi veya halt sonrasi "
             "reclaim yoksa cik."
@@ -4816,6 +5073,14 @@ def v17_signal_from_scores(
     )
     aggressive_momentum_ok = pd.notna(change) and change >= 20.0
 
+    guard_decision = f.get("microcap_guard_decision", "PASS")
+    if guard_decision == "HARD_REJECT":
+        return "TRAP_RUNNER_NO_TRADE", "HARD_REJECT_MICROCAP"
+    if guard_decision == "LAB_ONLY":
+        return "MICROCAP_LAB_ONLY", "LAB_ONLY_MICROCAP"
+    if guard_decision == "STRICT_REVIEW":
+        return "MICROCAP_STRICT_WATCH", "PAPER_ONLY_MICROCAP"
+
     if clean_score >= 76 and fakeout_risk <= 48 and above_vwap:
         return "CLEAN_BUY", "PAPER_MAIN_CONTROLLED"
     if (
@@ -4824,16 +5089,16 @@ def v17_signal_from_scores(
         and above_vwap
         and (pd.isna(active_pos) or active_pos >= 0.50)
     ):
-        return "CATALYST_RUNNER_BUY", "MAIN_OR_HALF_SIZE"
+        return "CATALYST_RUNNER_BUY", "PAPER_OR_HALF_SIZE"
     if (
         whale_score >= 78
         and above_vwap
         and (pd.isna(buy_pressure) or buy_pressure >= 0.55)
         and fakeout_risk <= 65
     ):
-        return "WHALE_FOOTPRINT_BUY", "MAIN_OR_HALF_SIZE"
+        return "WHALE_FOOTPRINT_BUY", "PAPER_OR_HALF_SIZE"
     if aggressive_score >= 75 and aggressive_momentum_ok and above_vwap:
-        return "AGGRESSIVE_100DOLLAR_ONLY", "AGGRESSIVE_100"
+        return "PAPER_AGGRESSIVE_100DOLLAR_ONLY", "PAPER_AGGRESSIVE_100"
     if catalyst_score >= 62 or whale_score >= 62 or clean_score >= 60:
         return "WATCH_CONFIRMATION", "WATCHLIST"
     return "NO_TRADE", "NONE"
@@ -4885,8 +5150,10 @@ def v17_build_candidate_row(
         primary_reason = ", ".join(catalyst_notes[:4]) or "catalyst/momentum runner"
     elif signal == "WHALE_FOOTPRINT_BUY":
         primary_reason = ", ".join(whale_notes[:4]) or "whale footprint proxy"
-    elif signal == "AGGRESSIVE_100DOLLAR_ONLY":
+    elif signal == "PAPER_AGGRESSIVE_100DOLLAR_ONLY":
         primary_reason = ", ".join(aggressive_notes[:4]) or "aggressive supernova profile"
+    elif signal in {"TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"}:
+        primary_reason = f.get("microcap_trap_reasons", "Microcap Trap Guard")
     else:
         primary_reason = "confirmation needed"
 
@@ -4918,6 +5185,11 @@ def v17_build_candidate_row(
         "Price_to_EMA9_%": round(f["price_to_ema9_pct"], 2) if pd.notna(f["price_to_ema9_pct"]) else np.nan,
         "Return1D_%": round(f["return1d_pct"], 2) if pd.notna(f["return1d_pct"]) else np.nan,
         "MarketCap_M": round(f["market_cap"] / 1_000_000, 2) if pd.notna(f["market_cap"]) else np.nan,
+        "MarketCap_Bucket": f.get("market_cap_bucket", "UNKNOWN"),
+        "China_HK_Risk": bool(f.get("china_hk_risk", False)),
+        "Microcap_Guard_Decision": f.get("microcap_guard_decision", "PASS"),
+        "Microcap_Trap_Reasons": f.get("microcap_trap_reasons", "PASS"),
+        "High_to_Current_Drop_%": round(f.get("high_to_current_drop_pct", np.nan), 2) if pd.notna(f.get("high_to_current_drop_pct", np.nan)) else np.nan,
         "DollarVolume_M": round(f["dollar_volume"] / 1_000_000, 2) if pd.notna(f["dollar_volume"]) else np.nan,
         **plan,
     }
@@ -4971,7 +5243,7 @@ def v17_evaluate_multimodule_candidates(
         "CLEAN_BUY": 6,
         "CATALYST_RUNNER_BUY": 5,
         "WHALE_FOOTPRINT_BUY": 4,
-        "AGGRESSIVE_100DOLLAR_ONLY": 3,
+        "PAPER_AGGRESSIVE_100DOLLAR_ONLY": 3,
         "WATCH_CONFIRMATION": 1,
         "NO_TRADE": 0,
     }
@@ -5196,7 +5468,7 @@ def render_v17_multimodule_tab(
     st.subheader("v17 Multi-Module: Clean + Catalyst + Whale + Aggressive")
     st.write(
         "Ana fikir: temiz devam hisseleri ile agresif runner hisseleri ayni sepete atma. "
-        "CLEAN_BUY paper ana takip listesine, AGGRESSIVE_100DOLLAR_ONLY ise sadece kucuk/paper denemeye gider."
+        "CLEAN_BUY paper ana takip listesine, PAPER_AGGRESSIVE_100DOLLAR_ONLY ise sadece kucuk/paper denemeye gider."
     )
     st.warning(
         "Bu modul yatirim tavsiyesi degildir. Whale_Footprint gercek emir defteri degil, OHLCV uzerinden proxy skorudur."
@@ -5441,6 +5713,11 @@ def render_v17_multimodule_tab(
         "RVOL20",
         "Return1D_%",
         "MarketCap_M",
+        "MarketCap_Bucket",
+        "China_HK_Risk",
+        "Microcap_Guard_Decision",
+        "Microcap_Trap_Reasons",
+        "High_to_Current_Drop_%",
         "Exit_Plan",
     ]
     show_cols = [c for c in show_cols if c in out.columns]
@@ -5457,15 +5734,21 @@ def render_v17_multimodule_tab(
             )
         )
     ].copy()
-    aggressive_df = out[out["Signal"].eq("AGGRESSIVE_100DOLLAR_ONLY")].copy()
-    watch_df = out[out["Signal"].isin(["WATCH_CONFIRMATION", "NO_TRADE"])].copy()
+    aggressive_df = out[out["Signal"].eq("PAPER_AGGRESSIVE_100DOLLAR_ONLY")].copy()
+    trap_df = out[out["Signal"].isin(["TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"])].copy()
+    watch_df = out[out["Signal"].isin(["WATCH_CONFIRMATION", "NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH", "TRAP_RUNNER_NO_TRADE"])].copy()
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Clean", len(clean_df))
     m2.metric("Catalyst", len(catalyst_df))
     m3.metric("Whale proxy", len(whale_df))
     m4.metric("Aggressive", len(aggressive_df))
-    m5.metric("Watch/No", len(watch_df))
+    m5.metric("Trap/Watch/No", len(watch_df))
+
+    if not trap_df.empty:
+        st.subheader("⛔ Microcap Trap Guard — alınmayacak hareketli hisseler")
+        st.caption("CLIK tipi nanocap/microcap, Çin-HK/Cayman, high'dan sert fade veya VWAP altı tuzak adayları. Alım sinyali değildir.")
+        st.dataframe(trap_df[show_cols].head(50), use_container_width=True)
 
     if not clean_df.empty:
         st.subheader("Clean Continuation - paper ana takip listesi")
@@ -6234,7 +6517,8 @@ with tab5:
                     "Symbol", "Grade", "Status", "Night_Entry_Signal", "Trade_Allowed", "Night_Action", "Night_Signal_Score",
                     "Expected_Target_%", "TP15", "TP15_Required_Move_%", "TP15_R_Multiple", "Target15_Score",
                     "D1_15_Target_Score", "D1_15_Probability_Proxy", "D1_15_Gate_Passed",
-                    "Runner_Squeeze_Contribution", "Has_15pct_Upside", "No_Trade_Reason",
+                    "Runner_Squeeze_Contribution", "Has_15pct_Upside", "MarketCap_M", "MarketCap_Bucket",
+                    "Microcap_Guard_Decision", "Microcap_Trap_Reasons", "High_to_Current_Drop_%", "No_Trade_Reason",
                     "AH_Confirmed", "In_Entry_Zone", "Entry_Zone_Status", "Too_Far_To_Chase", "Liquidity_OK", "Spread_Risk",
                     "Final_Night_Score",
                     "Demand_Pressure", "Technical_Alignment", "Daily_Momentum_Quality",
@@ -6343,7 +6627,8 @@ with tab5:
                         closest_cols = [c for c in [
                             "Symbol", "Night_Entry_Signal", "Trade_Allowed", "Expected_Target_%", "TP15",
                             "Target15_Score", "D1_15_Target_Score", "D1_15_Gate_Passed", "Runner_Squeeze_Contribution",
-                            "Has_15pct_Upside", "No_Trade_Reason",
+                            "Has_15pct_Upside", "MarketCap_M", "MarketCap_Bucket", "Microcap_Guard_Decision",
+                            "Microcap_Trap_Reasons", "High_to_Current_Drop_%", "No_Trade_Reason",
                             "Final_Night_Score", "Night_Signal_Score", "Demand_Pressure",
                             "Daily_Momentum_Quality", "Squeeze_Proxy", "AH_Strength",
                             "Fakeout_Risk", "Hard_Reject", "Risk_Notes"
