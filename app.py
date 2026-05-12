@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v18 (Microcap Trap Guard + Clean/Catalyst/Whale/Runner)")
-st.sidebar.success("v18 build aktif — Microcap Trap Guard aktif")
+st.title("🎯 NextDay Scanner Pro v19 (Entry Confirmation + TP0 + Microcap Trap Guard)")
+st.sidebar.success("v19 build aktif — Entry Confirmation + TP0 + Trap Guard aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -70,6 +70,17 @@ CHINA_HK_MICROCAP_REJECT_CAP = 100_000_000         # Çin/HK/Cayman + <100M$: ha
 FAILED_RUNNER_HARD_DROP_PCT = -35.0                # high'dan -35% ve fazlası: hard reject
 FAILED_RUNNER_VWAP_DROP_PCT = -25.0                # high'dan -25% + VWAP altı: hard reject
 PENNY_MICROCAP_REJECT_PRICE = 1.0                  # <$1 + microcap: hard reject
+
+# v19 Entry Confirmation + TP0 + Weak Trigger Guard
+# Amaç: AVPT gibi entry sonrası devam edenleri BW/AIRJ gibi zayıf iğne tetiklerinden ayırmak.
+ENTRY_CONFIRM_MIN_HOLD_MINUTES = 5
+ENTRY_CONFIRM_PREFERRED_HOLD_MINUTES = 15
+ENTRY_READY_MAX_DISTANCE_FROM_HIGH_PCT = -2.5     # current, active high'dan en fazla -%2.5 geride olsun
+ENTRY_READY_MIN_RANGE_POSITION = 0.55             # aktif seans range'inin üst yarısında kalsın
+ENTRY_READY_MIN_BUY_PRESSURE = 0.52
+WEAK_TRIGGER_HIGH_DROP_PCT = -4.0                 # high'dan -%4+ kopma: zayıf tetik riski
+HIGH_FADE_CAUTION_PCT = -12.0                     # high'dan -%12+ kopma: fade riski
+TP0_MIN_QUICK_PROFIT_PCT = 3.0                    # TP0 için min hızlı kâr çıpası
 
 
 # ============================================================
@@ -1559,8 +1570,14 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Entry_Idea": entry_idea,
                         "Stop_Price": stop_price,
                         "Stop_Limit_Price": stop_limit_price,
+                        "TP0_Quick": round(entry_idea + 0.5 * risk, 4),
+                        "Follow_Through_0_5R": round(entry_idea + 0.5 * risk, 4),
+                        "TP15": round(entry_idea * 1.15, 4),
                         "TP1": tp1,
                         "TP2": tp2,
+                        "Trade_Readiness": "WAIT_CONFIRM",
+                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + 0.5R follow-through şart",
+                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve 0.5R devam gelmezse işlem yok/çık",
                         "Score": score,
                         "Notes": ", ".join(notes[:6]),
                     }
@@ -5052,6 +5069,172 @@ def v17_trade_plan(
     }
 
 
+
+def v19_entry_confirmation_overlay(
+    f: dict,
+    plan: dict,
+    module_signal: str,
+    fakeout_risk: float,
+    clean_score: float,
+    catalyst_score: float,
+    whale_score: float,
+    aggressive_score: float,
+) -> dict:
+    """v19 karar katmanı: seviye verildi diye işlem açmayı engeller.
+
+    Bu katman AVPT gibi entry sonrası devam edenleri, AIRJ gibi sadece iğne atıp dönen
+    zayıf tetiklerden ayırmak için tasarlandı. Buradaki PAPER_READY ifadesi bile
+    otomatik alım değil; entry üstünde en az 5 dakika tutunma ve/veya 0.5R follow-through
+    teyidi beklenmesi gerektiğini söyler.
+    """
+    entry_low = safe_float(plan.get("Entry_Low"), np.nan)
+    entry_high = safe_float(plan.get("Entry_High"), np.nan)
+    stop = safe_float(plan.get("Stop"), np.nan)
+    price = safe_float(f.get("active_price"), np.nan)
+    active_session = str(f.get("active_session", "")).lower()
+
+    above_vwap = bool(f.get("above_active_vwap") or f.get("above_reg_vwap"))
+    above_active_vwap = bool(f.get("above_active_vwap"))
+    active_range_pos = safe_float(f.get("active_range_position"), np.nan)
+    price_to_high_pct = safe_float(f.get("price_to_active_high_pct"), np.nan)
+    buy_pressure = safe_float(f.get("buy_pressure_ratio"), np.nan)
+    last6_vol_burst = safe_float(f.get("last6_volume_burst"), np.nan)
+    whale_absorption = bool(f.get("whale_absorption_proxy", False))
+    guard_decision = str(f.get("microcap_guard_decision", "PASS"))
+    entry_status = str(plan.get("Entry_Status", "UNKNOWN"))
+
+    buy_signal = module_signal in {"CLEAN_BUY", "CATALYST_RUNNER_BUY", "WHALE_FOOTPRINT_BUY"}
+    trap_signal = module_signal in {"TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"}
+
+    risk = max(entry_low - stop, 0.01) if pd.notna(entry_low) and pd.notna(stop) else np.nan
+    rnd = v17_price_round(entry_low if pd.notna(entry_low) else price)
+    tp0_05r = round(entry_low + 0.5 * risk, rnd) if pd.notna(entry_low) and pd.notna(risk) else np.nan
+    tp0_quick_3pct = round(entry_low * (1 + TP0_MIN_QUICK_PROFIT_PCT / 100.0), rnd) if pd.notna(entry_low) else np.nan
+    tp0_quick = np.nan
+    if pd.notna(tp0_05r) and pd.notna(tp0_quick_3pct):
+        tp0_quick = round(max(tp0_05r, tp0_quick_3pct), rnd)
+
+    in_or_above_entry_zone = bool(pd.notna(price) and pd.notna(entry_low) and price >= entry_low)
+    not_too_extended_from_entry = bool(pd.isna(entry_high) or pd.isna(price) or price <= entry_high * 1.03)
+    high_fade_risk = bool(
+        (pd.notna(price_to_high_pct) and price_to_high_pct <= HIGH_FADE_CAUTION_PCT)
+        or (pd.notna(active_range_pos) and active_range_pos < 0.35)
+    )
+    weak_trigger_guard = bool(
+        (entry_status in {"WAIT_RECLAIM", "WAIT_PULLBACK"})
+        or (not above_vwap)
+        or (pd.notna(price_to_high_pct) and price_to_high_pct <= WEAK_TRIGGER_HIGH_DROP_PCT)
+        or (pd.notna(active_range_pos) and active_range_pos < 0.45)
+    )
+
+    pressure_ok = bool(
+        (pd.notna(buy_pressure) and buy_pressure >= ENTRY_READY_MIN_BUY_PRESSURE)
+        or (pd.notna(last6_vol_burst) and last6_vol_burst >= 1.5)
+        or whale_absorption
+    )
+    entry_hold_confirmed_proxy = bool(
+        buy_signal
+        and guard_decision == "PASS"
+        and entry_status == "IN_ENTRY_ZONE"
+        and in_or_above_entry_zone
+        and above_vwap
+        and not_too_extended_from_entry
+        and (pd.isna(price_to_high_pct) or price_to_high_pct >= ENTRY_READY_MAX_DISTANCE_FROM_HIGH_PCT)
+        and (pd.isna(active_range_pos) or active_range_pos >= ENTRY_READY_MIN_RANGE_POSITION)
+        and pressure_ok
+        and fakeout_risk <= 50
+        and not high_fade_risk
+    )
+    premarket_reclaim_ok = bool(
+        active_session == "premarket"
+        and entry_status == "IN_ENTRY_ZONE"
+        and above_active_vwap
+        and in_or_above_entry_zone
+        and not high_fade_risk
+    )
+
+    # AVPT Pattern Score: entry skalası + premarket/AH devam + TP15 alanı olan adayları ölçer.
+    avpt_score = 0.0
+    if buy_signal:
+        avpt_score += 18
+    if guard_decision == "PASS":
+        avpt_score += 12
+    elif guard_decision in {"LAB_ONLY", "STRICT_REVIEW"}:
+        avpt_score -= 12
+    if above_vwap:
+        avpt_score += 14
+    if entry_status == "IN_ENTRY_ZONE":
+        avpt_score += 10
+    if pd.notna(active_range_pos):
+        if active_range_pos >= 0.75:
+            avpt_score += 14
+        elif active_range_pos >= 0.60:
+            avpt_score += 9
+    if pd.notna(price_to_high_pct):
+        if price_to_high_pct >= -1.5:
+            avpt_score += 12
+        elif price_to_high_pct >= -3.0:
+            avpt_score += 6
+        elif price_to_high_pct <= -8.0:
+            avpt_score -= 14
+    if pressure_ok:
+        avpt_score += 10
+    if fakeout_risk <= 35:
+        avpt_score += 12
+    elif fakeout_risk <= 50:
+        avpt_score += 6
+    else:
+        avpt_score -= 10
+    if max(clean_score, catalyst_score, whale_score) >= 85:
+        avpt_score += 10
+    elif max(clean_score, catalyst_score, whale_score) >= 75:
+        avpt_score += 6
+    if active_session in {"premarket", "afterhours"}:
+        avpt_score += 6
+    if pd.notna(entry_low) and entry_low > 0:
+        avpt_score += 4
+    avpt_score = float(max(0, min(100, avpt_score)))
+
+    if guard_decision == "HARD_REJECT" or module_signal == "TRAP_RUNNER_NO_TRADE":
+        readiness = "NO_TRADE"
+        reason = "Microcap/failed-runner hard reject."
+    elif trap_signal:
+        readiness = "LAB_ONLY"
+        reason = "Microcap guard nedeniyle ana paper trade yok; yalnız gözlem."
+    elif not buy_signal:
+        readiness = "WATCH_ONLY" if module_signal == "WATCH_CONFIRMATION" else "NO_TRADE"
+        reason = "Buy sinyali yok; sadece izleme."
+    elif entry_hold_confirmed_proxy:
+        readiness = "PAPER_READY_AFTER_5MIN_HOLD"
+        reason = "Entry bölgesi + VWAP + high'a yakınlık + basınç uygun; yine de 5dk tutunma bekle."
+    elif entry_status in {"WAIT_RECLAIM", "WAIT_PULLBACK"}:
+        readiness = "WAIT_CONFIRM"
+        reason = "Entry bölgesi henüz teyitli değil; reclaim/pullback bekle."
+    elif weak_trigger_guard:
+        readiness = "WAIT_CONFIRM"
+        reason = "Weak trigger riski: entry dokunması yeterli değil, 0.5R follow-through bekle."
+    else:
+        readiness = "WAIT_CONFIRM"
+        reason = "Sinyal var ama v19 entry confirmation tamam değil."
+
+    return {
+        "Trade_Readiness": readiness,
+        "AVPT_Pattern_Score": round(avpt_score, 1),
+        "Entry_Hold_Required_Min": ENTRY_CONFIRM_MIN_HOLD_MINUTES,
+        "Entry_Hold_Preferred_Min": ENTRY_CONFIRM_PREFERRED_HOLD_MINUTES,
+        "Entry_Hold_Confirmed_Proxy": bool(entry_hold_confirmed_proxy),
+        "Premarket_Reclaim_OK": bool(premarket_reclaim_ok),
+        "Weak_Trigger_Guard": bool(weak_trigger_guard),
+        "High_Fade_Risk": bool(high_fade_risk),
+        "TP0_0_5R": tp0_05r,
+        "TP0_Quick_3pct": tp0_quick_3pct,
+        "TP0_Quick": tp0_quick,
+        "Follow_Through_Min": tp0_05r,
+        "Trade_Readiness_Reason": reason,
+        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + VWAP üstü + 0.5R follow-through şart",
+        "Weak_Trigger_Action": "Entry sadece iğneyle görülürse alma; 0.5R gelmezse weak trigger kabul et.",
+    }
+
 def v17_signal_from_scores(
     clean_score: float,
     catalyst_score: float,
@@ -5143,6 +5326,16 @@ def v17_build_candidate_row(
         risk_per_trade_pct=risk_per_trade_pct,
         aggressive_budget=aggressive_budget,
     )
+    confirmation = v19_entry_confirmation_overlay(
+        f=f,
+        plan=plan,
+        module_signal=signal,
+        fakeout_risk=fakeout,
+        clean_score=clean_score,
+        catalyst_score=catalyst_score,
+        whale_score=whale_score,
+        aggressive_score=aggressive_score,
+    )
 
     if signal == "CLEAN_BUY":
         primary_reason = ", ".join(clean_notes[:4]) or "clean continuation alignment"
@@ -5191,6 +5384,7 @@ def v17_build_candidate_row(
         "Microcap_Trap_Reasons": f.get("microcap_trap_reasons", "PASS"),
         "High_to_Current_Drop_%": round(f.get("high_to_current_drop_pct", np.nan), 2) if pd.notna(f.get("high_to_current_drop_pct", np.nan)) else np.nan,
         "DollarVolume_M": round(f["dollar_volume"] / 1_000_000, 2) if pd.notna(f["dollar_volume"]) else np.nan,
+        **confirmation,
         **plan,
     }
     return result, None
@@ -5465,10 +5659,10 @@ def render_v17_multimodule_tab(
     secret_key: str = "",
     alpaca_feed: str = "iex",
 ):
-    st.subheader("v17 Multi-Module: Clean + Catalyst + Whale + Aggressive")
+    st.subheader("v19 Multi-Module: Entry Confirmation + TP0 + Clean/Catalyst/Whale")
     st.write(
-        "Ana fikir: temiz devam hisseleri ile agresif runner hisseleri ayni sepete atma. "
-        "CLEAN_BUY paper ana takip listesine, PAPER_AGGRESSIVE_100DOLLAR_ONLY ise sadece kucuk/paper denemeye gider."
+        "Ana fikir: seviye verildi diye otomatik işlem yok. "
+        "CLEAN_BUY/CATALYST/Whale adayları bile entry üstünde 5-15dk tutunma, VWAP ve 0.5R follow-through teyidi ister."
     )
     st.warning(
         "Bu modul yatirim tavsiyesi degildir. Whale_Footprint gercek emir defteri degil, OHLCV uzerinden proxy skorudur."
@@ -5690,10 +5884,22 @@ def render_v17_multimodule_tab(
         "Fakeout_Risk",
         "Primary_Reason",
         "Entry_Status",
+        "Trade_Readiness",
+        "AVPT_Pattern_Score",
+        "Entry_Hold_Confirmed_Proxy",
+        "Premarket_Reclaim_OK",
+        "Weak_Trigger_Guard",
+        "High_Fade_Risk",
+        "Trade_Readiness_Reason",
+        "Entry_Confirmation_Rule",
         "Too_Far_To_Chase",
         "Entry_Low",
         "Entry_High",
         "Stop",
+        "TP0_Quick",
+        "TP0_0_5R",
+        "TP0_Quick_3pct",
+        "Follow_Through_Min",
         "TP15",
         "TP20",
         "TP30",
@@ -5736,14 +5942,22 @@ def render_v17_multimodule_tab(
     ].copy()
     aggressive_df = out[out["Signal"].eq("PAPER_AGGRESSIVE_100DOLLAR_ONLY")].copy()
     trap_df = out[out["Signal"].isin(["TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"])].copy()
+    ready_df = out[out.get("Trade_Readiness", pd.Series("", index=out.index)).eq("PAPER_READY_AFTER_5MIN_HOLD")].copy()
+    wait_confirm_df = out[out.get("Trade_Readiness", pd.Series("", index=out.index)).eq("WAIT_CONFIRM")].copy()
     watch_df = out[out["Signal"].isin(["WATCH_CONFIRMATION", "NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH", "TRAP_RUNNER_NO_TRADE"])].copy()
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Clean", len(clean_df))
     m2.metric("Catalyst", len(catalyst_df))
     m3.metric("Whale proxy", len(whale_df))
     m4.metric("Aggressive", len(aggressive_df))
-    m5.metric("Trap/Watch/No", len(watch_df))
+    m5.metric("Paper Ready", len(ready_df))
+    m6.metric("Trap/Watch/No", len(watch_df))
+
+    if not ready_df.empty:
+        st.subheader("✅ v19 Paper Ready — yine de 5dk tutunma bekle")
+        st.caption("Bu tablo otomatik alım değildir. Entry üstü 5-15 dakika tutunma ve 0.5R follow-through teyidi aranır.")
+        st.dataframe(ready_df[show_cols].head(30), use_container_width=True)
 
     if not trap_df.empty:
         st.subheader("⛔ Microcap Trap Guard — alınmayacak hareketli hisseler")
@@ -5767,12 +5981,16 @@ def render_v17_multimodule_tab(
         st.subheader("Aggressive Supernova - sadece 100$ / paper")
         st.dataframe(aggressive_df[show_cols].head(30), use_container_width=True)
 
-    st.subheader("Tum v17 skorlar")
+    if not wait_confirm_df.empty:
+        st.subheader("⏳ WAIT_CONFIRM — seviye var ama entry teyidi eksik")
+        st.dataframe(wait_confirm_df[show_cols].head(50), use_container_width=True)
+
+    st.subheader("Tum v19 skorlar")
     st.dataframe(out[show_cols].head(100), use_container_width=True)
     st.download_button(
-        "v17 tum skorlar CSV indir",
+        "v19 tum skorlar CSV indir",
         data=out.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"v17_multimodule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"v19_multimodule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         key="download_v17_multimodule",
     )
@@ -5824,7 +6042,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "📊 VWAP",
         "🌙 Night",
         "🔥 Runner",
-        "🐋 v17",
+        "🐋 v19",
     ]
 )
 
