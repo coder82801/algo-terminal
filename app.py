@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v21 (Pre-Ignition + Early Tape Burst + No-Chase Radar)")
-st.sidebar.success("v21 build aktif — Pre-Ignition + Early Tape Burst aktif")
+st.title("🎯 NextDay Scanner Pro v21.1 (Universe Shuffle + Liquidity Gate)")
+st.sidebar.success("v21.1 build aktif — Universe Shuffle + Liquidity Gate aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -6631,6 +6631,54 @@ def v20_scan_explosive_radar(
     return out.sort_values(["Explosion_Score", "Ignition_Score", "Change_%"], ascending=False).reset_index(drop=True)
 
 
+def _v21_normalize_symbol_list(tickers: list[str]) -> list[str]:
+    """Tekilleştirilmiş, Yahoo uyumlu, boş/garip sembolleri temizlenmiş liste."""
+    out = []
+    seen = set()
+    for raw in tickers or []:
+        sym = normalize_symbol_for_yahoo(str(raw).strip().upper())
+        if not sym or sym in seen:
+            continue
+        # Basit bozuk ticker koruması
+        if len(sym) > 12 or " " in sym:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
+def _v21_sample_tickers_for_accumulation(
+    tickers: list[str],
+    max_tickers: int,
+    sample_mode: str = "daily_shuffle",
+    seed_offset: int = 0,
+) -> tuple[list[str], str]:
+    """Silent accumulation için alfabetik ilk N tuzağını kırar.
+
+    Eski sürümde CSV'nin ilk N sembolü alındığı için sonuçlar A harfine kilitlenebiliyordu.
+    Bu fonksiyon her gün deterministik shuffle yapar veya kullanıcı isterse tüm/ilk N tarar.
+    """
+    clean = _v21_normalize_symbol_list(tickers)
+    if not clean:
+        return [], "empty"
+
+    max_tickers = int(max(1, min(max_tickers, len(clean))))
+    mode = (sample_mode or "daily_shuffle").lower()
+
+    if mode == "first_n":
+        return clean[:max_tickers], f"first_n_{max_tickers}"
+
+    if mode == "full_then_limit":
+        # Pratikte yine max_tickers ile sınırlı; isim kullanıcıya geniş tarama niyetini gösterir.
+        return clean[:max_tickers], f"full_then_limit_{max_tickers}"
+
+    # Varsayılan: günlük deterministik karıştırma. Aynı gün aynı örnek; ertesi gün yeni örnek.
+    seed_base = int(datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")) + int(seed_offset)
+    series = pd.Series(clean)
+    sampled = series.sample(n=max_tickers, random_state=seed_base).tolist()
+    return sampled, f"daily_shuffle_seed_{seed_base}_n_{max_tickers}"
+
+
 def v20_scan_silent_accumulation_universe(
     tickers: list[str],
     max_tickers: int,
@@ -6638,10 +6686,31 @@ def v20_scan_silent_accumulation_universe(
     api_key_value: str,
     secret_key_value: str,
     alpaca_feed: str,
+    sample_mode: str = "daily_shuffle",
+    min_last_volume: int = 50_000,
+    min_dollar_volume: float = 500_000,
+    manual_symbols_text: str = "",
 ) -> pd.DataFrame:
-    if not tickers:
+    if not tickers and not manual_symbols_text:
         return pd.DataFrame()
-    sample = list(dict.fromkeys([normalize_symbol_for_yahoo(str(t).strip().upper()) for t in tickers if str(t).strip()]))[:int(max_tickers)]
+
+    manual_syms = _v21_normalize_symbol_list(
+        str(manual_symbols_text or "").replace(";", ",").replace("\n", ",").split(",")
+    )
+    sample, sampling_note = _v21_sample_tickers_for_accumulation(
+        tickers=tickers,
+        max_tickers=int(max_tickers),
+        sample_mode=sample_mode,
+    )
+
+    # Manuel semboller her zaman örneğe zorla eklenir; TDIC/RXT/SOBR gibi geçmiş örnekleri kontrol için.
+    if manual_syms:
+        sample = list(dict.fromkeys(manual_syms + sample))[: max(int(max_tickers), len(manual_syms))]
+        sampling_note = sampling_note + f"; manual_forced={','.join(manual_syms[:10])}"
+
+    if not sample:
+        return pd.DataFrame()
+
     daily_dict = download_daily_data_chunked(
         sample,
         period="1y",
@@ -6652,36 +6721,67 @@ def v20_scan_silent_accumulation_universe(
         alpaca_feed=alpaca_feed,
     )
     rows = []
+    low_liq_rows = []
     for ys, df in daily_dict.items():
         acc = v20_accumulation_score_from_daily(df)
         if acc.get("Accumulation_Score", 0) >= float(min_acc_score):
             last_price = np.nan
             last_vol = 0
+            dollar_volume = np.nan
             try:
                 last_price = float(df["Close"].dropna().iloc[-1])
                 last_vol = float(df["Volume"].fillna(0).iloc[-1])
+                dollar_volume = float(last_price * last_vol) if pd.notna(last_price) else np.nan
             except Exception:
                 pass
-            rows.append({
+
+            liquidity_ok = (
+                pd.notna(last_price)
+                and float(last_vol) >= float(min_last_volume)
+                and pd.notna(dollar_volume)
+                and float(dollar_volume) >= float(min_dollar_volume)
+            )
+            base_row = {
                 "Symbol": ys.replace("-", "."),
                 "Price": round(last_price, v17_price_round(last_price)) if pd.notna(last_price) else np.nan,
                 "Last_Volume": int(last_vol),
+                "Dollar_Volume_M": round(float(dollar_volume) / 1_000_000, 3) if pd.notna(dollar_volume) else np.nan,
+                "Liquidity_OK": bool(liquidity_ok),
+                "Liquidity_Filter": f"LastVol>={int(min_last_volume):,}; DollarVol>={int(min_dollar_volume):,}",
+                "Sampling_Note": sampling_note,
                 **acc,
-                "Signal": "SILENT_ACCUMULATION_WATCH",
-                "Trade_Status": "WATCH_ONLY_PRE_IGNITION",
-            })
+                "Signal": "SILENT_ACCUMULATION_WATCH" if liquidity_ok else "LOW_LIQUIDITY_ACCUMULATION_SUPPRESSED",
+                "Trade_Status": "WATCH_ONLY_PRE_IGNITION" if liquidity_ok else "LOW_LIQUIDITY_NO_TRADE",
+            }
+            if liquidity_ok:
+                rows.append(base_row)
+            else:
+                low_liq_rows.append(base_row)
+
     out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(["Accumulation_Score", "Absorption_Score"], ascending=False).reset_index(drop=True)
+    low = pd.DataFrame(low_liq_rows)
+
+    if not out.empty:
+        out = out.sort_values(["Accumulation_Score", "Absorption_Score", "Dollar_Volume_M"], ascending=False).reset_index(drop=True)
+
+    # Düşük likiditeliler tamamen kaybolmasın; ana listenin altına NO_TRADE olarak eklenir.
+    # Kullanıcı CSV'de neden eski A-harfli düşük hacimli adayların dışlandığını görebilsin.
+    if not low.empty:
+        low = low.sort_values(["Accumulation_Score", "Absorption_Score"], ascending=False).reset_index(drop=True)
+        if out.empty:
+            return low
+        return pd.concat([out, low.head(50)], ignore_index=True)
+
+    return out
 
 
 def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v21 Pre-Ignition + Early Tape Burst — patlamadan önce / erken ateşleme radarı")
+    st.subheader("🚀 v21.1 Pre-Ignition + Early Tape Burst — universe shuffle + liquidity gate")
     st.info(
         "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
         "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
-        "Menşei, fiyat ve piyasa değeri bulma aşamasında saklanmaz; riskler Stage/Trade_Status/Risk_Flags içinde açıkça gösterilir."
+        "v21.1 ile Silent Accumulation evreni alfabetik ilk N yerine günlük shuffle ile seçilir; "
+        "likiditesi çok zayıf adaylar ana listeden ayrılır."
     )
 
     active = get_active_session_et()
@@ -6795,7 +6895,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 erken ateşleme skorlarını CSV indir",
                     data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_early_ignition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_1_early_ignition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_explosive_csv",
                 )
@@ -6805,8 +6905,23 @@ def render_v20_explosive_runner_tab():
     st.caption("Patlamadan önce fiyat yatayken hacim/OBV birikimi arar. Bu modül canlı explosion değil, ön radar üretir.")
     csv_file = st.file_uploader("Ticker CSV yükle (opsiyonel)", type=["csv"], key="v20_acc_csv")
     csv_col = st.text_input("CSV sembol kolonu (boş=otomatik)", value="", key="v20_acc_col")
-    acc_max = st.number_input("Max ticker tarama", 50, 5000, 300, 50, key="v20_acc_max")
+    acc_max = st.number_input("Max ticker tarama", 50, 5000, 500, 50, key="v20_acc_max")
     acc_min_score = st.slider("Min Accumulation Score", 40.0, 95.0, 70.0, 5.0, key="v20_acc_min_score")
+    acc_c1, acc_c2, acc_c3, acc_c4 = st.columns(4)
+    with acc_c1:
+        acc_sample_mode = st.selectbox(
+            "Evren örnekleme",
+            ["daily_shuffle", "first_n"],
+            index=0,
+            key="v21_acc_sample_mode",
+            help="daily_shuffle alfabetik ilk N sorununu çözer; her gün farklı ama aynı gün deterministik örneklem üretir.",
+        )
+    with acc_c2:
+        acc_min_last_vol = st.number_input("Min son gün hacmi", 0, 50_000_000, 50_000, 10_000, key="v21_acc_min_last_vol")
+    with acc_c3:
+        acc_min_dollar_vol = st.number_input("Min son gün dolar hacmi", 0, 100_000_000, 500_000, 100_000, key="v21_acc_min_dollar_vol")
+    with acc_c4:
+        acc_manual_symbols = st.text_input("Zorunlu sembol kontrolü", value="", key="v21_acc_manual_symbols", help="Örn: TDIC,RXT,SOBR. Bu semboller shuffle örneğine ayrıca eklenir.")
 
     if st.button("🧊 Silent Accumulation Scanner'ı Çalıştır", key="btn_v20_accumulation"):
         tickers = []
@@ -6834,7 +6949,7 @@ def render_v20_explosive_runner_tab():
         if not tickers:
             st.warning("Ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
         else:
-            with st.spinner(f"Silent accumulation taranıyor... Kaynak: {source}; ticker: {min(len(tickers), int(acc_max))}"):
+            with st.spinner(f"Silent accumulation taranıyor... Kaynak: {source}; örnekleme: {acc_sample_mode}; ticker: {min(len(tickers), int(acc_max))}"):
                 acc_df = v20_scan_silent_accumulation_universe(
                     tickers=tickers,
                     max_tickers=int(acc_max),
@@ -6842,16 +6957,20 @@ def render_v20_explosive_runner_tab():
                     api_key_value=api_key,
                     secret_key_value=secret_key,
                     alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+                    sample_mode=acc_sample_mode,
+                    min_last_volume=int(acc_min_last_vol),
+                    min_dollar_volume=float(acc_min_dollar_vol),
+                    manual_symbols_text=acc_manual_symbols,
                 )
             if acc_df.empty:
                 st.info("Silent accumulation adayı çıkmadı. Eşiği düşür veya daha geniş evren tara.")
             else:
-                st.success(f"Silent accumulation adayı: {len(acc_df)}")
+                st.success(f"Silent accumulation satırı: {len(acc_df)} — ana adaylar ve düşük likidite nedeniyle bastırılanlar birlikte gösterilir.")
                 st.dataframe(acc_df.head(200), use_container_width=True)
                 st.download_button(
                     "📥 v21 Silent accumulation CSV indir",
                     data=acc_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_1_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_acc_csv",
                 )
@@ -6868,7 +6987,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "🌙 Night",
         "🔥 Runner",
         "🐋 v19",
-        "🚀 v21 Early Explosion",
+        "🚀 v21.1 Early Explosion",
     ]
 )
 
