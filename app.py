@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v21.1 (Universe Shuffle + Liquidity Gate)")
-st.sidebar.success("v21.1 build aktif — Universe Shuffle + Liquidity Gate aktif")
+st.title("🎯 NextDay Scanner Pro v21.2 (Tradable Supernova Gate + Early Tape Burst)")
+st.sidebar.success("v21.2 build aktif — Tradable Supernova Gate aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -6034,7 +6034,7 @@ def render_v17_multimodule_tab(
 
 
 # ============================================================
-# v21 PRE-IGNITION + EARLY TAPE BURST + EXPLOSIVE RUNNER RADAR
+# v21.2 PRE-IGNITION + EARLY TAPE BURST + TRADABLE SUPERNOVA GATE
 # ============================================================
 # Amaç: TDIC/SKK/RXT benzeri patlayıcı hisseleri, ülke/menşei ve fiyat/piyasa değeri
 # yüzünden saklamadan radar ekranına düşürmek. Bu modül "al" motoru değildir.
@@ -6454,12 +6454,88 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         and (pd.isna(high_drop) or high_drop >= -10)
     )
 
+    # v21.2: Tradable Supernova Gate
+    # Amaç: TDIC'i 20$'da kovalamak değil; KULR/TDIC erken evresi gibi
+    # +8/+20/+40 bölgesinde, VWAP üstü, tepeye yakın ve hacim/tape akışı güçlü olanları
+    # PAPER_READY_SUPERNOVA olarak ayırmak.
+    supernova_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 95.0)
+    supernova_not_chase = bool(not already_exploded and not high_fade_bad)
+    supernova_near_high_ok = bool((pd.isna(high_drop) or high_drop >= -8.0) and (pd.isna(range_pos) or range_pos >= 0.72))
+    supernova_liquidity_ok = bool(
+        (pd.notna(live_volume) and live_volume >= 100_000)
+        and (pd.notna(dollar_volume) and dollar_volume >= 1_000_000)
+    )
+    supernova_guard_ok = guard["decision"] in ["PASS", "STRICT_REVIEW", "LAB_ONLY"]
+    supernova_hard_block = bool(guard["decision"] == "HARD_REJECT" or high_fade_failed or not above_vwap)
+
+    chase_risk = 0.0
+    if pd.notna(live_change_pct):
+        if live_change_pct >= 300:
+            chase_risk += 45
+        elif live_change_pct >= 150:
+            chase_risk += 32
+        elif live_change_pct >= 100:
+            chase_risk += 22
+        elif live_change_pct >= 80:
+            chase_risk += 12
+    if pd.notna(high_drop):
+        if high_drop <= -35:
+            chase_risk += 35
+        elif high_drop <= -25:
+            chase_risk += 25
+        elif high_drop <= -15:
+            chase_risk += 12
+        elif high_drop <= -8:
+            chase_risk += 6
+    if not above_vwap and f:
+        chase_risk += 22
+    if guard["decision"] == "HARD_REJECT":
+        chase_risk += 18
+    elif guard["decision"] == "LAB_ONLY":
+        chase_risk += 10
+    elif guard["decision"] == "STRICT_REVIEW":
+        chase_risk += 6
+    chase_risk = round(float(max(0, min(100, chase_risk))), 1)
+
+    supernova_tradability_score = round(float(max(0, min(100,
+        0.26 * tape_score
+        + 0.23 * early_ignition_score
+        + 0.16 * near_high_score
+        + 0.14 * dollar_score
+        + 0.10 * acc.get("Accumulation_Score", 0.0)
+        + 0.06 * rvol_score
+        + (5.0 if above_vwap else 0.0)
+        - 0.22 * chase_risk
+    ))), 1)
+
+    paper_ready_supernova = bool(
+        supernova_early_window
+        and supernova_not_chase
+        and supernova_near_high_ok
+        and supernova_liquidity_ok
+        and supernova_guard_ok
+        and not supernova_hard_block
+        and tape_score >= 70
+        and early_ignition_score >= 68
+        and supernova_tradability_score >= 62
+    )
+
+    tiny_ready_supernova = bool(
+        paper_ready_supernova
+        and guard["decision"] in ["PASS", "STRICT_REVIEW"]
+        and chase_risk <= 35
+        and supernova_tradability_score >= 70
+    )
+
     if extreme_exploded:
         signal = "ALREADY_EXPLODED_SUPERNOVA"
         stage = "ALREADY_EXPLODED_NO_CHASE"
     elif high_fade_failed:
         signal = "FAILED_RUNNER_NO_CHASE"
         stage = "FAILED_RUNNER"
+    elif paper_ready_supernova:
+        signal = "PAPER_READY_SUPERNOVA"
+        stage = "TRADABLE_SUPERNOVA_READY"
     elif ready_trigger:
         signal = "READY_TRIGGER"
         stage = "EARLY_IGNITION_READY"
@@ -6489,6 +6565,10 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         trade_status = "NO_TRADE_FAILED_RUNNER"
     elif stage == "ALREADY_EXPLODED_NO_CHASE" or guard["decision"] == "HARD_REJECT":
         trade_status = "RADAR_ONLY_EXTREME_RISK"
+    elif paper_ready_supernova and guard["decision"] == "PASS":
+        trade_status = "PAPER_READY_SUPERNOVA"
+    elif paper_ready_supernova:
+        trade_status = "PAPER_READY_SUPERNOVA_RISK_TAGGED"
     elif ready_trigger and guard["decision"] == "PASS":
         trade_status = "PAPER_READY_CONFIRM_ONLY"
     elif ready_trigger:
@@ -6503,6 +6583,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         trade_status = "WATCH_ONLY"
 
     v21_action = {
+        "PAPER_READY_SUPERNOVA": "Alinabilir supernova paper adayi: 5-15dk VWAP/entry ustu tutunma + stop zorunlu",
+        "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Alinabilir ama risk etiketli supernova: sadece paper/mikro risk, onay bekle",
         "PAPER_READY_CONFIRM_ONLY": "Paper icin bile 5-15dk VWAP/entry ustu tutunma bekle",
         "RADAR_ONLY_RISK_TAGGED": "Erken atesleme var ama risk etiketi nedeniyle ana trade yok",
         "PAPER_WATCH_RECLAIM_ONLY": "Reclaim/VWAP teyidi gelirse paper izle",
@@ -6527,6 +6609,37 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
             emergency_stop = live_price * 0.88
         emergency_stop = round(emergency_stop, v17_price_round(live_price))
 
+    tp30 = round(live_price * 1.30, v17_price_round(live_price)) if pd.notna(live_price) else np.nan
+    trigger_price = entry_reclaim
+    kill_level = emergency_stop
+    if stage == "TRADABLE_SUPERNOVA_READY":
+        entry_mode = "VWAP_HOD_HOLD_OR_FIRST_PULLBACK" if above_vwap else "WAIT_VWAP_RECLAIM"
+    elif ready_trigger:
+        entry_mode = "WAIT_5_15MIN_HOLD"
+    elif stage == "ALREADY_EXPLODED_NO_CHASE":
+        entry_mode = "NO_CHASE"
+    elif stage == "FAILED_RUNNER":
+        entry_mode = "NO_TRADE"
+    else:
+        entry_mode = "WATCH_ONLY"
+
+    if trade_status == "PAPER_READY_SUPERNOVA":
+        position_risk_mode = "PAPER_ONLY_CONTROLLED"
+    elif trade_status == "PAPER_READY_SUPERNOVA_RISK_TAGGED":
+        position_risk_mode = "PAPER_ONLY_TINY_RISK"
+    elif "NO_TRADE" in trade_status or "EXTREME" in trade_status:
+        position_risk_mode = "NO_MAIN_TRADE"
+    else:
+        position_risk_mode = "WATCH_OR_LAB"
+
+    supernova_action = {
+        "PAPER_READY_SUPERNOVA": "Paper alinabilir: Entry ustu 5-15dk tutunma, VWAP kaybi/kill level ile cikis",
+        "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Sadece paper/mikro risk: guclu teyit olmadan giris yok",
+        "PAPER_READY_CONFIRM_ONLY": "Teyit bekle; entry ignesi yetmez",
+        "RADAR_ONLY_EXTREME_RISK": "Goruldu ama kovalama yok",
+        "NO_TRADE_FAILED_RUNNER": "Failed runner; islem yok",
+    }.get(trade_status, v21_action)
+
     return {
         "Symbol": symbol,
         "Company": description,
@@ -6534,6 +6647,13 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         "Stage": stage,
         "Trade_Status": trade_status,
         "V21_Action": v21_action,
+        "Supernova_Action": supernova_action,
+        "Supernova_Tradability_Score": supernova_tradability_score,
+        "Chase_Risk": chase_risk,
+        "Entry_Mode": entry_mode,
+        "Trigger_Price": round(trigger_price, v17_price_round(trigger_price)) if pd.notna(trigger_price) else np.nan,
+        "Kill_Level": kill_level,
+        "Position_Risk_Mode": position_risk_mode,
         "Pre_Ignition_Score": pre_ignition_score,
         "Early_Ignition_Score": early_ignition_score,
         "Ready_Trigger": bool(ready_trigger),
@@ -6567,6 +6687,7 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         "Reclaim_Entry_Only": round(entry_reclaim, v17_price_round(entry_reclaim)) if pd.notna(entry_reclaim) else np.nan,
         "TP0_8pct": tp0,
         "TP15": tp15,
+        "TP30": tp30,
         "Emergency_Stop": emergency_stop,
         "Risk_Flags": "; ".join(risk_flags) if risk_flags else "",
         "Guard_Reasons": guard["reason_text"],
@@ -6628,7 +6749,20 @@ def v20_scan_explosive_radar(
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values(["Explosion_Score", "Ignition_Score", "Change_%"], ascending=False).reset_index(drop=True)
+    status_rank = {
+        "PAPER_READY_SUPERNOVA": 0,
+        "PAPER_READY_SUPERNOVA_RISK_TAGGED": 1,
+        "PAPER_READY_CONFIRM_ONLY": 2,
+        "PAPER_WATCH_RECLAIM_ONLY": 3,
+        "WATCH_ONLY_PRE_IGNITION": 4,
+        "RADAR_ONLY_EXTREME_RISK": 5,
+        "NO_TRADE_FAILED_RUNNER": 6,
+    }
+    out["_status_rank"] = out.get("Trade_Status", pd.Series(index=out.index, dtype=str)).map(status_rank).fillna(4).astype(int)
+    sort_cols = [c for c in ["_status_rank", "Supernova_Tradability_Score", "Early_Ignition_Score", "Tape_Burst_Proxy", "Explosion_Score", "Change_%"] if c in out.columns]
+    asc = [True] + [False] * (len(sort_cols) - 1) if sort_cols else [False]
+    out = out.sort_values(sort_cols, ascending=asc).drop(columns=["_status_rank"], errors="ignore")
+    return out.reset_index(drop=True)
 
 
 def _v21_normalize_symbol_list(tickers: list[str]) -> list[str]:
@@ -6776,12 +6910,12 @@ def v20_scan_silent_accumulation_universe(
 
 
 def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v21.1 Pre-Ignition + Early Tape Burst — universe shuffle + liquidity gate")
+    st.subheader("🚀 v21.2 Pre-Ignition + Tradable Supernova Gate")
     st.info(
         "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
         "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
-        "v21.1 ile Silent Accumulation evreni alfabetik ilk N yerine günlük shuffle ile seçilir; "
-        "likiditesi çok zayıf adaylar ana listeden ayrılır."
+        "v21.2 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; "
+        "TDIC gibi geç kalınmış hareketler No-Chase, KULR benzeri erken ve sağlam yapılar Paper-Ready olarak görünür."
     )
 
     active = get_active_session_et()
@@ -6854,17 +6988,24 @@ def render_v20_explosive_runner_tab():
             else:
                 st.metric("Explosive aday", len(scored))
                 top_cols = [
-                    "Symbol", "Signal", "Stage", "Trade_Status", "V21_Action", "Active_Session", "Change_%", "Price", "Live_Volume",
-                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Pre_Ignition_Score", "Early_Ignition_Score",
+                    "Symbol", "Signal", "Stage", "Trade_Status", "V21_Action", "Supernova_Action", "Active_Session", "Change_%", "Price", "Live_Volume",
+                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Supernova_Tradability_Score", "Chase_Risk", "Pre_Ignition_Score", "Early_Ignition_Score",
                     "Explosion_Score", "Ignition_Score", "Tape_Burst_Proxy", "Accumulation_Score", "Above_VWAP", "High_to_Current_Drop_%",
-                    "Reclaim_Entry_Only", "TP0_8pct", "TP15", "Emergency_Stop", "Ready_Trigger", "Already_Exploded", "No_Chase_Reason", "Risk_Flags",
+                    "Entry_Mode", "Trigger_Price", "Kill_Level", "Position_Risk_Mode", "Reclaim_Entry_Only", "TP0_8pct", "TP15", "TP30", "Emergency_Stop", "Ready_Trigger", "Already_Exploded", "No_Chase_Reason", "Risk_Flags",
                 ]
                 top_cols = [c for c in top_cols if c in scored.columns]
 
-                early = scored[scored["Stage"].isin(["EARLY_IGNITION_READY", "EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
+                supernova_ready = scored[scored["Trade_Status"].astype(str).str.contains("PAPER_READY_SUPERNOVA", na=False)].copy() if "Trade_Status" in scored.columns else pd.DataFrame()
+                early = scored[scored["Stage"].isin(["TRADABLE_SUPERNOVA_READY", "EARLY_IGNITION_READY", "EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
                 pre = scored[scored["Stage"].isin(["PRE_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
                 no_chase = scored[scored["Stage"].astype(str).str.contains("ALREADY_EXPLODED|FAILED_RUNNER", na=False)].copy() if "Stage" in scored.columns else pd.DataFrame()
-                traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE|RISK_TAGGED", na=False)].copy()
+                traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE", na=False)].copy()
+
+                st.markdown("### ✅ Paper-Ready Supernova — alınabilir erken süpernova adayı")
+                if supernova_ready.empty:
+                    st.info("Paper-ready supernova yok. Bu iyi olabilir; geç kalınmış/bozulmuş hareketleri kovalamıyoruz.")
+                else:
+                    st.dataframe(supernova_ready[top_cols].head(50), use_container_width=True)
 
                 st.markdown("### ⚡ Early Ignition / Ready Trigger — patlamadan önce/erken yakalama")
                 if early.empty:
@@ -6895,7 +7036,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 erken ateşleme skorlarını CSV indir",
                     data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_1_early_ignition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_2_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_explosive_csv",
                 )
@@ -6970,7 +7111,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 Silent accumulation CSV indir",
                     data=acc_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_1_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_2_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_acc_csv",
                 )
@@ -6987,7 +7128,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "🌙 Night",
         "🔥 Runner",
         "🐋 v19",
-        "🚀 v21.1 Early Explosion",
+        "🚀 v21.2 Supernova",
     ]
 )
 
@@ -8180,7 +8321,7 @@ with tab7:
 
 
 # ============================================================
-# TAB 8 - v21 PRE-IGNITION / EARLY TAPE BURST / NO-CHASE RADAR
+# TAB 8 - v21.2 TRADABLE SUPERNOVA / PRE-IGNITION / NO-CHASE RADAR
 # ============================================================
 with tab8:
     render_v20_explosive_runner_tab()
