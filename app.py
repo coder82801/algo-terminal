@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v20 (Explosive Runner + Tape Burst + Accumulation Radar)")
-st.sidebar.success("v20 build aktif — Explosive Runner Radar aktif")
+st.title("🎯 NextDay Scanner Pro v21 (Pre-Ignition + Early Tape Burst + No-Chase Radar)")
+st.sidebar.success("v21 build aktif — Pre-Ignition + Early Tape Burst aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -6034,16 +6034,16 @@ def render_v17_multimodule_tab(
 
 
 # ============================================================
-# v20 EXPLOSIVE RUNNER RADAR - PRICE/ORIGIN AGNOSTIC
+# v21 PRE-IGNITION + EARLY TAPE BURST + EXPLOSIVE RUNNER RADAR
 # ============================================================
 # Amaç: TDIC/SKK/RXT benzeri patlayıcı hisseleri, ülke/menşei ve fiyat/piyasa değeri
 # yüzünden saklamadan radar ekranına düşürmek. Bu modül "al" motoru değildir.
 # Microcap/China-HK/low-float benzeri riskler sinyali gizlemez; sadece Risk_Flags ve
 # Trade_Status içinde açıkça gösterilir.
 
-V20_EXPLOSIVE_DEFAULT_MIN_CHANGE = 20.0
+V20_EXPLOSIVE_DEFAULT_MIN_CHANGE = 5.0
 V20_EXPLOSIVE_DEFAULT_MIN_VOLUME = 100_000
-V20_EXPLOSIVE_DEFAULT_MAX_RECORDS = 250
+V20_EXPLOSIVE_DEFAULT_MAX_RECORDS = 500
 V20_TAPE_DEEP_TOP_N = 25
 
 
@@ -6412,29 +6412,105 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     if not above_vwap and f:
         risk_flags.append("VWAP_NOT_CONFIRMED")
 
-    if pd.notna(live_change_pct) and live_change_pct >= 300:
-        signal = "EXPLOSIVE_SUPERNOVA_RADAR"
-    elif ignition_score >= 78 and tape_score >= 55:
-        signal = "TAPE_BURST_IGNITION"
-    elif acc.get("Accumulation_Score", 0.0) >= 70 and pd.notna(live_change_pct) and live_change_pct >= 20:
+    # v21: hedef, sadece patlamışları değil; patlama öncesi birikimi ve erken ateşlemeyi ayırmak.
+    early_change_score = v17_score_linear(live_change_pct, 5.0, 60.0) if pd.notna(live_change_pct) else 0.0
+    pre_ignition_score = round(float(max(0, min(100,
+        0.55 * acc.get("Accumulation_Score", 0.0)
+        + 0.20 * acc.get("Absorption_Score", 0.0)
+        + 0.10 * rvol_score
+        + 0.10 * near_high_score
+        + 0.05 * dollar_score
+    ))), 1)
+
+    early_ignition_score = round(float(max(0, min(100,
+        0.30 * tape_score
+        + 0.20 * near_high_score
+        + 0.20 * early_change_score
+        + 0.15 * acc.get("Accumulation_Score", 0.0)
+        + 0.10 * dollar_score
+        + 0.05 * rvol_score
+        + (6.0 if above_vwap else 0.0)
+    ))), 1)
+
+    already_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 150)
+    extreme_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 300)
+    early_window = bool(pd.notna(live_change_pct) and 5.0 <= live_change_pct <= 90.0)
+    ideal_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 80.0)
+    high_fade_bad = bool(pd.notna(high_drop) and high_drop <= -25.0)
+    high_fade_failed = bool(pd.notna(high_drop) and high_drop <= -35.0)
+    no_chase_reason = []
+    if already_exploded:
+        no_chase_reason.append("already +150% extended")
+    if high_fade_bad:
+        no_chase_reason.append("high'dan sert fade")
+    if guard["decision"] == "HARD_REJECT":
+        no_chase_reason.append("microcap/trap hard reject")
+
+    ready_trigger = bool(
+        ideal_early_window
+        and early_ignition_score >= 72
+        and tape_score >= 55
+        and above_vwap
+        and (pd.isna(high_drop) or high_drop >= -10)
+    )
+
+    if extreme_exploded:
+        signal = "ALREADY_EXPLODED_SUPERNOVA"
+        stage = "ALREADY_EXPLODED_NO_CHASE"
+    elif high_fade_failed:
+        signal = "FAILED_RUNNER_NO_CHASE"
+        stage = "FAILED_RUNNER"
+    elif ready_trigger:
+        signal = "READY_TRIGGER"
+        stage = "EARLY_IGNITION_READY"
+    elif early_window and early_ignition_score >= 65 and tape_score >= 45:
+        signal = "EARLY_IGNITION"
+        stage = "EARLY_IGNITION_WATCH"
+    elif pre_ignition_score >= 72 and (pd.isna(live_change_pct) or live_change_pct < 25):
+        signal = "PRE_IGNITION_WATCH"
+        stage = "PRE_IGNITION"
+    elif acc.get("Accumulation_Score", 0.0) >= 70 and pd.notna(live_change_pct) and live_change_pct >= 15:
         signal = "ACCUMULATION_IGNITION"
+        stage = "ACCUMULATION_TO_IGNITION"
+    elif already_exploded:
+        signal = "ALREADY_EXPLODED"
+        stage = "ALREADY_EXPLODED_NO_CHASE"
     elif explosion_score >= 65:
         signal = "EXPLOSIVE_RUNNER_RADAR"
+        stage = "EXPLOSIVE_RADAR"
     elif acc.get("Accumulation_Score", 0.0) >= 70:
         signal = "SILENT_ACCUMULATION_WATCH"
+        stage = "PRE_IGNITION"
     else:
         signal = "WATCH"
+        stage = "WATCH"
 
-    if pd.notna(high_drop) and high_drop <= -35:
+    if high_fade_failed:
         trade_status = "NO_TRADE_FAILED_RUNNER"
-    elif guard["decision"] == "HARD_REJECT" or (pd.notna(live_change_pct) and live_change_pct >= 250):
+    elif stage == "ALREADY_EXPLODED_NO_CHASE" or guard["decision"] == "HARD_REJECT":
         trade_status = "RADAR_ONLY_EXTREME_RISK"
+    elif ready_trigger and guard["decision"] == "PASS":
+        trade_status = "PAPER_READY_CONFIRM_ONLY"
+    elif ready_trigger:
+        trade_status = "RADAR_ONLY_RISK_TAGGED"
+    elif stage in ["EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"]:
+        trade_status = "PAPER_WATCH_RECLAIM_ONLY" if guard["decision"] == "PASS" else "LAB_ONLY_RISK_TAGGED"
+    elif stage == "PRE_IGNITION":
+        trade_status = "WATCH_ONLY_PRE_IGNITION"
     elif guard["decision"] in ["LAB_ONLY", "STRICT_REVIEW"]:
         trade_status = "LAB_ONLY_NO_MAIN_TRADE"
-    elif signal in ["TAPE_BURST_IGNITION", "EXPLOSIVE_RUNNER_RADAR"] and above_vwap and (pd.isna(high_drop) or high_drop >= -8):
-        trade_status = "PAPER_WATCH_RECLAIM_ONLY"
     else:
         trade_status = "WATCH_ONLY"
+
+    v21_action = {
+        "PAPER_READY_CONFIRM_ONLY": "Paper icin bile 5-15dk VWAP/entry ustu tutunma bekle",
+        "RADAR_ONLY_RISK_TAGGED": "Erken atesleme var ama risk etiketi nedeniyle ana trade yok",
+        "PAPER_WATCH_RECLAIM_ONLY": "Reclaim/VWAP teyidi gelirse paper izle",
+        "LAB_ONLY_RISK_TAGGED": "Riskli erken hareket; sadece lab/paper gozlem",
+        "WATCH_ONLY_PRE_IGNITION": "Patlama oncesi havuza al; canli ignition bekle",
+        "RADAR_ONLY_EXTREME_RISK": "Goruldu ama kovalama yok",
+        "NO_TRADE_FAILED_RUNNER": "Failed runner; islem yok",
+    }.get(trade_status, "Izle / teyit bekle")
 
     entry_reclaim = np.nan
     if pd.notna(live_price):
@@ -6455,7 +6531,14 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         "Symbol": symbol,
         "Company": description,
         "Signal": signal,
+        "Stage": stage,
         "Trade_Status": trade_status,
+        "V21_Action": v21_action,
+        "Pre_Ignition_Score": pre_ignition_score,
+        "Early_Ignition_Score": early_ignition_score,
+        "Ready_Trigger": bool(ready_trigger),
+        "Already_Exploded": bool(already_exploded),
+        "No_Chase_Reason": "; ".join(no_chase_reason),
         "Active_Session": active_session,
         "Change_%": round(live_change_pct, 2) if pd.notna(live_change_pct) else np.nan,
         "Price": round(live_price, v17_price_round(live_price)) if pd.notna(live_price) else np.nan,
@@ -6594,10 +6677,11 @@ def v20_scan_silent_accumulation_universe(
 
 
 def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v20 Explosive Runner Radar — TDIC/SKK tipi patlayıcı hisse radarı")
+    st.subheader("🚀 v21 Pre-Ignition + Early Tape Burst — patlamadan önce / erken ateşleme radarı")
     st.info(
-        "Bu modül alım motoru değildir. Amaç TDIC gibi ülke/fiyat/piyasa değeri nedeniyle ana filtrelerde kaybolan "
-        "patlayıcı hisseleri görünür yapmaktır. Menşei ve fiyat alandan çıkarmak için değil, Risk_Flags içinde göstermek için kullanılır."
+        "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
+        "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
+        "Menşei, fiyat ve piyasa değeri bulma aşamasında saklanmaz; riskler Stage/Trade_Status/Risk_Flags içinde açıkça gösterilir."
     )
 
     active = get_active_session_et()
@@ -6670,18 +6754,35 @@ def render_v20_explosive_runner_tab():
             else:
                 st.metric("Explosive aday", len(scored))
                 top_cols = [
-                    "Symbol", "Signal", "Trade_Status", "Active_Session", "Change_%", "Price", "Live_Volume",
-                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Explosion_Score", "Ignition_Score",
-                    "Tape_Burst_Proxy", "Accumulation_Score", "Above_VWAP", "High_to_Current_Drop_%",
-                    "Reclaim_Entry_Only", "TP0_8pct", "TP15", "Emergency_Stop", "Risk_Flags",
+                    "Symbol", "Signal", "Stage", "Trade_Status", "V21_Action", "Active_Session", "Change_%", "Price", "Live_Volume",
+                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Pre_Ignition_Score", "Early_Ignition_Score",
+                    "Explosion_Score", "Ignition_Score", "Tape_Burst_Proxy", "Accumulation_Score", "Above_VWAP", "High_to_Current_Drop_%",
+                    "Reclaim_Entry_Only", "TP0_8pct", "TP15", "Emergency_Stop", "Ready_Trigger", "Already_Exploded", "No_Chase_Reason", "Risk_Flags",
                 ]
                 top_cols = [c for c in top_cols if c in scored.columns]
 
-                explosive = scored[scored["Signal"].isin(["EXPLOSIVE_SUPERNOVA_RADAR", "TAPE_BURST_IGNITION", "EXPLOSIVE_RUNNER_RADAR", "ACCUMULATION_IGNITION"])].copy()
-                traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE", na=False)].copy()
+                early = scored[scored["Stage"].isin(["EARLY_IGNITION_READY", "EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
+                pre = scored[scored["Stage"].isin(["PRE_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
+                no_chase = scored[scored["Stage"].astype(str).str.contains("ALREADY_EXPLODED|FAILED_RUNNER", na=False)].copy() if "Stage" in scored.columns else pd.DataFrame()
+                traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE|RISK_TAGGED", na=False)].copy()
 
-                st.markdown("### 🔥 Explosive / Ignition Radar")
-                st.dataframe(explosive[top_cols].head(100) if not explosive.empty else scored[top_cols].head(50), use_container_width=True)
+                st.markdown("### ⚡ Early Ignition / Ready Trigger — patlamadan önce/erken yakalama")
+                if early.empty:
+                    st.info("Erken ateşleme adayı yok. Min değişimi 5-10 aralığına indirip evreni büyütebilirsin.")
+                else:
+                    st.dataframe(early[top_cols].head(100), use_container_width=True)
+
+                st.markdown("### 🧊 Pre-Ignition / Silent Accumulation — henüz patlamadan havuz")
+                if pre.empty:
+                    st.write("Pre-ignition adayı bu canlı evrende yok. Aşağıdaki Silent Accumulation Scanner ile geniş evren taranabilir.")
+                else:
+                    st.dataframe(pre[top_cols + [c for c in ["PreExplosion_Note", "Data_Status", "Feature_Status"] if c in pre.columns]].head(100), use_container_width=True)
+
+                st.markdown("### 🚫 Already Exploded / No-Chase — görüldü ama kovalama yok")
+                if no_chase.empty:
+                    st.write("No-chase tablosu boş.")
+                else:
+                    st.dataframe(no_chase[top_cols + [c for c in ["Guard_Reasons", "PreExplosion_Note", "Data_Status", "Feature_Status"] if c in no_chase.columns]].head(100), use_container_width=True)
 
                 st.markdown("### ⛔ Risk / Trap Board — görüldü ama temiz alım değil")
                 if traps.empty:
@@ -6689,12 +6790,12 @@ def render_v20_explosive_runner_tab():
                 else:
                     st.dataframe(traps[top_cols + [c for c in ["Guard_Reasons", "PreExplosion_Note", "Data_Status", "Feature_Status"] if c in traps.columns]].head(100), use_container_width=True)
 
-                st.markdown("### 📊 Tüm v20 skorlar")
+                st.markdown("### 📊 Tüm v21 skorlar")
                 st.dataframe(scored, use_container_width=True)
                 st.download_button(
-                    "📥 v20 explosive skorlarını CSV indir",
+                    "📥 v21 erken ateşleme skorlarını CSV indir",
                     data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v20_explosive_runner_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_early_ignition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_explosive_csv",
                 )
@@ -6748,9 +6849,9 @@ def render_v20_explosive_runner_tab():
                 st.success(f"Silent accumulation adayı: {len(acc_df)}")
                 st.dataframe(acc_df.head(200), use_container_width=True)
                 st.download_button(
-                    "📥 Silent accumulation CSV indir",
+                    "📥 v21 Silent accumulation CSV indir",
                     data=acc_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v20_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_acc_csv",
                 )
@@ -6767,7 +6868,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "🌙 Night",
         "🔥 Runner",
         "🐋 v19",
-        "🚀 v20 Explosive",
+        "🚀 v21 Early Explosion",
     ]
 )
 
@@ -7960,7 +8061,7 @@ with tab7:
 
 
 # ============================================================
-# TAB 8 - v20 EXPLOSIVE RUNNER / TAPE BURST / ACCUMULATION RADAR
+# TAB 8 - v21 PRE-IGNITION / EARLY TAPE BURST / NO-CHASE RADAR
 # ============================================================
 with tab8:
     render_v20_explosive_runner_tab()
