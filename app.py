@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v21.2 (Tradable Supernova Gate + Early Tape Burst)")
-st.sidebar.success("v21.2 build aktif — Tradable Supernova Gate aktif")
+st.title("🎯 NextDay Scanner Pro v21.3 (Target Cleanup + Tradable Supernova Gate)")
+st.sidebar.success("v21.3 build aktif — Target Cleanup + Tradable Supernova Gate aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -1532,18 +1532,17 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 stop_limit_price = dynamic_stop_limit(stop_price)
                 risk = max(entry_idea - stop_price, 0.01)
 
-                if entry_type == "BREAKOUT":
-                    tp1 = round(entry_idea + 1.5 * risk, 4)
-                    tp2 = round(entry_idea + 3.0 * risk, 4)
-                elif entry_type == "MICRO_PULLBACK":
-                    tp1 = round(entry_idea + 1.3 * risk, 4)
-                    tp2 = round(entry_idea + 2.6 * risk, 4)
-                elif entry_type == "VWAP_PULLBACK":
-                    tp1 = round(entry_idea + 1.2 * risk, 4)
-                    tp2 = round(entry_idea + 2.4 * risk, 4)
-                else:
-                    tp1 = round(entry_idea + risk, 4)
-                    tp2 = round(entry_idea + 2 * risk, 4)
+                # v21.3 Target Cleanup:
+                # Next Day tarafında TP2 artık TP15 ile aynı hedefi tekrar etmesin.
+                # TP0 = hızlı kâr / 0.5R veya %3; TP1 = ara hedef / +%7.5;
+                # TP15 = ana hedef / +%15; Runner hedefleri = +%20 ve +%30.
+                tp0_05r = round(entry_idea + 0.5 * risk, 4)
+                tp0_3pct = round(entry_idea * 1.03, 4)
+                tp0_quick = round(max(tp0_05r, tp0_3pct), 4)
+                tp1 = round(entry_idea * 1.075, 4)
+                tp15 = round(entry_idea * 1.15, 4)
+                runner_tp20 = round(entry_idea * 1.20, 4)
+                runner_tp30 = round(entry_idea * 1.30, 4)
 
                 final_candidates.append(
                     {
@@ -1570,11 +1569,14 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Entry_Idea": entry_idea,
                         "Stop_Price": stop_price,
                         "Stop_Limit_Price": stop_limit_price,
-                        "TP0_Quick": round(entry_idea + 0.5 * risk, 4),
-                        "Follow_Through_0_5R": round(entry_idea + 0.5 * risk, 4),
-                        "TP15": round(entry_idea * 1.15, 4),
+                        "TP0_Quick": tp0_quick,
+                        "TP0_0_5R": tp0_05r,
+                        "TP0_Quick_3pct": tp0_3pct,
+                        "Follow_Through_0_5R": tp0_05r,
                         "TP1": tp1,
-                        "TP2": tp2,
+                        "TP15": tp15,
+                        "Runner_TP20": runner_tp20,
+                        "Runner_TP30": runner_tp30,
                         "Trade_Readiness": "WAIT_CONFIRM",
                         "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + 0.5R follow-through şart",
                         "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve 0.5R devam gelmezse işlem yok/çık",
@@ -2297,7 +2299,7 @@ def _safe_pct(numerator: float, denominator: float) -> float:
 
 def _target_pct_by_price(price: float) -> float:
     # v11: ana hedef artık normalize edilmiş küçük hedef değil; minimum +%15 hard gate.
-    # Bu fonksiyon TP0/TP1/TP2 yardımcı hedeflerinin makul seviyelerini üretmek için kalır;
+    # Bu fonksiyon TP0/TP1/Runner hedeflerinin makul seviyelerini üretmek için kalır;
     # gerçek alım izni ayrıca TP15 / Has_15pct_Upside kapısından geçmek zorundadır.
     if pd.isna(price) or price <= 0:
         return 0.15
@@ -3690,6 +3692,8 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "Night_Signal_Score": round(signal_score, 1),
         "Expected_Target_%": round(expected_target_pct, 2) if pd.notna(expected_target_pct) else np.nan,
         "TP15": round(tp15, rnd),
+        "Runner_TP20": round(entry_low * 1.20, rnd),
+        "Runner_TP30": round(entry_low * 1.30, rnd),
         "TP15_Required_Move_%": round(tp15_required_move_pct, 2),
         "TP15_R_Multiple": round(tp15_r_multiple, 2) if pd.notna(tp15_r_multiple) else np.nan,
         "Target15_Score": round(target15_score, 1),
@@ -3758,7 +3762,8 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         "Stop": round(stop_price, rnd),
         "TP0_Quick": round(tp0, rnd),
         "TP1": round(tp1, rnd),
-        "TP2": round(tp2, rnd),
+        # TP2 intentionally removed in v21.3: TP15 is the main +15% target.
+        # Runner_TP20 / Runner_TP30 are shown separately for extended moves.
         "Risk_per_Share": round(risk, rnd),
         "RTH_Instruction": rth_instruction,
         "Why": ", ".join(why[:6]) if why else "Net pozitif gerekçe zayıf",
@@ -6910,11 +6915,11 @@ def v20_scan_silent_accumulation_universe(
 
 
 def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v21.2 Pre-Ignition + Tradable Supernova Gate")
+    st.subheader("🚀 v21.3 Pre-Ignition + Tradable Supernova Gate")
     st.info(
         "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
         "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
-        "v21.2 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; "
+        "v21.3 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; "
         "TDIC gibi geç kalınmış hareketler No-Chase, KULR benzeri erken ve sağlam yapılar Paper-Ready olarak görünür."
     )
 
@@ -7036,7 +7041,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 erken ateşleme skorlarını CSV indir",
                     data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_2_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_3_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_explosive_csv",
                 )
@@ -7833,7 +7838,7 @@ with tab5:
                     "Breakout_Flag", "Breakout_Pct_%", "ATR_pct",
                     "Night_Entry_Low", "Night_Entry_High", "Stop", "Setup_Invalidation",
                     "Follow_Through_0_5R", "Follow_Through_0_75R",
-                    "TP0_Quick", "TP1", "TP2", "TP15",
+                    "TP0_Quick", "TP1", "TP15", "Runner_TP20", "Runner_TP30",
                     "Current_vs_Entry_Low_%", "Current_vs_Entry_High_%",
                     "RTH_Instruction", "Why", "Risk_Notes", "Aggressive_Reason"
                 ]
