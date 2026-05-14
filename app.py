@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v21.3 (Target Cleanup + Tradable Supernova Gate)")
-st.sidebar.success("v21.3 build aktif — Target Cleanup + Tradable Supernova Gate aktif")
+st.title("🎯 NextDay Scanner Pro v21.4 (Late Entry Guard + VIVO Pattern + Target Cleanup)")
+st.sidebar.success("v21.4 build aktif — Late Entry Guard + VIVO Pattern aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -1532,8 +1532,8 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 stop_limit_price = dynamic_stop_limit(stop_price)
                 risk = max(entry_idea - stop_price, 0.01)
 
-                # v21.3 Target Cleanup:
-                # Next Day tarafında TP2 artık TP15 ile aynı hedefi tekrar etmesin.
+                # v21.4 Target Cleanup + VIVO Pattern:
+                # Next Day tarafında TP2 artık TP15 ile aynı hedefi tekrar etmesin; VIVO/ATRO gibi güçlü follow-through adayları ayrı readiness alsın.
                 # TP0 = hızlı kâr / 0.5R veya %3; TP1 = ara hedef / +%7.5;
                 # TP15 = ana hedef / +%15; Runner hedefleri = +%20 ve +%30.
                 tp0_05r = round(entry_idea + 0.5 * risk, 4)
@@ -1543,6 +1543,59 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                 tp15 = round(entry_idea * 1.15, 4)
                 runner_tp20 = round(entry_idea * 1.20, 4)
                 runner_tp30 = round(entry_idea * 1.30, 4)
+
+                # v21.4 VIVO/ATRO Pattern Readiness:
+                # VIVO gibi TP15'e giden adaylarda ortak yapı: yüksek RS, high'a yakın kapanış,
+                # VWAP üstü, yeterli RVOL ve pozitif gap/OBV. BCRX gibi sadece entry görüp
+                # follow-through vermeyen adaylar WAIT_CONFIRM'da kalır.
+                vivo_pattern_score = 0.0
+                if pd.notna(rvol20):
+                    if rvol20 >= 3.0:
+                        vivo_pattern_score += 22
+                    elif rvol20 >= 2.0:
+                        vivo_pattern_score += 17
+                    elif rvol20 >= 1.5:
+                        vivo_pattern_score += 10
+                if pd.notna(closing_strength):
+                    if closing_strength >= 0.88:
+                        vivo_pattern_score += 22
+                    elif closing_strength >= 0.78:
+                        vivo_pattern_score += 18
+                    elif closing_strength >= 0.68:
+                        vivo_pattern_score += 9
+                if close_above_vwap:
+                    vivo_pattern_score += 15
+                dist_to_high_pct_abs = dist_below_breakout * 100.0 if pd.notna(dist_below_breakout) else np.nan
+                if pd.notna(dist_to_high_pct_abs):
+                    if dist_to_high_pct_abs <= 0.75:
+                        vivo_pattern_score += 18
+                    elif dist_to_high_pct_abs <= 1.50:
+                        vivo_pattern_score += 10
+                    elif dist_to_high_pct_abs <= 3.00:
+                        vivo_pattern_score += 5
+                rs_spread_pct_abs = rs_spread * 100.0 if pd.notna(rs_spread) else np.nan
+                if pd.notna(rs_spread_pct_abs):
+                    if rs_spread_pct_abs >= 15:
+                        vivo_pattern_score += 18
+                    elif rs_spread_pct_abs >= 8:
+                        vivo_pattern_score += 12
+                    elif rs_spread_pct_abs >= 3:
+                        vivo_pattern_score += 5
+                if pd.notna(gap_pct) and gap_pct >= 0:
+                    vivo_pattern_score += 5
+                if obv_slope_10 > 0:
+                    vivo_pattern_score += 5
+                vivo_pattern_score = round(float(max(0, min(100, vivo_pattern_score))), 1)
+
+                if vivo_pattern_score >= 85 and confidence >= 75:
+                    trade_readiness = "PAPER_READY_AFTER_5MIN_HOLD"
+                    readiness_reason = "VIVO pattern güçlü: RS + VWAP + high'a yakın kapanış; yine de 5-15dk hold şart"
+                elif vivo_pattern_score >= 70 and confidence >= 75:
+                    trade_readiness = "WAIT_CONFIRM_STRONG"
+                    readiness_reason = "Güçlü aday ama TP0/follow-through teyidi gelmeden işlem yok"
+                else:
+                    trade_readiness = "WAIT_CONFIRM"
+                    readiness_reason = "Entry dokunuşu yeterli değil; TP0/0.5R follow-through bekle"
 
                 final_candidates.append(
                     {
@@ -1577,9 +1630,11 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "TP15": tp15,
                         "Runner_TP20": runner_tp20,
                         "Runner_TP30": runner_tp30,
-                        "Trade_Readiness": "WAIT_CONFIRM",
-                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + 0.5R follow-through şart",
-                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve 0.5R devam gelmezse işlem yok/çık",
+                        "VIVO_Pattern_Score": vivo_pattern_score,
+                        "Trade_Readiness": trade_readiness,
+                        "Trade_Readiness_Reason": readiness_reason,
+                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + TP0/0.5R follow-through şart",
+                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve TP0/0.5R devam gelmezse işlem yok/çık",
                         "Score": score,
                         "Notes": ", ".join(notes[:6]),
                     }
@@ -6513,7 +6568,34 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         - 0.22 * chase_risk
     ))), 1)
 
-    paper_ready_supernova = bool(
+    # v21.4 Late Entry Guard:
+    # KULR vakasında model 4.04 civarı erken sinyal verdi, ancak 4.45 geç giriş zarar yazdı.
+    # Bu nedenle VWAP/reclaim bazlı teorik trigger'dan %5-8 fazla uzaklaşmış ve TP0 alanına
+    # yaklaşmış/geçmiş hisselerde yeni giriş artık FRESH_BUY değil, PULLBACK_ONLY olur.
+    base_trigger_price = np.nan
+    if pd.notna(active_vwap) and active_vwap > 0:
+        base_trigger_price = active_vwap * 1.003
+    elif pd.notna(live_price) and live_price > 0:
+        base_trigger_price = live_price
+    fresh_entry_max = base_trigger_price * 1.05 if pd.notna(base_trigger_price) else np.nan
+    ideal_pullback_zone_low = base_trigger_price * 0.995 if pd.notna(base_trigger_price) else np.nan
+    ideal_pullback_zone_high = base_trigger_price * 1.03 if pd.notna(base_trigger_price) else np.nan
+    late_entry_pct = ((live_price - base_trigger_price) / base_trigger_price * 100.0) if pd.notna(live_price) and pd.notna(base_trigger_price) and base_trigger_price > 0 else np.nan
+    tp0_from_trigger = base_trigger_price * 1.08 if pd.notna(base_trigger_price) else np.nan
+    tp0_already_reached_from_trigger = bool(pd.notna(live_price) and pd.notna(tp0_from_trigger) and live_price >= tp0_from_trigger)
+    late_entry_hard = bool(pd.notna(late_entry_pct) and (late_entry_pct >= 8.0 or (late_entry_pct >= 5.0 and tp0_already_reached_from_trigger)))
+    late_entry_soft = bool(pd.notna(late_entry_pct) and 5.0 <= late_entry_pct < 8.0 and not late_entry_hard)
+    if late_entry_hard:
+        late_entry_warning = "LATE_ENTRY_NO_FRESH_BUY"
+        late_entry_action = "Geç giriş: yeni alım yok; sadece VWAP/trigger pullback + reclaim gelirse paper düşün"
+    elif late_entry_soft:
+        late_entry_warning = "LATE_ENTRY_PULLBACK_ONLY"
+        late_entry_action = "Trigger'dan uzak; marketten kovalamak yerine pullback/retest bekle"
+    else:
+        late_entry_warning = "FRESH_ENTRY_OK"
+        late_entry_action = "Trigger'a yakın; yine de 5-15dk hold şart"
+
+    paper_ready_supernova_raw = bool(
         supernova_early_window
         and supernova_not_chase
         and supernova_near_high_ok
@@ -6524,6 +6606,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         and early_ignition_score >= 68
         and supernova_tradability_score >= 62
     )
+    paper_ready_supernova = bool(paper_ready_supernova_raw and not late_entry_hard)
+    late_entry_supernova = bool(paper_ready_supernova_raw and late_entry_hard)
 
     tiny_ready_supernova = bool(
         paper_ready_supernova
@@ -6541,6 +6625,9 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     elif paper_ready_supernova:
         signal = "PAPER_READY_SUPERNOVA"
         stage = "TRADABLE_SUPERNOVA_READY"
+    elif late_entry_supernova:
+        signal = "LATE_ENTRY_PULLBACK_ONLY"
+        stage = "LATE_ENTRY_NO_FRESH_BUY"
     elif ready_trigger:
         signal = "READY_TRIGGER"
         stage = "EARLY_IGNITION_READY"
@@ -6574,6 +6661,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         trade_status = "PAPER_READY_SUPERNOVA"
     elif paper_ready_supernova:
         trade_status = "PAPER_READY_SUPERNOVA_RISK_TAGGED"
+    elif late_entry_supernova:
+        trade_status = "LATE_ENTRY_PULLBACK_ONLY"
     elif ready_trigger and guard["decision"] == "PASS":
         trade_status = "PAPER_READY_CONFIRM_ONLY"
     elif ready_trigger:
@@ -6590,6 +6679,7 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     v21_action = {
         "PAPER_READY_SUPERNOVA": "Alinabilir supernova paper adayi: 5-15dk VWAP/entry ustu tutunma + stop zorunlu",
         "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Alinabilir ama risk etiketli supernova: sadece paper/mikro risk, onay bekle",
+        "LATE_ENTRY_PULLBACK_ONLY": "Geç giriş: marketten kovalamak yok; pullback + reclaim bekle",
         "PAPER_READY_CONFIRM_ONLY": "Paper icin bile 5-15dk VWAP/entry ustu tutunma bekle",
         "RADAR_ONLY_RISK_TAGGED": "Erken atesleme var ama risk etiketi nedeniyle ana trade yok",
         "PAPER_WATCH_RECLAIM_ONLY": "Reclaim/VWAP teyidi gelirse paper izle",
@@ -6600,7 +6690,9 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     }.get(trade_status, "Izle / teyit bekle")
 
     entry_reclaim = np.nan
-    if pd.notna(live_price):
+    if pd.notna(base_trigger_price):
+        entry_reclaim = base_trigger_price
+    elif pd.notna(live_price):
         entry_reclaim = live_price
         if pd.notna(active_vwap):
             entry_reclaim = max(entry_reclaim, active_vwap * 1.003)
@@ -6619,6 +6711,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     kill_level = emergency_stop
     if stage == "TRADABLE_SUPERNOVA_READY":
         entry_mode = "VWAP_HOD_HOLD_OR_FIRST_PULLBACK" if above_vwap else "WAIT_VWAP_RECLAIM"
+    elif stage == "LATE_ENTRY_NO_FRESH_BUY":
+        entry_mode = "PULLBACK_RECLAIM_ONLY"
     elif ready_trigger:
         entry_mode = "WAIT_5_15MIN_HOLD"
     elif stage == "ALREADY_EXPLODED_NO_CHASE":
@@ -6632,6 +6726,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         position_risk_mode = "PAPER_ONLY_CONTROLLED"
     elif trade_status == "PAPER_READY_SUPERNOVA_RISK_TAGGED":
         position_risk_mode = "PAPER_ONLY_TINY_RISK"
+    elif trade_status == "LATE_ENTRY_PULLBACK_ONLY":
+        position_risk_mode = "NO_FRESH_BUY_PULLBACK_ONLY"
     elif "NO_TRADE" in trade_status or "EXTREME" in trade_status:
         position_risk_mode = "NO_MAIN_TRADE"
     else:
@@ -6640,6 +6736,7 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     supernova_action = {
         "PAPER_READY_SUPERNOVA": "Paper alinabilir: Entry ustu 5-15dk tutunma, VWAP kaybi/kill level ile cikis",
         "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Sadece paper/mikro risk: guclu teyit olmadan giris yok",
+        "LATE_ENTRY_PULLBACK_ONLY": "Geç giriş: yeni alım yok; pullback + VWAP/trigger reclaim bekle",
         "PAPER_READY_CONFIRM_ONLY": "Teyit bekle; entry ignesi yetmez",
         "RADAR_ONLY_EXTREME_RISK": "Goruldu ama kovalama yok",
         "NO_TRADE_FAILED_RUNNER": "Failed runner; islem yok",
@@ -6655,6 +6752,12 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         "Supernova_Action": supernova_action,
         "Supernova_Tradability_Score": supernova_tradability_score,
         "Chase_Risk": chase_risk,
+        "Late_Entry_%": round(late_entry_pct, 2) if pd.notna(late_entry_pct) else np.nan,
+        "Late_Entry_Warning": late_entry_warning,
+        "Late_Entry_Action": late_entry_action,
+        "Fresh_Entry_Max": round(fresh_entry_max, v17_price_round(fresh_entry_max)) if pd.notna(fresh_entry_max) else np.nan,
+        "Pullback_Reentry_Zone": (f"{round(ideal_pullback_zone_low, v17_price_round(ideal_pullback_zone_low))}-{round(ideal_pullback_zone_high, v17_price_round(ideal_pullback_zone_high))}" if pd.notna(ideal_pullback_zone_low) and pd.notna(ideal_pullback_zone_high) else "-"),
+        "TP0_Already_Reached_From_Trigger": bool(tp0_already_reached_from_trigger),
         "Entry_Mode": entry_mode,
         "Trigger_Price": round(trigger_price, v17_price_round(trigger_price)) if pd.notna(trigger_price) else np.nan,
         "Kill_Level": kill_level,
@@ -6757,11 +6860,12 @@ def v20_scan_explosive_radar(
     status_rank = {
         "PAPER_READY_SUPERNOVA": 0,
         "PAPER_READY_SUPERNOVA_RISK_TAGGED": 1,
-        "PAPER_READY_CONFIRM_ONLY": 2,
-        "PAPER_WATCH_RECLAIM_ONLY": 3,
-        "WATCH_ONLY_PRE_IGNITION": 4,
-        "RADAR_ONLY_EXTREME_RISK": 5,
-        "NO_TRADE_FAILED_RUNNER": 6,
+        "LATE_ENTRY_PULLBACK_ONLY": 2,
+        "PAPER_READY_CONFIRM_ONLY": 3,
+        "PAPER_WATCH_RECLAIM_ONLY": 4,
+        "WATCH_ONLY_PRE_IGNITION": 5,
+        "RADAR_ONLY_EXTREME_RISK": 6,
+        "NO_TRADE_FAILED_RUNNER": 7,
     }
     out["_status_rank"] = out.get("Trade_Status", pd.Series(index=out.index, dtype=str)).map(status_rank).fillna(4).astype(int)
     sort_cols = [c for c in ["_status_rank", "Supernova_Tradability_Score", "Early_Ignition_Score", "Tape_Burst_Proxy", "Explosion_Score", "Change_%"] if c in out.columns]
@@ -6915,11 +7019,11 @@ def v20_scan_silent_accumulation_universe(
 
 
 def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v21.3 Pre-Ignition + Tradable Supernova Gate")
+    st.subheader("🚀 v21.4 Pre-Ignition + Tradable Supernova Gate")
     st.info(
         "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
         "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
-        "v21.3 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; "
+        "v21.4 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; geç giriş uyarısı ve VIVO-pattern takibi eklenir; "
         "TDIC gibi geç kalınmış hareketler No-Chase, KULR benzeri erken ve sağlam yapılar Paper-Ready olarak görünür."
     )
 
@@ -6994,7 +7098,9 @@ def render_v20_explosive_runner_tab():
                 st.metric("Explosive aday", len(scored))
                 top_cols = [
                     "Symbol", "Signal", "Stage", "Trade_Status", "V21_Action", "Supernova_Action", "Active_Session", "Change_%", "Price", "Live_Volume",
-                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Supernova_Tradability_Score", "Chase_Risk", "Pre_Ignition_Score", "Early_Ignition_Score",
+                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Supernova_Tradability_Score", "Chase_Risk",
+                    "Late_Entry_%", "Late_Entry_Warning", "Fresh_Entry_Max", "Pullback_Reentry_Zone",
+                    "Pre_Ignition_Score", "Early_Ignition_Score",
                     "Explosion_Score", "Ignition_Score", "Tape_Burst_Proxy", "Accumulation_Score", "Above_VWAP", "High_to_Current_Drop_%",
                     "Entry_Mode", "Trigger_Price", "Kill_Level", "Position_Risk_Mode", "Reclaim_Entry_Only", "TP0_8pct", "TP15", "TP30", "Emergency_Stop", "Ready_Trigger", "Already_Exploded", "No_Chase_Reason", "Risk_Flags",
                 ]
@@ -7004,6 +7110,7 @@ def render_v20_explosive_runner_tab():
                 early = scored[scored["Stage"].isin(["TRADABLE_SUPERNOVA_READY", "EARLY_IGNITION_READY", "EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
                 pre = scored[scored["Stage"].isin(["PRE_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
                 no_chase = scored[scored["Stage"].astype(str).str.contains("ALREADY_EXPLODED|FAILED_RUNNER", na=False)].copy() if "Stage" in scored.columns else pd.DataFrame()
+                late_entry = scored[scored["Trade_Status"].astype(str).str.contains("LATE_ENTRY", na=False)].copy() if "Trade_Status" in scored.columns else pd.DataFrame()
                 traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE", na=False)].copy()
 
                 st.markdown("### ✅ Paper-Ready Supernova — alınabilir erken süpernova adayı")
@@ -7011,6 +7118,12 @@ def render_v20_explosive_runner_tab():
                     st.info("Paper-ready supernova yok. Bu iyi olabilir; geç kalınmış/bozulmuş hareketleri kovalamıyoruz.")
                 else:
                     st.dataframe(supernova_ready[top_cols].head(50), use_container_width=True)
+
+                st.markdown("### 🟡 Late Entry Guard — iyi hisse ama taze giriş kaçmış olabilir")
+                if late_entry.empty:
+                    st.write("Late-entry uyarısı yok.")
+                else:
+                    st.dataframe(late_entry[top_cols + [c for c in ["Late_Entry_Action", "Data_Status", "Feature_Status"] if c in late_entry.columns]].head(100), use_container_width=True)
 
                 st.markdown("### ⚡ Early Ignition / Ready Trigger — patlamadan önce/erken yakalama")
                 if early.empty:
@@ -7041,7 +7154,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 erken ateşleme skorlarını CSV indir",
                     data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_3_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_4_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_explosive_csv",
                 )
@@ -7116,7 +7229,7 @@ def render_v20_explosive_runner_tab():
                 st.download_button(
                     "📥 v21 Silent accumulation CSV indir",
                     data=acc_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_2_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v21_4_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
                     key="download_v20_acc_csv",
                 )
@@ -7133,7 +7246,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "🌙 Night",
         "🔥 Runner",
         "🐋 v19",
-        "🚀 v21.2 Supernova",
+        "🚀 v21.4 Supernova",
     ]
 )
 
