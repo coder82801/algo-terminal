@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v21.4 (Late Entry Guard + VIVO Pattern + Target Cleanup)")
-st.sidebar.success("v21.4 build aktif — Late Entry Guard + VIVO Pattern aktif")
+st.title("🎯 NextDay Scanner Pro v22 (Risk Engine + Performance Tracker + Readiness Gate)")
+st.sidebar.success("v22 build aktif — Risk Engine + Performance Tracker + Readiness Gate aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -232,6 +232,460 @@ def microcap_trap_guard(
         "market_cap_bucket": bucket,
         "china_hk_risk": bool(china_hk_risk),
     }
+
+
+# ============================================================
+# v22 RISK ENGINE + PERFORMANCE TRACKER + REAL-MONEY READINESS
+# ============================================================
+V22_MAX_SPREAD_PCT = 1.50
+V22_MAX_MICROCAP_SPREAD_PCT = 1.00
+V22_MIN_DOLLAR_VOLUME_NEXTDAY = 3_000_000
+V22_MIN_DOLLAR_VOLUME_SUPERNOVA = 3_000_000
+V22_IDEAL_DOLLAR_VOLUME_SUPERNOVA = 5_000_000
+V22_MIN_TP15_R_MULTIPLE = 1.50
+V22_MAX_STOP_DISTANCE_PCT = 8.0
+V22_FULL_REAL_MONEY_SIGNAL_COUNT = 100
+V22_MICRO_REAL_TEST_SIGNAL_COUNT = 30
+
+
+def v22_price_round(price: float) -> int:
+    price = safe_float(price, np.nan)
+    if pd.isna(price):
+        return 4
+    if price < 1:
+        return 4
+    if price < 10:
+        return 3
+    return 2
+
+
+def v22_pick_first(row: pd.Series | dict, keys: list[str], default=np.nan):
+    for k in keys:
+        try:
+            v = row.get(k, default) if hasattr(row, 'get') else default
+        except Exception:
+            v = default
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        if pd.notna(v):
+            return v
+    return default
+
+
+def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
+    """Farklı modüllerin CSV kolonlarını tek planned_entry/stop yapısına indirger."""
+    symbol = str(v22_pick_first(row, ["Symbol", "symbol", "Ticker", "ticker", "Hisse"], "")).upper().strip()
+    price = safe_float(v22_pick_first(row, ["Price", "Live_Price", "Close", "Current_Price", "Tarama_Fiyatı"], np.nan), np.nan)
+    planned_entry = safe_float(v22_pick_first(row, ["Planned_Entry", "Trigger_Price", "Entry_Idea", "Entry", "Entry_Low", "entry", "Model_Entry"], price), np.nan)
+    stop = safe_float(v22_pick_first(row, ["Stop_Price", "Stop", "Kill_Level", "Emergency_Stop", "Model_Stop"], np.nan), np.nan)
+    if pd.notna(planned_entry) and pd.isna(stop):
+        stop = planned_entry * 0.93
+    if pd.notna(planned_entry) and pd.notna(stop) and stop >= planned_entry:
+        stop = planned_entry * 0.95
+    market_cap = safe_float(v22_pick_first(row, ["MarketCap", "market_cap", "MarketCap_M"], np.nan), np.nan)
+    if pd.notna(market_cap) and market_cap < 1_000_000 and str(v22_pick_first(row, ["MarketCap_M"], "")) != "":
+        market_cap = market_cap * 1_000_000
+    float_shares = safe_float(v22_pick_first(row, ["Float", "float_shares", "Float_M"], np.nan), np.nan)
+    if pd.notna(float_shares) and float_shares < 1_000_000 and str(v22_pick_first(row, ["Float_M"], "")) != "":
+        float_shares = float_shares * 1_000_000
+    volume = safe_float(v22_pick_first(row, ["Live_Volume", "Volume", "volume", "Last_Volume"], np.nan), np.nan)
+    dollar_volume_m = safe_float(v22_pick_first(row, ["Dollar_Volume_M", "DollarVolume_M"], np.nan), np.nan)
+    if pd.notna(dollar_volume_m):
+        dollar_volume = dollar_volume_m * 1_000_000
+    elif pd.notna(volume) and pd.notna(price):
+        dollar_volume = volume * price
+    else:
+        dollar_volume = np.nan
+    change_pct = safe_float(v22_pick_first(row, ["Change_%", "Live_Change_%", "change_pct", "Expected_Target_%"], np.nan), np.nan)
+    high_drop = safe_float(v22_pick_first(row, ["High_to_Current_Drop_%", "High_to_Current_Drop", "Price_to_High_%"], np.nan), np.nan)
+    range_position = safe_float(v22_pick_first(row, ["Range_Position", "active_range_position"], np.nan), np.nan)
+    above_vwap_val = v22_pick_first(row, ["Above_VWAP", "Above_Active_VWAP", "above_vwap"], np.nan)
+    if isinstance(above_vwap_val, str):
+        above_vwap = above_vwap_val.strip().lower() in ["true", "1", "yes", "evet"]
+    elif pd.isna(above_vwap_val):
+        above_vwap = False
+    else:
+        above_vwap = bool(above_vwap_val)
+    active_vwap = safe_float(v22_pick_first(row, ["Active_VWAP", "VWAP_Regular", "VWAP"], np.nan), np.nan)
+    tape_proxy = safe_float(v22_pick_first(row, ["Tape_Burst_Proxy", "Whale_Footprint_Score", "Whale_Proxy"], np.nan), np.nan)
+    rvol = safe_float(v22_pick_first(row, ["RVOL", "tv_rvol", "TV_RVOL", "Session_RVOL"], np.nan), np.nan)
+    signal = str(v22_pick_first(row, ["Signal", "Trade_Readiness", "Night_Entry_Signal", "Category"], "UNKNOWN"))
+    return {
+        "Symbol": symbol,
+        "Company": str(v22_pick_first(row, ["Company", "Description", "description"], "")),
+        "Signal_Type": signal,
+        "Current_Price": price,
+        "Planned_Entry": planned_entry,
+        "Stop": stop,
+        "MarketCap": market_cap,
+        "Float": float_shares,
+        "Volume": volume,
+        "Dollar_Volume": dollar_volume,
+        "Change_%": change_pct,
+        "High_to_Current_Drop_%": high_drop,
+        "Range_Position": range_position,
+        "Above_VWAP": above_vwap,
+        "Active_VWAP": active_vwap,
+        "Tape_Burst_Proxy": tape_proxy,
+        "RVOL": rvol,
+    }
+
+
+def v22_standard_targets(planned_entry: float, stop: float) -> dict:
+    planned_entry = safe_float(planned_entry, np.nan)
+    stop = safe_float(stop, np.nan)
+    if pd.isna(planned_entry) or planned_entry <= 0 or pd.isna(stop) or stop <= 0 or stop >= planned_entry:
+        return {"R": np.nan, "Stop_Distance_%": np.nan, "TP0": np.nan, "TP1": np.nan, "TP15": np.nan, "Runner_TP20": np.nan, "Runner_TP30": np.nan, "TP15_R_Multiple": np.nan}
+    r = planned_entry - stop
+    rnd = v22_price_round(planned_entry)
+    tp0 = max(planned_entry + 0.5 * r, planned_entry * 1.03)
+    tp1 = planned_entry + 1.0 * r
+    tp15 = planned_entry * 1.15
+    runner20 = planned_entry * 1.20
+    runner30 = planned_entry * 1.30
+    return {
+        "R": round(r, rnd),
+        "Stop_Distance_%": round((r / planned_entry) * 100, 2),
+        "TP0": round(tp0, rnd),
+        "TP1": round(tp1, rnd),
+        "TP15": round(tp15, rnd),
+        "Runner_TP20": round(runner20, rnd),
+        "Runner_TP30": round(runner30, rnd),
+        "TP15_R_Multiple": round((tp15 - planned_entry) / r, 2) if r > 0 else np.nan,
+    }
+
+
+def v22_late_entry_guard(current_price: float, trigger_price: float, tp0: float = np.nan) -> dict:
+    current_price = safe_float(current_price, np.nan)
+    trigger_price = safe_float(trigger_price, np.nan)
+    tp0 = safe_float(tp0, np.nan)
+    if pd.isna(current_price) or pd.isna(trigger_price) or trigger_price <= 0:
+        return {"Late_Entry_%": np.nan, "Late_Entry_Decision": "UNKNOWN", "Late_Entry_Reason": "price/trigger unknown"}
+    late_pct = (current_price - trigger_price) / trigger_price * 100.0
+    tp0_hit = pd.notna(tp0) and current_price >= tp0
+    if late_pct >= 10 or (late_pct >= 8) or tp0_hit:
+        decision = "NO_FRESH_BUY"
+        reason = ">=8-10% late or TP0 already reached; wait pullback/reclaim"
+    elif late_pct >= 5:
+        decision = "PULLBACK_ONLY"
+        reason = ">=5% late; no market chase"
+    elif late_pct >= 3:
+        decision = "SOFT_PENALTY"
+        reason = "3-5% late; smaller risk / hold confirmation required"
+    else:
+        decision = "FRESH_ENTRY_OK"
+        reason = "near trigger"
+    return {"Late_Entry_%": round(late_pct, 2), "Late_Entry_Decision": decision, "Late_Entry_Reason": reason}
+
+
+def v22_fetch_latest_quote(symbol: str, api_key_value: str = "", secret_key_value: str = "") -> dict:
+    """Alpaca latest quote. Quote yoksa gerçek para iznini kapatmak için UNKNOWN döndürür."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol or not api_key_value or not secret_key_value:
+        return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": "QUOTE_UNKNOWN"}
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest"
+        resp = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params={"feed": os.getenv("ALPACA_FEED", "iex")}, timeout=6)
+        if resp.status_code != 200:
+            return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": f"QUOTE_ERROR_{resp.status_code}"}
+        q = resp.json().get("quote", {})
+        bid = safe_float(q.get("bp"), np.nan)
+        ask = safe_float(q.get("ap"), np.nan)
+        if pd.notna(bid) and pd.notna(ask) and ask > 0:
+            spread_pct = (ask - bid) / ask * 100.0
+            return {"Bid": bid, "Ask": ask, "Spread_%": round(spread_pct, 3), "Quote_Status": "QUOTE_OK"}
+        return {"Bid": bid, "Ask": ask, "Spread_%": np.nan, "Quote_Status": "QUOTE_EMPTY"}
+    except Exception as exc:
+        return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": f"QUOTE_EXCEPTION: {str(exc)[:40]}"}
+
+
+def v22_factor_score(norm: dict, quote: dict | None = None) -> dict:
+    quote = quote or {"Spread_%": np.nan, "Quote_Status": "QUOTE_UNKNOWN"}
+    price = norm["Current_Price"] if pd.notna(norm["Current_Price"]) else norm["Planned_Entry"]
+    guard = microcap_trap_guard(
+        symbol=norm["Symbol"],
+        description=norm.get("Company", ""),
+        market_cap=norm["MarketCap"],
+        price=price,
+        price_to_high_pct=norm["High_to_Current_Drop_%"],
+        below_vwap=not bool(norm["Above_VWAP"]),
+        change_pct=norm["Change_%"],
+    )
+    targets = v22_standard_targets(norm["Planned_Entry"], norm["Stop"])
+    late = v22_late_entry_guard(norm["Current_Price"], norm["Planned_Entry"], targets.get("TP0", np.nan))
+
+    dollar_volume = norm["Dollar_Volume"]
+    rvol = norm["RVOL"]
+    tape = norm["Tape_Burst_Proxy"]
+    range_pos = norm["Range_Position"]
+    high_drop = norm["High_to_Current_Drop_%"]
+    spread_pct = safe_float(quote.get("Spread_%"), np.nan)
+    quote_status = quote.get("Quote_Status", "QUOTE_UNKNOWN")
+
+    trend = 0.35
+    if norm["Above_VWAP"]:
+        trend += 0.30
+    if pd.notna(range_pos):
+        trend += max(0, min(0.25, range_pos * 0.25))
+    if pd.notna(tape):
+        trend += max(0, min(0.10, tape / 100 * 0.10))
+    trend = min(1.0, trend)
+
+    liquidity = 0.15
+    if pd.notna(dollar_volume):
+        if dollar_volume >= 10_000_000: liquidity = 1.0
+        elif dollar_volume >= 5_000_000: liquidity = 0.80
+        elif dollar_volume >= 3_000_000: liquidity = 0.62
+        elif dollar_volume >= 1_000_000: liquidity = 0.35
+        else: liquidity = 0.12
+    if pd.notna(rvol):
+        liquidity = max(liquidity, min(1.0, rvol / 6.0))
+
+    vwap_quality = 1.0 if norm["Above_VWAP"] else 0.25
+    if pd.notna(norm["Active_VWAP"]) and pd.notna(price) and norm["Active_VWAP"] > 0:
+        dist_vwap = (price - norm["Active_VWAP"]) / norm["Active_VWAP"] * 100.0
+        if dist_vwap > 15: vwap_quality *= 0.35
+        elif dist_vwap > 10: vwap_quality *= 0.55
+        elif dist_vwap > 5: vwap_quality *= 0.78
+
+    extension = 1.0
+    if pd.notna(norm["Change_%"]):
+        chg = norm["Change_%"]
+        if chg >= 150: extension *= 0.05
+        elif chg >= 100: extension *= 0.15
+        elif chg >= 95: extension *= 0.30
+        elif chg >= 60: extension *= 0.60
+    if pd.notna(high_drop):
+        if high_drop <= -25: extension *= 0.10
+        elif high_drop <= -10: extension *= 0.45
+        elif high_drop <= -5: extension *= 0.70
+
+    trap = 1.0
+    if guard["decision"] == "HARD_REJECT": trap = 0.0
+    elif guard["decision"] == "LAB_ONLY": trap = 0.35
+    elif guard["decision"] == "STRICT_REVIEW": trap = 0.60
+    if pd.isna(norm["MarketCap"]):
+        trap *= 0.60
+
+    execution = 0.55
+    if quote_status == "QUOTE_OK" and pd.notna(spread_pct):
+        execution = 1.0
+        max_spread = V22_MAX_MICROCAP_SPREAD_PCT if guard["decision"] in ["LAB_ONLY", "STRICT_REVIEW"] else V22_MAX_SPREAD_PCT
+        if spread_pct > max_spread:
+            execution = 0.0
+        elif spread_pct > max_spread * 0.65:
+            execution = 0.55
+    # quote bilinmiyorsa paper olabilir ama gerçek para kapalı kalır.
+
+    if late["Late_Entry_Decision"] == "NO_FRESH_BUY": execution *= 0.10
+    elif late["Late_Entry_Decision"] == "PULLBACK_ONLY": execution *= 0.45
+    elif late["Late_Entry_Decision"] == "SOFT_PENALTY": execution *= 0.75
+
+    final_score = round(float(100 * trend * liquidity * vwap_quality * extension * trap * execution), 1)
+
+    blocks = []
+    if guard["decision"] == "HARD_REJECT": blocks.append("Microcap/Trap hard reject")
+    if quote_status != "QUOTE_OK": blocks.append("Bid/Ask bilinmiyor: gerçek para kapalı")
+    if quote_status == "QUOTE_OK" and pd.notna(spread_pct) and spread_pct > V22_MAX_SPREAD_PCT: blocks.append("Spread geniş")
+    if pd.notna(targets.get("Stop_Distance_%")) and targets["Stop_Distance_%"] > V22_MAX_STOP_DISTANCE_PCT: blocks.append("Stop distance >8%")
+    if pd.notna(targets.get("TP15_R_Multiple")) and targets["TP15_R_Multiple"] < V22_MIN_TP15_R_MULTIPLE: blocks.append("TP15_R <1.5")
+    if late["Late_Entry_Decision"] in ["NO_FRESH_BUY", "PULLBACK_ONLY"]: blocks.append(late["Late_Entry_Decision"])
+    if pd.notna(dollar_volume) and dollar_volume < 1_000_000: blocks.append("Dollar volume çok zayıf")
+    if pd.isna(norm["MarketCap"]): blocks.append("MarketCap bilinmiyor")
+
+    if guard["decision"] == "HARD_REJECT" or "Spread geniş" in blocks or "Stop distance >8%" in blocks:
+        decision = "NO_TRADE"
+    elif final_score >= 45 and late["Late_Entry_Decision"] == "FRESH_ENTRY_OK" and guard["decision"] == "PASS":
+        decision = "PAPER_READY_RISK_CHECKED"
+    elif final_score >= 25:
+        decision = "WATCH_OR_PULLBACK_ONLY"
+    else:
+        decision = "NO_TRADE_OR_LOW_QUALITY"
+
+    real_ready = False
+    if decision == "PAPER_READY_RISK_CHECKED" and quote_status == "QUOTE_OK" and not blocks:
+        real_label = "PAPER_ONLY_UNTIL_TRACKER_PROVES"
+    else:
+        real_label = "REAL_MONEY_NOT_ALLOWED"
+
+    return {
+        **norm,
+        **targets,
+        **late,
+        "Bid": quote.get("Bid", np.nan),
+        "Ask": quote.get("Ask", np.nan),
+        "Spread_%": spread_pct,
+        "Quote_Status": quote_status,
+        "Microcap_Guard": guard["decision"],
+        "Microcap_Reasons": guard["reason_text"],
+        "Trend_Factor": round(trend, 3),
+        "Liquidity_Factor": round(liquidity, 3),
+        "VWAP_Quality_Factor": round(vwap_quality, 3),
+        "Extension_Risk_Factor": round(extension, 3),
+        "Trap_Risk_Factor": round(trap, 3),
+        "Execution_Factor": round(execution, 3),
+        "Factor_Final_Score": final_score,
+        "Risk_Engine_Decision": decision,
+        "Real_Money_Readiness": real_label,
+        "Real_Money_Allowed": bool(real_ready),
+        "Risk_Blocks": "; ".join(blocks) if blocks else "Paper-ready; tracker sonucu beklenir",
+        "Proxy_Disclaimer": "Whale/Tape/Absorption alanları gerçek order-flow değil, OHLCV proxy'sidir.",
+    }
+
+
+def v22_apply_risk_engine(df: pd.DataFrame, quote_check: bool = False, max_quote_rows: int = 20, api_key_value: str = "", secret_key_value: str = "") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = []
+    for i, (_, r) in enumerate(df.iterrows()):
+        norm = v22_normalize_signal_row(r)
+        quote = None
+        if quote_check and i < int(max_quote_rows) and norm["Symbol"]:
+            quote = v22_fetch_latest_quote(norm["Symbol"], api_key_value, secret_key_value)
+        out.append(v22_factor_score(norm, quote=quote))
+    res = pd.DataFrame(out)
+    if not res.empty and "Factor_Final_Score" in res.columns:
+        res = res.sort_values(["Risk_Engine_Decision", "Factor_Final_Score"], ascending=[True, False]).reset_index(drop=True)
+    return res
+
+
+def v22_paper_template() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "Signal_ID", "Model_Version", "Signal_Date", "Symbol", "Signal_Type", "Session",
+        "Planned_Entry", "Actual_Entry", "Stop", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30",
+        "Max_High_After_Entry", "Min_Low_After_Entry", "Exit_Price", "Exit_Reason",
+        "Estimated_Slippage_%", "Time_To_TP0_Min", "Time_To_TP15_Min", "Time_To_Stop_Min", "Notes",
+    ])
+
+
+def v22_evaluate_paper_log(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if log_df is None or log_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    df = log_df.copy()
+    def col(name, fallback=np.nan):
+        return df[name] if name in df.columns else fallback
+    entry = pd.to_numeric(col("Actual_Entry", col("Planned_Entry")), errors="coerce")
+    stop = pd.to_numeric(col("Stop"), errors="coerce")
+    high = pd.to_numeric(col("Max_High_After_Entry"), errors="coerce")
+    low = pd.to_numeric(col("Min_Low_After_Entry"), errors="coerce")
+    exit_price = pd.to_numeric(col("Exit_Price", np.nan), errors="coerce")
+    tp0 = pd.to_numeric(col("TP0", np.nan), errors="coerce")
+    tp1 = pd.to_numeric(col("TP1", np.nan), errors="coerce")
+    tp15 = pd.to_numeric(col("TP15", np.nan), errors="coerce")
+    risk = (entry - stop).replace(0, np.nan)
+    df["MFE_%"] = ((high - entry) / entry * 100).round(2)
+    df["MAE_%"] = ((low - entry) / entry * 100).round(2)
+    df["TP0_Hit"] = high >= tp0
+    df["TP1_Hit"] = high >= tp1
+    df["TP15_Hit"] = high >= tp15
+    df["Stop_Hit"] = low <= stop
+    df["Outcome_R"] = ((exit_price.fillna(entry) - entry) / risk).round(3)
+    df.loc[df["Stop_Hit"] & exit_price.isna(), "Outcome_R"] = -1.0
+    df.loc[df["TP15_Hit"] & exit_price.isna(), "Outcome_R"] = ((tp15 - entry) / risk).round(3)
+    df.loc[(df["TP0_Hit"]) & (~df["TP15_Hit"]) & exit_price.isna(), "Outcome_R"] = ((tp0 - entry) / risk).round(3)
+    valid = df[pd.notna(entry) & pd.notna(risk)].copy()
+    n = len(valid)
+    if n == 0:
+        summary = pd.DataFrame([{"Metric": "Valid Trades", "Value": 0}])
+        return df, summary
+    gross_profit = valid.loc[valid["Outcome_R"] > 0, "Outcome_R"].sum()
+    gross_loss = valid.loc[valid["Outcome_R"] < 0, "Outcome_R"].sum()
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else np.inf
+    equity = valid["Outcome_R"].fillna(0).cumsum()
+    roll_max = equity.cummax()
+    dd = equity - roll_max
+    max_dd = dd.min() if not dd.empty else 0
+    summary_rows = [
+        {"Metric": "Valid Trades", "Value": n},
+        {"Metric": "TP0 Hit Rate", "Value": round(valid["TP0_Hit"].mean() * 100, 2)},
+        {"Metric": "TP1 Hit Rate", "Value": round(valid["TP1_Hit"].mean() * 100, 2)},
+        {"Metric": "TP15 Hit Rate", "Value": round(valid["TP15_Hit"].mean() * 100, 2)},
+        {"Metric": "Stop Hit Rate", "Value": round(valid["Stop_Hit"].mean() * 100, 2)},
+        {"Metric": "Average MFE_%", "Value": round(valid["MFE_%"].mean(), 2)},
+        {"Metric": "Average MAE_%", "Value": round(valid["MAE_%"].mean(), 2)},
+        {"Metric": "Expectancy_R", "Value": round(valid["Outcome_R"].mean(), 3)},
+        {"Metric": "Profit Factor", "Value": round(profit_factor, 3) if np.isfinite(profit_factor) else "inf"},
+        {"Metric": "Max Drawdown_R", "Value": round(max_dd, 3)},
+    ]
+    ready = bool(n >= V22_MICRO_REAL_TEST_SIGNAL_COUNT and valid["Outcome_R"].mean() > 0.20 and (profit_factor > 1.3 or np.isinf(profit_factor)) and max_dd > -8)
+    summary_rows.append({"Metric": "Micro Real Test Readiness", "Value": "YES_TINY_TEST" if ready else "NO_CONTINUE_PAPER"})
+    return df, pd.DataFrame(summary_rows)
+
+
+def render_v22_risk_tracker_tab():
+    st.subheader("🛡️ v22 Risk Engine + Performance Tracker + Real-Money Readiness Gate")
+    st.warning(
+        "Bu sekme alım motoru değildir. Next Day / Night / Supernova çıktısını gerçek para öncesi risk, execution ve performans açısından denetler. "
+        "Bid/Ask bilinmiyorsa gerçek para izni kapalı kalır. Whale/Tape/Absorption alanları OHLCV proxy'sidir."
+    )
+
+    st.markdown("### 1) Tarama CSV'sini v22 Risk Engine ile denetle")
+    scan_file = st.file_uploader("NextDay / Night / Supernova CSV yükle", type=["csv"], key="v22_scan_upload")
+    col_q1, col_q2 = st.columns(2)
+    with col_q1:
+        quote_check = st.checkbox("İlk satırlar için Alpaca bid/ask spread kontrolü yap", value=False, key="v22_quote_check")
+    with col_q2:
+        max_quote_rows = st.slider("Quote kontrol max satır", 5, 50, 20, 5, key="v22_quote_rows")
+
+    if scan_file is not None:
+        try:
+            scan_df = pd.read_csv(scan_file)
+            st.caption(f"Yüklenen satır: {len(scan_df)}")
+            risk_df = v22_apply_risk_engine(scan_df, quote_check=quote_check, max_quote_rows=max_quote_rows, api_key_value=api_key, secret_key_value=secret_key)
+            if risk_df.empty:
+                st.warning("Risk Engine çıktı üretmedi.")
+            else:
+                primary_cols = [
+                    "Symbol", "Signal_Type", "Risk_Engine_Decision", "Real_Money_Readiness", "Factor_Final_Score",
+                    "Current_Price", "Planned_Entry", "Stop", "Stop_Distance_%", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30", "TP15_R_Multiple",
+                    "Late_Entry_%", "Late_Entry_Decision", "Microcap_Guard", "Dollar_Volume", "RVOL", "Spread_%", "Quote_Status", "Risk_Blocks",
+                ]
+                show_cols = [c for c in primary_cols if c in risk_df.columns]
+                st.dataframe(risk_df[show_cols], use_container_width=True)
+                st.download_button(
+                    "📥 v22 risk denetimli CSV indir",
+                    data=risk_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"v22_risk_checked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_v22_risk_checked",
+                )
+        except Exception as exc:
+            st.error(f"v22 risk engine CSV okuma/denetim hatası: {exc}")
+
+    st.divider()
+    st.markdown("### 2) Paper Performance Tracker")
+    st.caption("Paper log yükle; MFE, MAE, TP hit rate, stop hit rate, expectancy_R, profit factor ve max drawdown hesaplanır.")
+    template = v22_paper_template()
+    st.download_button(
+        "📥 Paper log şablonu indir",
+        data=template.to_csv(index=False).encode("utf-8-sig"),
+        file_name="paper_log_template_v22.csv",
+        mime="text/csv",
+        key="download_v22_paper_template",
+    )
+    log_file = st.file_uploader("paper_log.csv yükle", type=["csv"], key="v22_paper_log_upload")
+    if log_file is not None:
+        try:
+            log_df = pd.read_csv(log_file)
+            evaluated, summary = v22_evaluate_paper_log(log_df)
+            st.markdown("#### Performans özeti")
+            st.dataframe(summary, use_container_width=True)
+            st.markdown("#### İşlem bazlı outcome")
+            st.dataframe(evaluated, use_container_width=True)
+            st.download_button(
+                "📥 Değerlendirilmiş paper log indir",
+                data=evaluated.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"paper_log_evaluated_v22_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_v22_paper_evaluated",
+            )
+        except Exception as exc:
+            st.error(f"Paper log değerlendirme hatası: {exc}")
+
+    st.info(
+        "Gerçek para kapısı: en az 30 geçerli paper fill + pozitif expectancy_R + profit factor >1.3 + kontrollü drawdown olmadan mikro gerçek test yok. "
+        "Tam ölçekli gerçek para için strateji başına 100-200 doğrulanmış fill gerekir."
+    )
 
 
 def get_api(api_key_value, secret_key_value):
@@ -1353,6 +1807,22 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
 
             close_above_vwap = last_close > regular_vwap
 
+            # v22: Microcap Trap Guard artık Next Day / Swing tarafında da zorunlu.
+            tv_market_cap = safe_float(row.get("tv_market_cap", np.nan), np.nan)
+            day_high_drop_pct = ((last_close - last_high) / last_high * 100.0) if last_high and last_high > 0 else np.nan
+            swing_micro_guard = microcap_trap_guard(
+                symbol=symbol,
+                description=description,
+                market_cap=tv_market_cap,
+                price=last_close,
+                price_to_high_pct=day_high_drop_pct,
+                below_vwap=not bool(close_above_vwap),
+                change_pct=((last_close - prev_close) / prev_close * 100.0) if prev_close and prev_close > 0 else np.nan,
+            )
+            if swing_micro_guard["decision"] == "HARD_REJECT":
+                rejected_log.append({"Hisse": symbol, "Neden": f"Microcap hard reject: {swing_micro_guard['reason_text']}"})
+                continue
+
             score = 0
             notes = []
 
@@ -1597,11 +2067,22 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     trade_readiness = "WAIT_CONFIRM"
                     readiness_reason = "Entry dokunuşu yeterli değil; TP0/0.5R follow-through bekle"
 
+                if swing_micro_guard["decision"] == "LAB_ONLY":
+                    trade_readiness = "LAB_ONLY_NO_MAIN_TRADE"
+                    readiness_reason = "MarketCap 50-100M / microcap risk: sadece lab-paper; ana trade yok"
+                elif swing_micro_guard["decision"] == "STRICT_REVIEW":
+                    trade_readiness = "STRICT_REVIEW_PAPER_ONLY"
+                    readiness_reason = "MarketCap 100-300M: sıkı teyit ve paper-only"
+
                 final_candidates.append(
                     {
                         "Symbol": symbol,
                         "Yahoo_Symbol": yahoo_symbol,
                         "Description": description,
+                        "MarketCap_M": round(tv_market_cap / 1_000_000, 2) if pd.notna(tv_market_cap) else np.nan,
+                        "MarketCap_Bucket": swing_micro_guard["market_cap_bucket"],
+                        "Microcap_Guard": swing_micro_guard["decision"],
+                        "Microcap_Reasons": swing_micro_guard["reason_text"],
                         "Category": category,
                         "Move_Type": move_type,
                         "Entry_Type": entry_type,
@@ -6492,10 +6973,10 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         + (6.0 if above_vwap else 0.0)
     ))), 1)
 
-    already_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 150)
+    already_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 100)
     extreme_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 300)
-    early_window = bool(pd.notna(live_change_pct) and 5.0 <= live_change_pct <= 90.0)
-    ideal_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 80.0)
+    early_window = bool(pd.notna(live_change_pct) and 5.0 <= live_change_pct <= 80.0)
+    ideal_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 60.0)
     high_fade_bad = bool(pd.notna(high_drop) and high_drop <= -25.0)
     high_fade_failed = bool(pd.notna(high_drop) and high_drop <= -35.0)
     no_chase_reason = []
@@ -6518,12 +6999,12 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     # Amaç: TDIC'i 20$'da kovalamak değil; KULR/TDIC erken evresi gibi
     # +8/+20/+40 bölgesinde, VWAP üstü, tepeye yakın ve hacim/tape akışı güçlü olanları
     # PAPER_READY_SUPERNOVA olarak ayırmak.
-    supernova_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 95.0)
+    supernova_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 60.0)
     supernova_not_chase = bool(not already_exploded and not high_fade_bad)
     supernova_near_high_ok = bool((pd.isna(high_drop) or high_drop >= -8.0) and (pd.isna(range_pos) or range_pos >= 0.72))
     supernova_liquidity_ok = bool(
         (pd.notna(live_volume) and live_volume >= 100_000)
-        and (pd.notna(dollar_volume) and dollar_volume >= 1_000_000)
+        and (pd.notna(dollar_volume) and dollar_volume >= 3_000_000)
     )
     supernova_guard_ok = guard["decision"] in ["PASS", "STRICT_REVIEW", "LAB_ONLY"]
     supernova_hard_block = bool(guard["decision"] == "HARD_REJECT" or high_fade_failed or not above_vwap)
@@ -7237,7 +7718,7 @@ def render_v20_explosive_runner_tab():
 # ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     [
         "⚡ Radar",
         "🧠 Intraday",
@@ -7247,6 +7728,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         "🔥 Runner",
         "🐋 v19",
         "🚀 v21.4 Supernova",
+        "🛡️ v22 Risk",
     ]
 )
 
@@ -8443,6 +8925,13 @@ with tab7:
 # ============================================================
 with tab8:
     render_v20_explosive_runner_tab()
+
+
+# ============================================================
+# TAB 9 - v22 RISK ENGINE / PERFORMANCE TRACKER
+# ============================================================
+with tab9:
+    render_v22_risk_tracker_tab()
 
 st.write("---")
 st.caption(
