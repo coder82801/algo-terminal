@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v22.1 (Semantic Risk Patch + Conservative Tracker)")
+st.title("🎯 NextDay Scanner Pro v22.2 (Slippage-Adjusted Tracker + Ambiguous Bar Audit)")
 st.sidebar.success("v22.1 build aktif — Semantic Risk Patch + Conservative Tracker aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
@@ -246,6 +246,7 @@ V22_MIN_TP15_R_MULTIPLE = 1.50
 V22_MAX_STOP_DISTANCE_PCT = 8.0
 V22_FULL_REAL_MONEY_SIGNAL_COUNT = 100
 V22_MICRO_REAL_TEST_SIGNAL_COUNT = 30
+V22_SLIPPAGE_WARN_PCT = 1.50
 
 
 def v22_price_round(price: float) -> int:
@@ -275,7 +276,7 @@ def v22_pick_first(row: pd.Series | dict, keys: list[str], default=np.nan):
 def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
     """Farklı modüllerin CSV kolonlarını tek planned_entry/stop yapısına indirger.
 
-    v22.1 notları:
+    v22.2 notları:
     - Change_% canlı/gerçekleşmiş değişimdir; Expected_Target_% fallback değildir.
     - MarketCap ve MarketCap_M kaynakları karıştırılmaz; kaynak kolon ayrıca tutulur.
     - Unknown MarketCap/Float gerçek para kapısını kapatan risk kabul edilir.
@@ -538,6 +539,18 @@ def v22_factor_score(norm: dict, quote: dict | None = None) -> dict:
     else:
         real_label = "REAL_MONEY_NOT_ALLOWED"
 
+    # v22.2: teknik sinyal ayrı, execution kalitesi ayrı okunur.
+    if quote_status != "QUOTE_OK":
+        execution_risk_label = "EXECUTION_RISK_UNKNOWN_QUOTE"
+    elif pd.notna(spread_pct) and spread_pct > V22_MAX_SPREAD_PCT:
+        execution_risk_label = "EXECUTION_RISK_SPREAD_TOO_WIDE"
+    elif pd.notna(spread_pct) and spread_pct >= V22_SLIPPAGE_WARN_PCT:
+        execution_risk_label = "PAPER_READY_BUT_EXECUTION_RISK"
+    elif pd.notna(spread_pct) and spread_pct >= 0.75:
+        execution_risk_label = "EXECUTION_RISK_ELEVATED"
+    else:
+        execution_risk_label = "EXECUTION_RISK_OK"
+
     return {
         **norm,
         **targets,
@@ -558,6 +571,7 @@ def v22_factor_score(norm: dict, quote: dict | None = None) -> dict:
         "Risk_Engine_Decision": decision,
         "Real_Money_Readiness": real_label,
         "Real_Money_Allowed": bool(real_ready),
+        "Execution_Risk_Adjusted_Readiness": execution_risk_label,
         "Risk_Blocks": "; ".join(blocks) if blocks else "Paper-ready; tracker sonucu beklenir",
         "Proxy_Disclaimer": "Whale/Tape/Absorption alanları gerçek order-flow değil; OHLCV tabanlı Momentum_Uptick/Tape proxy'sidir.",
     }
@@ -591,70 +605,147 @@ def v22_paper_template() -> pd.DataFrame:
         "Signal_ID", "Model_Version", "Signal_Date", "Symbol", "Signal_Type", "Session",
         "Planned_Entry", "Actual_Entry", "Stop", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30",
         "Max_High_After_Entry", "Min_Low_After_Entry", "Exit_Price", "Exit_Reason",
-        "Estimated_Slippage_%", "Time_To_TP0_Min", "Time_To_TP15_Min", "Time_To_Stop_Min", "Notes",
+        "Estimated_Slippage_%", "Entry_Slippage_%", "Exit_Slippage_%", "Total_Slippage_Cost_%",
+        "Time_To_TP0_Min", "Time_To_TP15_Min", "Time_To_Stop_Min", "Notes",
     ])
 
 
 def v22_evaluate_paper_log(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Paper log outcome evaluator.
+
+    v22.2 notları:
+    - Daily/high-low veride aynı trade içinde hem TP hem stop görülürse sıra bilinmez; defansif olarak stop önce varsayılır.
+    - Gross_Outcome_R ile Net_Outcome_R_After_Slippage ayrılır.
+    - Estimated_Slippage_% tek kolon verildiyse toplam round-trip maliyet kabul edilir.
+      Entry_Slippage_% ve Exit_Slippage_% ayrı verilirse toplam bunlardan hesaplanır.
+    - Real-money readiness sadece net/slippage-adjusted metriklere göre okunur.
+    """
     if log_df is None or log_df.empty:
         return pd.DataFrame(), pd.DataFrame()
+
     df = log_df.copy()
-    def col(name, fallback=np.nan):
-        return df[name] if name in df.columns else fallback
-    entry = pd.to_numeric(col("Actual_Entry", col("Planned_Entry")), errors="coerce")
-    stop = pd.to_numeric(col("Stop"), errors="coerce")
-    high = pd.to_numeric(col("Max_High_After_Entry"), errors="coerce")
-    low = pd.to_numeric(col("Min_Low_After_Entry"), errors="coerce")
-    exit_price = pd.to_numeric(col("Exit_Price", np.nan), errors="coerce")
-    tp0 = pd.to_numeric(col("TP0", np.nan), errors="coerce")
-    tp1 = pd.to_numeric(col("TP1", np.nan), errors="coerce")
-    tp15 = pd.to_numeric(col("TP15", np.nan), errors="coerce")
+
+    def get_series(name, fallback=np.nan):
+        if name in df.columns:
+            return df[name]
+        if isinstance(fallback, pd.Series):
+            return fallback
+        return pd.Series([fallback] * len(df), index=df.index)
+
+    planned_entry = pd.to_numeric(get_series("Planned_Entry"), errors="coerce")
+    actual_entry = pd.to_numeric(get_series("Actual_Entry", planned_entry), errors="coerce")
+    entry = actual_entry.combine_first(planned_entry)
+    stop = pd.to_numeric(get_series("Stop"), errors="coerce")
+    high = pd.to_numeric(get_series("Max_High_After_Entry"), errors="coerce")
+    low = pd.to_numeric(get_series("Min_Low_After_Entry"), errors="coerce")
+    exit_price = pd.to_numeric(get_series("Exit_Price", np.nan), errors="coerce")
+    tp0 = pd.to_numeric(get_series("TP0", np.nan), errors="coerce")
+    tp1 = pd.to_numeric(get_series("TP1", np.nan), errors="coerce")
+    tp15 = pd.to_numeric(get_series("TP15", np.nan), errors="coerce")
+
     risk = (entry - stop).replace(0, np.nan)
+    stop_distance_pct = (risk / entry * 100).replace([np.inf, -np.inf], np.nan)
+
     df["MFE_%"] = ((high - entry) / entry * 100).round(2)
     df["MAE_%"] = ((low - entry) / entry * 100).round(2)
     df["TP0_Hit"] = high >= tp0
     df["TP1_Hit"] = high >= tp1
     df["TP15_Hit"] = high >= tp15
     df["Stop_Hit"] = low <= stop
-    df["Outcome_R"] = ((exit_price.fillna(entry) - entry) / risk).round(3)
+
     no_exit = exit_price.isna()
-    # v22.1 conservative daily-OHLC outcome:
-    # Aynı bar/günde hem TP hem stop görüldüyse sıra bilinmez; gerçek para hazırlığı için stop önce varsayılır.
+    gross_outcome = ((exit_price.fillna(entry) - entry) / risk).replace([np.inf, -np.inf], np.nan)
+
+    # Önce TP'leri yaz; en son stop override yapılır. Böylece günlük OHLC belirsizliğinde stop-first defansif yaklaşım uygulanır.
+    gross_outcome.loc[df["TP0_Hit"] & no_exit] = ((tp0 - entry) / risk).round(3)
+    gross_outcome.loc[df["TP1_Hit"] & no_exit] = ((tp1 - entry) / risk).round(3)
+    gross_outcome.loc[df["TP15_Hit"] & no_exit] = ((tp15 - entry) / risk).round(3)
+
     df["Ambiguous_TP_Stop_Same_Bar"] = no_exit & df["Stop_Hit"] & (df["TP0_Hit"] | df["TP1_Hit"] | df["TP15_Hit"])
-    df.loc[(df["TP0_Hit"]) & (~df["TP15_Hit"]) & no_exit, "Outcome_R"] = ((tp0 - entry) / risk).round(3)
-    df.loc[df["TP15_Hit"] & no_exit, "Outcome_R"] = ((tp15 - entry) / risk).round(3)
-    df.loc[df["Stop_Hit"] & no_exit, "Outcome_R"] = -1.0
-    valid = df[pd.notna(entry) & pd.notna(risk)].copy()
+    gross_outcome.loc[df["Stop_Hit"] & no_exit] = -1.0
+    gross_outcome.loc[no_exit & ~(df["TP0_Hit"] | df["TP1_Hit"] | df["TP15_Hit"] | df["Stop_Hit"])] = 0.0
+
+    df["Gross_Outcome_R"] = gross_outcome.round(3)
+
+    # Slippage / spread maliyeti. Estimated_Slippage_% tek başına verilirse toplam round-trip maliyet sayılır.
+    total_slip_direct = pd.to_numeric(get_series("Total_Slippage_Cost_%", np.nan), errors="coerce")
+    estimated_slip = pd.to_numeric(get_series("Estimated_Slippage_%", 0.0), errors="coerce").fillna(0.0)
+    entry_slip = pd.to_numeric(get_series("Entry_Slippage_%", np.nan), errors="coerce")
+    exit_slip = pd.to_numeric(get_series("Exit_Slippage_%", np.nan), errors="coerce")
+
+    has_split_slip = entry_slip.notna() | exit_slip.notna()
+    split_total = entry_slip.fillna(0.0) + exit_slip.fillna(0.0)
+    total_slip_pct = total_slip_direct.where(total_slip_direct.notna(), split_total.where(has_split_slip, estimated_slip))
+    total_slip_pct = pd.to_numeric(total_slip_pct, errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    df["Total_Slippage_Cost_%"] = total_slip_pct.round(3)
+    df["Entry_Slippage_Cost_$"] = (entry * (total_slip_pct / 2.0) / 100.0).round(4)
+    df["Exit_Slippage_Cost_$"] = (entry * (total_slip_pct / 2.0) / 100.0).round(4)
+    df["Total_Slippage_Cost_$"] = (entry * total_slip_pct / 100.0).round(4)
+    df["Slippage_R_Cost"] = (total_slip_pct / stop_distance_pct).replace([np.inf, -np.inf], np.nan).fillna(0.0).round(3)
+    df["Net_Outcome_R_After_Slippage"] = (df["Gross_Outcome_R"] - df["Slippage_R_Cost"]).round(3)
+    # Backward-compatible ama defansif: ana Outcome_R artık net outcome'dur.
+    df["Outcome_R"] = df["Net_Outcome_R_After_Slippage"]
+
+    df["Execution_Risk_Adjusted_Readiness"] = np.where(
+        df["Total_Slippage_Cost_%"] >= V22_SLIPPAGE_WARN_PCT,
+        "PAPER_READY_BUT_EXECUTION_RISK",
+        "EXECUTION_COST_OK",
+    )
+
+    valid = df[pd.notna(entry) & pd.notna(risk) & (risk > 0)].copy()
     n = len(valid)
     if n == 0:
         summary = pd.DataFrame([{"Metric": "Valid Trades", "Value": 0}])
         return df, summary
-    gross_profit = valid.loc[valid["Outcome_R"] > 0, "Outcome_R"].sum()
-    gross_loss = valid.loc[valid["Outcome_R"] < 0, "Outcome_R"].sum()
-    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else np.inf
-    equity = valid["Outcome_R"].fillna(0).cumsum()
-    roll_max = equity.cummax()
-    dd = equity - roll_max
-    max_dd = dd.min() if not dd.empty else 0
+
+    def _profit_factor(series: pd.Series):
+        gp = series[series > 0].sum()
+        gl = series[series < 0].sum()
+        return gp / abs(gl) if gl < 0 else np.inf
+
+    gross_pf = _profit_factor(valid["Gross_Outcome_R"].fillna(0))
+    net_pf = _profit_factor(valid["Net_Outcome_R_After_Slippage"].fillna(0))
+    equity_net = valid["Net_Outcome_R_After_Slippage"].fillna(0).cumsum()
+    roll_max_net = equity_net.cummax()
+    dd_net = equity_net - roll_max_net
+    max_dd_net = dd_net.min() if not dd_net.empty else 0
+
+    ambiguous_count = int(valid["Ambiguous_TP_Stop_Same_Bar"].sum())
+    ambiguous_rate = round(ambiguous_count / n * 100, 2) if n else 0.0
+
     summary_rows = [
         {"Metric": "Valid Trades", "Value": n},
         {"Metric": "TP0 Hit Rate", "Value": round(valid["TP0_Hit"].mean() * 100, 2)},
         {"Metric": "TP1 Hit Rate", "Value": round(valid["TP1_Hit"].mean() * 100, 2)},
         {"Metric": "TP15 Hit Rate", "Value": round(valid["TP15_Hit"].mean() * 100, 2)},
         {"Metric": "Stop Hit Rate", "Value": round(valid["Stop_Hit"].mean() * 100, 2)},
+        {"Metric": "Ambiguous Bars (Assumed Loss)", "Value": ambiguous_count},
+        {"Metric": "Ambiguous Rate_%", "Value": ambiguous_rate},
         {"Metric": "Average MFE_%", "Value": round(valid["MFE_%"].mean(), 2)},
         {"Metric": "Average MAE_%", "Value": round(valid["MAE_%"].mean(), 2)},
-        {"Metric": "Expectancy_R", "Value": round(valid["Outcome_R"].mean(), 3)},
-        {"Metric": "Profit Factor", "Value": round(profit_factor, 3) if np.isfinite(profit_factor) else "inf"},
-        {"Metric": "Max Drawdown_R", "Value": round(max_dd, 3)},
+        {"Metric": "Average Slippage Cost_%", "Value": round(valid["Total_Slippage_Cost_%"].mean(), 3)},
+        {"Metric": "Gross Expectancy_R", "Value": round(valid["Gross_Outcome_R"].mean(), 3)},
+        {"Metric": "Net Expectancy_R After Slippage", "Value": round(valid["Net_Outcome_R_After_Slippage"].mean(), 3)},
+        {"Metric": "Gross Profit Factor", "Value": round(gross_pf, 3) if np.isfinite(gross_pf) else "inf"},
+        {"Metric": "Net Profit Factor After Slippage", "Value": round(net_pf, 3) if np.isfinite(net_pf) else "inf"},
+        {"Metric": "Max Drawdown_R Net", "Value": round(max_dd_net, 3)},
     ]
-    ready = bool(n >= V22_MICRO_REAL_TEST_SIGNAL_COUNT and valid["Outcome_R"].mean() > 0.20 and (profit_factor > 1.3 or np.isinf(profit_factor)) and max_dd > -8)
+
+    ready = bool(
+        n >= V22_MICRO_REAL_TEST_SIGNAL_COUNT
+        and valid["Net_Outcome_R_After_Slippage"].mean() > 0.20
+        and (net_pf > 1.3 or np.isinf(net_pf))
+        and max_dd_net > -8
+        and ambiguous_rate <= 20
+    )
     summary_rows.append({"Metric": "Micro Real Test Readiness", "Value": "YES_TINY_TEST" if ready else "NO_CONTINUE_PAPER"})
+    summary_rows.append({"Metric": "Readiness Basis", "Value": "NET_SLIPPAGE_ADJUSTED_STOP_FIRST"})
     return df, pd.DataFrame(summary_rows)
 
 
 def render_v22_risk_tracker_tab():
-    st.subheader("🛡️ v22.1 Risk Engine + Conservative Performance Tracker + Real-Money Readiness Gate")
+    st.subheader("🛡️ v22.2 Risk Engine + Slippage-Adjusted Performance Tracker + Real-Money Readiness Gate")
     st.warning(
         "Bu sekme alım motoru değildir. Next Day / Night / Supernova çıktısını gerçek para öncesi risk, execution ve performans açısından denetler. "
         "Bid/Ask bilinmiyorsa gerçek para izni kapalı kalır. Whale/Tape/Absorption alanları OHLCV proxy'sidir."
@@ -679,7 +770,7 @@ def render_v22_risk_tracker_tab():
                 primary_cols = [
                     "Symbol", "Signal_Type", "Risk_Engine_Decision", "Real_Money_Readiness", "Factor_Final_Score",
                     "Current_Price", "Planned_Entry", "Stop", "Stop_Distance_%", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30", "TP15_R_Multiple",
-                    "Late_Entry_%", "Late_Entry_Decision", "Microcap_Guard", "Dollar_Volume", "RVOL", "Spread_%", "Quote_Status", "Risk_Blocks",
+                    "Late_Entry_%", "Late_Entry_Decision", "Microcap_Guard", "Dollar_Volume", "RVOL", "Spread_%", "Quote_Status", "Execution_Risk_Adjusted_Readiness", "Risk_Blocks",
                 ]
                 show_cols = [c for c in primary_cols if c in risk_df.columns]
                 st.dataframe(risk_df[show_cols], use_container_width=True)
@@ -695,12 +786,12 @@ def render_v22_risk_tracker_tab():
 
     st.divider()
     st.markdown("### 2) Paper Performance Tracker")
-    st.caption("Paper log yükle; MFE, MAE, TP hit rate, stop hit rate, expectancy_R, profit factor ve max drawdown hesaplanır.")
+    st.caption("Paper log yükle; MFE, MAE, TP hit rate, stop hit rate, gross/net expectancy_R, slippage-adjusted profit factor, ambiguous bar ve max drawdown hesaplanır.")
     template = v22_paper_template()
     st.download_button(
         "📥 Paper log şablonu indir",
         data=template.to_csv(index=False).encode("utf-8-sig"),
-        file_name="paper_log_template_v22.csv",
+        file_name="paper_log_template_v22_2.csv",
         mime="text/csv",
         key="download_v22_paper_template",
     )
@@ -716,7 +807,7 @@ def render_v22_risk_tracker_tab():
             st.download_button(
                 "📥 Değerlendirilmiş paper log indir",
                 data=evaluated.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"paper_log_evaluated_v22_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"paper_log_evaluated_v22_2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 key="download_v22_paper_evaluated",
             )
