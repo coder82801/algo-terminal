@@ -18,7 +18,7 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v22.2 (Slippage-Adjusted Tracker + Ambiguous Bar Audit)")
+st.title("🎯 NextDay Scanner Pro v22.3 (Actionable Target Floor + Noise-Stop Guard)")
 st.sidebar.success("v22.1 build aktif — Semantic Risk Patch + Conservative Tracker aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
@@ -81,6 +81,13 @@ ENTRY_READY_MIN_BUY_PRESSURE = 0.52
 WEAK_TRIGGER_HIGH_DROP_PCT = -4.0                 # high'dan -%4+ kopma: zayıf tetik riski
 HIGH_FADE_CAUTION_PCT = -12.0                     # high'dan -%12+ kopma: fade riski
 TP0_MIN_QUICK_PROFIT_PCT = 3.0                    # TP0 için min hızlı kâr çıpası
+
+# v22.3 Actionable Target Floor + Too-Tight Stop Guard
+# Amaç: 7.11 -> 7.13 gibi piyasa gürültüsü/spread seviyesindeki "hedefleri" ana hedef gibi göstermemek.
+NEXTDAY_MIN_STOP_DISTANCE_PCT = 2.0       # stop çok dar ise gürültü/spread stopu sayılır; hedef/R hesabı için en az %2 risk tabanı
+NEXTDAY_TOO_TIGHT_STOP_WARN_PCT = 1.0     # bilgilendirici uyarı eşiği
+NEXTDAY_MIN_ACTIONABLE_MOVE_PCT = 3.0     # ana TP0 en az +%3 hareket istemeli
+NEXTDAY_MIN_ACTIONABLE_SCORE = 65.0       # RVOL/VWAP/EMA/RS/OBV gibi matematiksel devam skoru
 
 
 # ============================================================
@@ -383,6 +390,80 @@ def v22_standard_targets(planned_entry: float, stop: float) -> dict:
         "TP15_R_Multiple": round((tp15 - planned_entry) / r, 2) if r > 0 else np.nan,
     }
 
+
+
+def v22_3_min_actionable_move_abs(entry: float) -> float:
+    """Fiyat seviyesine göre en küçük anlamlı mutlak hareket.
+    Bu değer hedef zorlamaz; sadece gürültü/spread kadar küçük hedeflerin ana hedef gibi görünmesini engeller.
+    """
+    entry = safe_float(entry, np.nan)
+    if pd.isna(entry) or entry <= 0:
+        return np.nan
+    if entry < 1:
+        return max(0.03, entry * 0.05)
+    if entry < 10:
+        return 0.15
+    if entry < 25:
+        return 0.25
+    if entry < 100:
+        return 0.50
+    return 1.00
+
+
+def v22_3_actionable_target_floor(entry: float, raw_05r: float, raw_3pct: float) -> dict:
+    """Ana işlem hedefi için minimum anlamlı fiyat hareketini uygular.
+    0.5R seviyesi çok yakınsa yalnızca teknik follow-through metriği olarak kalır; ana TP0 olmaz.
+    """
+    entry = safe_float(entry, np.nan)
+    raw_05r = safe_float(raw_05r, np.nan)
+    raw_3pct = safe_float(raw_3pct, np.nan)
+    if pd.isna(entry) or entry <= 0:
+        return {"Actionable_TP0": np.nan, "Actionable_Move_$": np.nan, "Actionable_Move_%": np.nan,
+                "Min_Actionable_Move_$": np.nan, "Min_Actionable_Move_%": np.nan, "Actionable_Target_OK": False,
+                "Actionable_Target_Reason": "Entry geçersiz"}
+    floor_abs = v22_3_min_actionable_move_abs(entry)
+    floor_pct_price = entry * (1 + NEXTDAY_MIN_ACTIONABLE_MOVE_PCT / 100.0)
+    floor_abs_price = entry + floor_abs
+    candidates = [x for x in [raw_05r, raw_3pct, floor_pct_price, floor_abs_price] if pd.notna(x) and x > entry]
+    target = max(candidates) if candidates else np.nan
+    move_abs = target - entry if pd.notna(target) else np.nan
+    move_pct = (move_abs / entry * 100.0) if pd.notna(move_abs) else np.nan
+    ok = bool(pd.notna(move_abs) and move_abs >= floor_abs and pd.notna(move_pct) and move_pct >= NEXTDAY_MIN_ACTIONABLE_MOVE_PCT)
+    reason = "OK: TP0 anlamlı hareket tabanını geçiyor" if ok else "NO_ACTIONABLE_TARGET: hedef gürültü/spread kadar küçük"
+    return {"Actionable_TP0": round(target, v22_price_round(entry)) if pd.notna(target) else np.nan,
+            "Actionable_Move_$": round(move_abs, 4) if pd.notna(move_abs) else np.nan,
+            "Actionable_Move_%": round(move_pct, 2) if pd.notna(move_pct) else np.nan,
+            "Min_Actionable_Move_$": round(floor_abs, 4) if pd.notna(floor_abs) else np.nan,
+            "Min_Actionable_Move_%": NEXTDAY_MIN_ACTIONABLE_MOVE_PCT,
+            "Actionable_Target_OK": ok,
+            "Actionable_Target_Reason": reason}
+
+
+def v22_3_noise_adjust_stop(entry: float, stop: float) -> dict:
+    """Stop mesafesi aşırı darsa onu piyasa gürültüsü/spread riski kabul eder.
+    Hedef/R hesabı için en az %2 risk tabanı kullanılır; kullanıcıya stopun noise-adjusted olduğu açıkça gösterilir.
+    """
+    entry = safe_float(entry, np.nan)
+    stop = safe_float(stop, np.nan)
+    if pd.isna(entry) or entry <= 0 or pd.isna(stop) or stop <= 0 or stop >= entry:
+        return {"Adjusted_Stop": stop, "Original_Stop_Distance_%": np.nan, "Stop_Adjusted_For_Noise": False,
+                "Too_Tight_Stop_Noise": True, "Stop_Noise_Reason": "Stop geçersiz veya entry üstünde"}
+    dist_pct = (entry - stop) / entry * 100.0
+    too_tight = dist_pct < NEXTDAY_TOO_TIGHT_STOP_WARN_PCT
+    adjusted = stop
+    adjusted_flag = False
+    reason = "OK"
+    if dist_pct < NEXTDAY_MIN_STOP_DISTANCE_PCT:
+        adjusted = entry * (1 - NEXTDAY_MIN_STOP_DISTANCE_PCT / 100.0)
+        adjusted_flag = True
+        reason = f"Stop {dist_pct:.2f}%: hedef/R hesabı için %{NEXTDAY_MIN_STOP_DISTANCE_PCT:.1f} noise tabanına genişletildi"
+    elif too_tight:
+        reason = f"Stop {dist_pct:.2f}%: çok dar, noise/spread riski yüksek"
+    return {"Adjusted_Stop": round(adjusted, v22_price_round(entry)),
+            "Original_Stop_Distance_%": round(dist_pct, 2),
+            "Stop_Adjusted_For_Noise": adjusted_flag,
+            "Too_Tight_Stop_Noise": bool(too_tight),
+            "Stop_Noise_Reason": reason}
 
 def v22_late_entry_guard(current_price: float, trigger_price: float, tp0: float = np.nan) -> dict:
     current_price = safe_float(current_price, np.nan)
@@ -1869,6 +1950,7 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
             last_high = float(df["High"].iloc[-1])
             last_low = float(df["Low"].iloc[-1])
             last_volume = float(df["Volume"].iloc[-1])
+            last_dollar_volume = last_close * last_volume if pd.notna(last_close) and pd.notna(last_volume) else np.nan
 
             df = df.copy()
             df["ATR14"] = calc_atr(df, 14)
@@ -1897,6 +1979,10 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
 
             sma50 = df["Close"].rolling(50).mean().iloc[-1]
             sma200 = df["Close"].rolling(200).mean().iloc[-1]
+            ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+            ema20 = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+            ema9_above_ema20 = bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20)
+            close_above_ema9 = bool(pd.notna(ema9) and last_close > ema9)
 
             avg_vol_20 = df["Volume"].rolling(20).mean().iloc[-1]
             rvol20 = last_volume / avg_vol_20 if avg_vol_20 and avg_vol_20 > 0 else np.nan
@@ -2124,24 +2210,29 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     entry_idea = round(last_close, 4)
 
                 if pd.notna(atr14):
-                    stop_price = round(max(entry_idea - 1.2 * atr14, entry_idea * 0.95), 4)
+                    stop_price_raw = round(max(entry_idea - 1.2 * atr14, entry_idea * 0.95), 4)
                 else:
-                    stop_price = round(entry_idea * 0.95, 4)
+                    stop_price_raw = round(entry_idea * 0.95, 4)
 
-                if stop_price >= entry_idea:
-                    stop_price = round(entry_idea * 0.95, 4)
+                if stop_price_raw >= entry_idea:
+                    stop_price_raw = round(entry_idea * 0.95, 4)
 
+                # v22.3: Stop aşırı dar ise 0.5R hedefi gürültü/spread seviyesine düşer.
+                # Bu nedenle hedef/R hesabı için en az %2 noise tabanı uygulanır.
+                stop_noise = v22_3_noise_adjust_stop(entry_idea, stop_price_raw)
+                stop_price = stop_noise["Adjusted_Stop"]
                 stop_limit_price = dynamic_stop_limit(stop_price)
                 risk = max(entry_idea - stop_price, 0.01)
 
-                # v21.4 Target Cleanup + VIVO Pattern:
-                # Next Day tarafında TP2 artık TP15 ile aynı hedefi tekrar etmesin; VIVO/ATRO gibi güçlü follow-through adayları ayrı readiness alsın.
-                # TP0 = hızlı kâr / 0.5R veya %3; TP1 = ara hedef / +%7.5;
-                # TP15 = ana hedef / +%15; Runner hedefleri = +%20 ve +%30.
-                tp0_05r = round(entry_idea + 0.5 * risk, 4)
-                tp0_3pct = round(entry_idea * 1.03, 4)
-                tp0_quick = round(max(tp0_05r, tp0_3pct), 4)
-                tp1 = round(entry_idea * 1.075, 4)
+                # v22.3 Actionable Target Floor:
+                # 7.11 -> 7.13 gibi anlamsız 0.5R seviyeleri ana hedef gibi gösterilmez.
+                raw_05r_level = round(entry_idea + 0.5 * risk, 4)
+                raw_3pct_level = round(entry_idea * 1.03, 4)
+                actionable = v22_3_actionable_target_floor(entry_idea, raw_05r_level, raw_3pct_level)
+                tp0_quick = actionable["Actionable_TP0"]
+                tp0_05r = raw_05r_level
+                tp0_3pct = raw_3pct_level
+                tp1 = round(max(entry_idea + 1.0 * risk, entry_idea * 1.075), 4)
                 tp15 = round(entry_idea * 1.15, 4)
                 runner_tp20 = round(entry_idea * 1.20, 4)
                 runner_tp30 = round(entry_idea * 1.30, 4)
@@ -2189,6 +2280,26 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     vivo_pattern_score += 5
                 vivo_pattern_score = round(float(max(0, min(100, vivo_pattern_score))), 1)
 
+                # v22.3: İşlem yapılabilir hareket skoru. Hedef zorlanmaz; RVOL/VWAP/EMA9-EMA20/RS/OBV gibi
+                # bağımsız metrikler devam ihtimalini matematiksel olarak desteklemiyorsa aday WAIT_CONFIRM'da kalır.
+                actionable_continuation_score = 0.0
+                if pd.notna(rvol20):
+                    if rvol20 >= 5: actionable_continuation_score += 22
+                    elif rvol20 >= 3: actionable_continuation_score += 18
+                    elif rvol20 >= 2: actionable_continuation_score += 12
+                if pd.notna(closing_strength):
+                    if closing_strength >= 0.90: actionable_continuation_score += 18
+                    elif closing_strength >= 0.80: actionable_continuation_score += 13
+                    elif closing_strength >= 0.70: actionable_continuation_score += 8
+                if close_above_vwap: actionable_continuation_score += 14
+                if ema9_above_ema20 and close_above_ema9: actionable_continuation_score += 14
+                elif ema9_above_ema20: actionable_continuation_score += 8
+                if rs_positive: actionable_continuation_score += 10
+                if obv_slope_10 > 0: actionable_continuation_score += 8
+                if move_type in ["SHORT_SQUEEZE", "NEWS_DRIVEN"]: actionable_continuation_score += 8
+                elif move_type == "TECHNICAL_MOMENTUM": actionable_continuation_score += 5
+                actionable_continuation_score = round(float(max(0, min(100, actionable_continuation_score))), 1)
+
                 if vivo_pattern_score >= 85 and confidence >= 75:
                     trade_readiness = "PAPER_READY_AFTER_5MIN_HOLD"
                     readiness_reason = "VIVO pattern güçlü: RS + VWAP + high'a yakın kapanış; yine de 5-15dk hold şart"
@@ -2197,7 +2308,17 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                     readiness_reason = "Güçlü aday ama TP0/follow-through teyidi gelmeden işlem yok"
                 else:
                     trade_readiness = "WAIT_CONFIRM"
-                    readiness_reason = "Entry dokunuşu yeterli değil; TP0/0.5R follow-through bekle"
+                    readiness_reason = "Entry dokunuşu yeterli değil; anlamlı TP0 + hacim/EMA/VWAP follow-through bekle"
+
+                if not actionable.get("Actionable_Target_OK", False):
+                    trade_readiness = "WAIT_CONFIRM_NO_ACTIONABLE_TARGET"
+                    readiness_reason = actionable.get("Actionable_Target_Reason", "Anlamlı minimum hedef yok")
+                elif stop_noise.get("Too_Tight_Stop_Noise", False):
+                    trade_readiness = "WAIT_CONFIRM_TOO_TIGHT_STOP"
+                    readiness_reason = stop_noise.get("Stop_Noise_Reason", "Stop çok dar; spread/noise riski")
+                elif actionable_continuation_score < NEXTDAY_MIN_ACTIONABLE_SCORE:
+                    trade_readiness = "WAIT_CONFIRM_ACTIONABLE_SCORE_LOW"
+                    readiness_reason = f"Anlamlı hedef var ama hacim/VWAP/EMA/RS matematiği zayıf: {actionable_continuation_score:.1f}"
 
                 if swing_micro_guard["decision"] == "LAB_ONLY":
                     trade_readiness = "LAB_ONLY_NO_MAIN_TRADE"
@@ -2231,14 +2352,31 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "Gap_%": round(gap_pct, 2),
                         "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
                         "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
+                        "EMA9": round(ema9, 4 if pd.notna(ema9) and ema9 < 1 else 2) if pd.notna(ema9) else np.nan,
+                        "EMA20": round(ema20, 4 if pd.notna(ema20) and ema20 < 1 else 2) if pd.notna(ema20) else np.nan,
+                        "EMA9_Above_EMA20": bool(ema9_above_ema20),
+                        "Close_Above_EMA9": bool(close_above_ema9),
                         "OBV_Positive": bool(obv_slope_10 > 0),
+                        "Last_Volume": round(last_volume, 0) if pd.notna(last_volume) else np.nan,
+                        "Dollar_Volume_M": round(last_dollar_volume / 1_000_000, 2) if pd.notna(last_dollar_volume) else np.nan,
                         "Entry_Idea": entry_idea,
+                        "Original_Stop_Price": stop_price_raw,
                         "Stop_Price": stop_price,
+                        "Original_Stop_Distance_%": stop_noise.get("Original_Stop_Distance_%"),
+                        "Stop_Adjusted_For_Noise": stop_noise.get("Stop_Adjusted_For_Noise"),
+                        "Too_Tight_Stop_Noise": stop_noise.get("Too_Tight_Stop_Noise"),
+                        "Stop_Noise_Reason": stop_noise.get("Stop_Noise_Reason"),
                         "Stop_Limit_Price": stop_limit_price,
                         "TP0_Quick": tp0_quick,
-                        "TP0_0_5R": tp0_05r,
+                        "Raw_0_5R_Level": tp0_05r,
                         "TP0_Quick_3pct": tp0_3pct,
-                        "Follow_Through_0_5R": tp0_05r,
+                        "Actionable_TP0": actionable.get("Actionable_TP0"),
+                        "Actionable_Move_$": actionable.get("Actionable_Move_$"),
+                        "Actionable_Move_%": actionable.get("Actionable_Move_%"),
+                        "Min_Actionable_Move_$": actionable.get("Min_Actionable_Move_$"),
+                        "Actionable_Target_OK": actionable.get("Actionable_Target_OK"),
+                        "Actionable_Target_Reason": actionable.get("Actionable_Target_Reason"),
+                        "Actionable_Continuation_Score": actionable_continuation_score,
                         "TP1": tp1,
                         "TP15": tp15,
                         "Runner_TP20": runner_tp20,
@@ -2246,8 +2384,8 @@ def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_d
                         "VIVO_Pattern_Score": vivo_pattern_score,
                         "Trade_Readiness": trade_readiness,
                         "Trade_Readiness_Reason": readiness_reason,
-                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + TP0/0.5R follow-through şart",
-                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve TP0/0.5R devam gelmezse işlem yok/çık",
+                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + anlamlı TP0 (min +%3 / min $ hareket) + hacim/EMA/VWAP follow-through şart",
+                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve anlamlı TP0/hacim devamı gelmezse işlem yok/çık",
                         "Score": score,
                         "Notes": ", ".join(notes[:6]),
                     }
@@ -2325,6 +2463,14 @@ def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
         (df["RS_10d_minus_SPY_%"].fillna(-999) > 0) &
         (df["Extension_Above_High_%"].fillna(999) <= 8.0)
     ]
+
+    # v22.3: Top 3'e sadece anlamlı hedefi olan ve stopu piyasa gürültüsü kadar dar olmayan adaylar girsin.
+    if "Actionable_Target_OK" in df.columns:
+        df = df[df["Actionable_Target_OK"] == True]
+    if "Too_Tight_Stop_Noise" in df.columns:
+        df = df[df["Too_Tight_Stop_Noise"] != True]
+    if "Actionable_Continuation_Score" in df.columns:
+        df = df[df["Actionable_Continuation_Score"].fillna(0) >= NEXTDAY_MIN_ACTIONABLE_SCORE]
 
     df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
     df["final_score"] = df["final_score"] + df["stability_bonus"]
