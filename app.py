@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v22 (Risk Engine + Performance Tracker + Readiness Gate)")
-st.sidebar.success("v22 build aktif — Risk Engine + Performance Tracker + Readiness Gate aktif")
+st.title("🎯 NextDay Scanner Pro v22.1 (Semantic Risk Patch + Conservative Tracker)")
+st.sidebar.success("v22.1 build aktif — Semantic Risk Patch + Conservative Tracker aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -273,7 +273,13 @@ def v22_pick_first(row: pd.Series | dict, keys: list[str], default=np.nan):
 
 
 def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
-    """Farklı modüllerin CSV kolonlarını tek planned_entry/stop yapısına indirger."""
+    """Farklı modüllerin CSV kolonlarını tek planned_entry/stop yapısına indirger.
+
+    v22.1 notları:
+    - Change_% canlı/gerçekleşmiş değişimdir; Expected_Target_% fallback değildir.
+    - MarketCap ve MarketCap_M kaynakları karıştırılmaz; kaynak kolon ayrıca tutulur.
+    - Unknown MarketCap/Float gerçek para kapısını kapatan risk kabul edilir.
+    """
     symbol = str(v22_pick_first(row, ["Symbol", "symbol", "Ticker", "ticker", "Hisse"], "")).upper().strip()
     price = safe_float(v22_pick_first(row, ["Price", "Live_Price", "Close", "Current_Price", "Tarama_Fiyatı"], np.nan), np.nan)
     planned_entry = safe_float(v22_pick_first(row, ["Planned_Entry", "Trigger_Price", "Entry_Idea", "Entry", "Entry_Low", "entry", "Model_Entry"], price), np.nan)
@@ -282,12 +288,28 @@ def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
         stop = planned_entry * 0.93
     if pd.notna(planned_entry) and pd.notna(stop) and stop >= planned_entry:
         stop = planned_entry * 0.95
-    market_cap = safe_float(v22_pick_first(row, ["MarketCap", "market_cap", "MarketCap_M"], np.nan), np.nan)
-    if pd.notna(market_cap) and market_cap < 1_000_000 and str(v22_pick_first(row, ["MarketCap_M"], "")) != "":
-        market_cap = market_cap * 1_000_000
-    float_shares = safe_float(v22_pick_first(row, ["Float", "float_shares", "Float_M"], np.nan), np.nan)
-    if pd.notna(float_shares) and float_shares < 1_000_000 and str(v22_pick_first(row, ["Float_M"], "")) != "":
-        float_shares = float_shares * 1_000_000
+
+    # Market cap normalize: absolute MarketCap varsa onu kullan; yoksa MarketCap_M milyon kabul edilir.
+    market_cap_source = "UNKNOWN"
+    market_cap = safe_float(v22_pick_first(row, ["MarketCap", "market_cap"], np.nan), np.nan)
+    if pd.notna(market_cap):
+        market_cap_source = "MarketCap"
+    else:
+        market_cap_m = safe_float(v22_pick_first(row, ["MarketCap_M"], np.nan), np.nan)
+        if pd.notna(market_cap_m):
+            market_cap = market_cap_m * 1_000_000
+            market_cap_source = "MarketCap_M"
+
+    float_source = "UNKNOWN"
+    float_shares = safe_float(v22_pick_first(row, ["Float", "float_shares"], np.nan), np.nan)
+    if pd.notna(float_shares):
+        float_source = "Float"
+    else:
+        float_m = safe_float(v22_pick_first(row, ["Float_M"], np.nan), np.nan)
+        if pd.notna(float_m):
+            float_shares = float_m * 1_000_000
+            float_source = "Float_M"
+
     volume = safe_float(v22_pick_first(row, ["Live_Volume", "Volume", "volume", "Last_Volume"], np.nan), np.nan)
     dollar_volume_m = safe_float(v22_pick_first(row, ["Dollar_Volume_M", "DollarVolume_M"], np.nan), np.nan)
     if pd.notna(dollar_volume_m):
@@ -296,7 +318,10 @@ def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
         dollar_volume = volume * price
     else:
         dollar_volume = np.nan
-    change_pct = safe_float(v22_pick_first(row, ["Change_%", "Live_Change_%", "change_pct", "Expected_Target_%"], np.nan), np.nan)
+
+    # SEMANTIC FIX: Expected_Target_% canlı değişim değildir; fallback listesinden bilerek çıkarıldı.
+    change_pct = safe_float(v22_pick_first(row, ["Change_%", "Live_Change_%", "change_pct", "Regular_Change_%", "Premarket_Change_%", "AfterHours_Change_%"], np.nan), np.nan)
+    expected_target_pct = safe_float(v22_pick_first(row, ["Expected_Target_%", "Expected_Target_Pct"], np.nan), np.nan)
     high_drop = safe_float(v22_pick_first(row, ["High_to_Current_Drop_%", "High_to_Current_Drop", "Price_to_High_%"], np.nan), np.nan)
     range_position = safe_float(v22_pick_first(row, ["Range_Position", "active_range_position"], np.nan), np.nan)
     above_vwap_val = v22_pick_first(row, ["Above_VWAP", "Above_Active_VWAP", "above_vwap"], np.nan)
@@ -307,7 +332,7 @@ def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
     else:
         above_vwap = bool(above_vwap_val)
     active_vwap = safe_float(v22_pick_first(row, ["Active_VWAP", "VWAP_Regular", "VWAP"], np.nan), np.nan)
-    tape_proxy = safe_float(v22_pick_first(row, ["Tape_Burst_Proxy", "Whale_Footprint_Score", "Whale_Proxy"], np.nan), np.nan)
+    tape_proxy = safe_float(v22_pick_first(row, ["Tape_Burst_Proxy", "Whale_Footprint_Score", "Whale_Proxy", "Momentum_Uptick_Pressure"], np.nan), np.nan)
     rvol = safe_float(v22_pick_first(row, ["RVOL", "tv_rvol", "TV_RVOL", "Session_RVOL"], np.nan), np.nan)
     signal = str(v22_pick_first(row, ["Signal", "Trade_Readiness", "Night_Entry_Signal", "Category"], "UNKNOWN"))
     return {
@@ -318,10 +343,13 @@ def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
         "Planned_Entry": planned_entry,
         "Stop": stop,
         "MarketCap": market_cap,
+        "MarketCap_Source": market_cap_source,
         "Float": float_shares,
+        "Float_Source": float_source,
         "Volume": volume,
         "Dollar_Volume": dollar_volume,
         "Change_%": change_pct,
+        "Expected_Target_%": expected_target_pct,
         "High_to_Current_Drop_%": high_drop,
         "Range_Position": range_position,
         "Above_VWAP": above_vwap,
@@ -363,9 +391,11 @@ def v22_late_entry_guard(current_price: float, trigger_price: float, tp0: float 
         return {"Late_Entry_%": np.nan, "Late_Entry_Decision": "UNKNOWN", "Late_Entry_Reason": "price/trigger unknown"}
     late_pct = (current_price - trigger_price) / trigger_price * 100.0
     tp0_hit = pd.notna(tp0) and current_price >= tp0
-    if late_pct >= 10 or (late_pct >= 8) or tp0_hit:
+    # v22.1 ortak geç giriş politikası:
+    # 0-3 fresh, 3-5 soft penalty, 5-8 pullback-only, 8%+ veya TP0 görülmüşse no fresh buy.
+    if late_pct >= 8 or tp0_hit:
         decision = "NO_FRESH_BUY"
-        reason = ">=8-10% late or TP0 already reached; wait pullback/reclaim"
+        reason = ">=8% late or TP0 already reached; wait pullback/reclaim"
     elif late_pct >= 5:
         decision = "PULLBACK_ONLY"
         reason = ">=5% late; no market chase"
@@ -529,7 +559,7 @@ def v22_factor_score(norm: dict, quote: dict | None = None) -> dict:
         "Real_Money_Readiness": real_label,
         "Real_Money_Allowed": bool(real_ready),
         "Risk_Blocks": "; ".join(blocks) if blocks else "Paper-ready; tracker sonucu beklenir",
-        "Proxy_Disclaimer": "Whale/Tape/Absorption alanları gerçek order-flow değil, OHLCV proxy'sidir.",
+        "Proxy_Disclaimer": "Whale/Tape/Absorption alanları gerçek order-flow değil; OHLCV tabanlı Momentum_Uptick/Tape proxy'sidir.",
     }
 
 
@@ -545,7 +575,14 @@ def v22_apply_risk_engine(df: pd.DataFrame, quote_check: bool = False, max_quote
         out.append(v22_factor_score(norm, quote=quote))
     res = pd.DataFrame(out)
     if not res.empty and "Factor_Final_Score" in res.columns:
-        res = res.sort_values(["Risk_Engine_Decision", "Factor_Final_Score"], ascending=[True, False]).reset_index(drop=True)
+        decision_rank = {
+            "PAPER_READY_RISK_CHECKED": 0,
+            "WATCH_OR_PULLBACK_ONLY": 1,
+            "NO_TRADE_OR_LOW_QUALITY": 2,
+            "NO_TRADE": 3,
+        }
+        res["_decision_rank"] = res.get("Risk_Engine_Decision", pd.Series(index=res.index, dtype=object)).map(decision_rank).fillna(9)
+        res = res.sort_values(["_decision_rank", "Factor_Final_Score"], ascending=[True, False]).drop(columns=["_decision_rank"], errors="ignore").reset_index(drop=True)
     return res
 
 
@@ -580,9 +617,13 @@ def v22_evaluate_paper_log(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
     df["TP15_Hit"] = high >= tp15
     df["Stop_Hit"] = low <= stop
     df["Outcome_R"] = ((exit_price.fillna(entry) - entry) / risk).round(3)
-    df.loc[df["Stop_Hit"] & exit_price.isna(), "Outcome_R"] = -1.0
-    df.loc[df["TP15_Hit"] & exit_price.isna(), "Outcome_R"] = ((tp15 - entry) / risk).round(3)
-    df.loc[(df["TP0_Hit"]) & (~df["TP15_Hit"]) & exit_price.isna(), "Outcome_R"] = ((tp0 - entry) / risk).round(3)
+    no_exit = exit_price.isna()
+    # v22.1 conservative daily-OHLC outcome:
+    # Aynı bar/günde hem TP hem stop görüldüyse sıra bilinmez; gerçek para hazırlığı için stop önce varsayılır.
+    df["Ambiguous_TP_Stop_Same_Bar"] = no_exit & df["Stop_Hit"] & (df["TP0_Hit"] | df["TP1_Hit"] | df["TP15_Hit"])
+    df.loc[(df["TP0_Hit"]) & (~df["TP15_Hit"]) & no_exit, "Outcome_R"] = ((tp0 - entry) / risk).round(3)
+    df.loc[df["TP15_Hit"] & no_exit, "Outcome_R"] = ((tp15 - entry) / risk).round(3)
+    df.loc[df["Stop_Hit"] & no_exit, "Outcome_R"] = -1.0
     valid = df[pd.notna(entry) & pd.notna(risk)].copy()
     n = len(valid)
     if n == 0:
@@ -613,7 +654,7 @@ def v22_evaluate_paper_log(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
 
 def render_v22_risk_tracker_tab():
-    st.subheader("🛡️ v22 Risk Engine + Performance Tracker + Real-Money Readiness Gate")
+    st.subheader("🛡️ v22.1 Risk Engine + Conservative Performance Tracker + Real-Money Readiness Gate")
     st.warning(
         "Bu sekme alım motoru değildir. Next Day / Night / Supernova çıktısını gerçek para öncesi risk, execution ve performans açısından denetler. "
         "Bid/Ask bilinmiyorsa gerçek para izni kapalı kalır. Whale/Tape/Absorption alanları OHLCV proxy'sidir."
@@ -3875,11 +3916,17 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     entry_high = entry_low * (1.012 if ah_price < 10 else 1.006)
 
     stop_anchor = ah_vwap if pd.notna(ah_vwap) and ah_vwap > 0 else reg_vwap if pd.notna(reg_vwap) and reg_vwap > 0 else last_close
-    stop_price = min(entry_low * 0.94, stop_anchor - 0.65 * atr14)
+    # v22.1: Long stop için en uzak değil, en yakın makul invalidation tercih edilir.
+    stop_candidates = [entry_low * 0.94]
+    if pd.notna(stop_anchor) and pd.notna(atr14):
+        stop_candidates.append(stop_anchor - 0.65 * atr14)
+    valid_stops = [s for s in stop_candidates if pd.notna(s) and 0 < s < entry_low]
+    stop_price = max(valid_stops) if valid_stops else entry_low * 0.94
     stop_price = max(0.01, stop_price)
     if stop_price >= entry_low:
         stop_price = entry_low * 0.94
     risk = max(entry_low - stop_price, 0.01)
+    night_stop_distance_pct = (risk / entry_low * 100.0) if entry_low and entry_low > 0 else np.nan
 
     # Karar katmanları
     aggressive_reasons = []
@@ -3944,16 +3991,22 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
     tp15_required_move_pct = MIN_REQUIRED_PROFIT_PCT
     tp15_r_multiple = (tp15 - entry_low) / risk if risk and risk > 0 else np.nan
     upside_to_fib127_pct_for_gate = fib.get("upside_to_1272_pct", np.nan) if isinstance(fib, dict) else np.nan
-    risk_model_target_pct = max(0.0, (tp2 / entry_low - 1.0) * 100.0) if entry_low and entry_low > 0 else 0.0
+    # v22.1: Expected_Target_% modelin kendi ürettiği TP2 hedefinden beslenmez.
+    # Bu gate sadece bağımsız/gözlenen kapasite metriklerinden oluşur.
+    atr_capacity_target_pct = 0.0
+    if pd.notna(atr_pct):
+        # ATR kapasitesi hedef potansiyelini sınırlı ve defansif şekilde temsil eder.
+        atr_capacity_target_pct = max(0.0, min(22.0, atr_pct * 2.2))
     runner_pressure_target_pct = 0.0
     if (squeeze_score >= 75 and demand_score >= 80 and pd.notna(rvol20) and rvol20 >= 3 and ah_strength >= 55):
         runner_pressure_target_pct = 15.0
     if (daily_momentum_score >= 82 and final_score >= 85 and ah_strength >= 65):
         runner_pressure_target_pct = max(runner_pressure_target_pct, 15.0)
+    observed_upside_target_pct = upside_to_fib127_pct_for_gate if pd.notna(upside_to_fib127_pct_for_gate) else 0.0
     expected_target_pct = max(
-        risk_model_target_pct,
-        upside_to_fib127_pct_for_gate if pd.notna(upside_to_fib127_pct_for_gate) else 0.0,
+        observed_upside_target_pct,
         runner_pressure_target_pct,
+        atr_capacity_target_pct,
     )
     target15_score = _score_15pct_target_feasibility(
         price=ah_price,
@@ -4023,6 +4076,7 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         and price_ok_for_real_trade
         and fakeout_risk <= MAX_D1_FAKEOUT_RISK
         and liquidity_ok
+        and (pd.isna(night_stop_distance_pct) or night_stop_distance_pct <= V22_MAX_STOP_DISTANCE_PCT)
         and not price_hard_reject_for_strategy
     )
 
@@ -4052,6 +4106,8 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         no_trade_reasons.append("Fakeout riski %15 stratejisi için yüksek")
     if not liquidity_ok:
         no_trade_reasons.append("Likidite/spread kalitesi yetersiz")
+    if pd.notna(night_stop_distance_pct) and night_stop_distance_pct > V22_MAX_STOP_DISTANCE_PCT:
+        no_trade_reasons.append("Stop mesafesi %8 üstü; fresh gece alım yok")
 
     # A/B aday dahi olsa %15 kapısından geçemiyorsa gerçek trade adayı olmaktan çıkar.
     if status == "TRADE_CANDIDATE" and not has_15pct_upside:
@@ -4150,6 +4206,7 @@ def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday
         and not too_far_to_chase
         and fakeout_risk <= MAX_D1_FAKEOUT_RISK
         and liquidity_ok
+        and (pd.isna(night_stop_distance_pct) or night_stop_distance_pct <= V22_MAX_STOP_DISTANCE_PCT)
     )
     if has_15pct_upside and not d1_15_gate_passed:
         if signal_score < MIN_REAL_SIGNAL_SCORE:
@@ -6981,7 +7038,7 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     high_fade_failed = bool(pd.notna(high_drop) and high_drop <= -35.0)
     no_chase_reason = []
     if already_exploded:
-        no_chase_reason.append("already +150% extended")
+        no_chase_reason.append("already +100% extended / no fresh buy")
     if high_fade_bad:
         no_chase_reason.append("high'dan sert fade")
     if guard["decision"] == "HARD_REJECT":
@@ -7008,6 +7065,8 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     )
     supernova_guard_ok = guard["decision"] in ["PASS", "STRICT_REVIEW", "LAB_ONLY"]
     supernova_hard_block = bool(guard["decision"] == "HARD_REJECT" or high_fade_failed or not above_vwap)
+    # Stop mesafesi geniş ise fresh supernova buy yok; risk engine ayrıca denetler.
+    supernova_stop_distance_ok = True
 
     chase_risk = 0.0
     if pd.notna(live_change_pct):
@@ -7062,7 +7121,17 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
     ideal_pullback_zone_low = base_trigger_price * 0.995 if pd.notna(base_trigger_price) else np.nan
     ideal_pullback_zone_high = base_trigger_price * 1.03 if pd.notna(base_trigger_price) else np.nan
     late_entry_pct = ((live_price - base_trigger_price) / base_trigger_price * 100.0) if pd.notna(live_price) and pd.notna(base_trigger_price) and base_trigger_price > 0 else np.nan
-    tp0_from_trigger = base_trigger_price * 1.08 if pd.notna(base_trigger_price) else np.nan
+    # v22.1: TP0 already reached kontrolü trigger/planned entry üzerinden üretilen standart TP0'a bakar.
+    preliminary_stop_for_trigger = np.nan
+    if pd.notna(base_trigger_price):
+        prelim_stops = []
+        if pd.notna(active_vwap):
+            prelim_stops.append(active_vwap * 0.985)
+        prelim_stops.append(base_trigger_price * 0.92)
+        prelim_stops = [s for s in prelim_stops if pd.notna(s) and 0 < s < base_trigger_price]
+        preliminary_stop_for_trigger = max(prelim_stops) if prelim_stops else base_trigger_price * 0.92
+    preliminary_targets = v22_standard_targets(base_trigger_price, preliminary_stop_for_trigger) if pd.notna(base_trigger_price) else {}
+    tp0_from_trigger = preliminary_targets.get("TP0", np.nan)
     tp0_already_reached_from_trigger = bool(pd.notna(live_price) and pd.notna(tp0_from_trigger) and live_price >= tp0_from_trigger)
     late_entry_hard = bool(pd.notna(late_entry_pct) and (late_entry_pct >= 8.0 or (late_entry_pct >= 5.0 and tp0_already_reached_from_trigger)))
     late_entry_soft = bool(pd.notna(late_entry_pct) and 5.0 <= late_entry_pct < 8.0 and not late_entry_hard)
@@ -7086,9 +7155,13 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         and tape_score >= 70
         and early_ignition_score >= 68
         and supernova_tradability_score >= 62
+        and (
+            pd.isna(preliminary_targets.get("Stop_Distance_%", np.nan))
+            or preliminary_targets.get("Stop_Distance_%", np.nan) <= V22_MAX_STOP_DISTANCE_PCT
+        )
     )
-    paper_ready_supernova = bool(paper_ready_supernova_raw and not late_entry_hard)
-    late_entry_supernova = bool(paper_ready_supernova_raw and late_entry_hard)
+    paper_ready_supernova = bool(paper_ready_supernova_raw and not late_entry_hard and not late_entry_soft)
+    late_entry_supernova = bool(paper_ready_supernova_raw and (late_entry_hard or late_entry_soft))
 
     tiny_ready_supernova = bool(
         paper_ready_supernova
@@ -7177,18 +7250,26 @@ def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = Non
         entry_reclaim = live_price
         if pd.notna(active_vwap):
             entry_reclaim = max(entry_reclaim, active_vwap * 1.003)
-    tp0 = round(live_price * 1.08, v17_price_round(live_price)) if pd.notna(live_price) else np.nan
-    tp15 = round(live_price * 1.15, v17_price_round(live_price)) if pd.notna(live_price) else np.nan
+    # v22.1: Supernova hedefleri geç kalmış live_price üzerinden değil,
+    # trigger/planned_entry üzerinden hesaplanır. Stop en yakın makul invalidation olmalıdır.
+    planned_supernova_entry = entry_reclaim if pd.notna(entry_reclaim) else live_price
     emergency_stop = np.nan
-    if pd.notna(live_price):
+    if pd.notna(planned_supernova_entry):
+        stop_candidates = []
         if pd.notna(active_vwap):
-            emergency_stop = min(live_price * 0.90, active_vwap * 0.985)
-        else:
-            emergency_stop = live_price * 0.88
-        emergency_stop = round(emergency_stop, v17_price_round(live_price))
+            stop_candidates.append(active_vwap * 0.985)
+        if pd.notna(live_price):
+            stop_candidates.append(live_price * 0.90)
+        stop_candidates.append(planned_supernova_entry * 0.92)
+        valid_stops = [s for s in stop_candidates if pd.notna(s) and 0 < s < planned_supernova_entry]
+        emergency_stop = max(valid_stops) if valid_stops else planned_supernova_entry * 0.92
+        emergency_stop = round(emergency_stop, v17_price_round(planned_supernova_entry))
 
-    tp30 = round(live_price * 1.30, v17_price_round(live_price)) if pd.notna(live_price) else np.nan
-    trigger_price = entry_reclaim
+    std_targets_supernova = v22_standard_targets(planned_supernova_entry, emergency_stop)
+    tp0 = std_targets_supernova.get("TP0", np.nan)
+    tp15 = std_targets_supernova.get("TP15", np.nan)
+    tp30 = std_targets_supernova.get("Runner_TP30", np.nan)
+    trigger_price = planned_supernova_entry
     kill_level = emergency_stop
     if stage == "TRADABLE_SUPERNOVA_READY":
         entry_mode = "VWAP_HOD_HOLD_OR_FIRST_PULLBACK" if above_vwap else "WAIT_VWAP_RECLAIM"
