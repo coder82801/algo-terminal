@@ -18,8 +18,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v22.3 (Actionable Target Floor + Noise-Stop Guard)")
-st.sidebar.success("v22.1 build aktif — Semantic Risk Patch + Conservative Tracker aktif")
+st.title("🎯 NextDay Scanner Pro v23 (Hot Mover Discovery + Second-Wave Engine)")
+st.sidebar.success("v23 build aktif — Hot Mover Discovery + Second-Wave Engine aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8033,10 +8033,545 @@ def render_v20_explosive_runner_tab():
                     key="download_v20_acc_csv",
                 )
 
+
+
+# ============================================================
+# v23 HOT MOVER DISCOVERY + SECOND-WAVE ENGINE
+# ============================================================
+V23_MIN_HOT_CHANGE = 10.0
+V23_MIN_TRADEABLE_CHANGE = 12.0
+V23_MAX_TRADEABLE_CHANGE = 60.0
+V23_RISK_TAG_CHANGE = 95.0
+V23_ALREADY_EXPLODED_CHANGE = 100.0
+V23_MIN_RVOL = 3.0
+V23_IDEAL_RVOL = 4.0
+V23_MIN_DOLLAR_VOLUME = 2_000_000
+V23_IDEAL_DOLLAR_VOLUME = 5_000_000
+V23_MIN_RANGE_POSITION = 0.80
+V23_IDEAL_RANGE_POSITION = 0.85
+V23_MAX_HIGH_FADE_FRESH = -8.0
+V23_MAX_VWAP_DISTANCE_PCT = 15.0
+V23_MAX_LATE_ENTRY_FRESH = 5.0
+V23_MIN_PRIOR_SPIKE = 45.0
+
+
+def v23_float_rotation(volume: float, float_shares: float) -> float:
+    volume = safe_float(volume, np.nan)
+    float_shares = safe_float(float_shares, np.nan)
+    if pd.isna(volume) or pd.isna(float_shares) or float_shares <= 0:
+        return np.nan
+    return float(volume / float_shares)
+
+
+def v23_safe_pct(a: float, b: float) -> float:
+    a = safe_float(a, np.nan)
+    b = safe_float(b, np.nan)
+    if pd.isna(a) or pd.isna(b) or b == 0:
+        return np.nan
+    return (a - b) / b * 100.0
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def v23_fetch_hot_mover_universe(
+    session_name: str = "auto",
+    max_records: int = 500,
+    min_change_pct: float = 5.0,
+    min_volume: int = 50_000,
+    min_price: float = 0.25,
+    max_price: float = 100.0,
+) -> pd.DataFrame:
+    """Piyasa geneli hot-mover evreni. Burada amaç alım değil, hiçbir büyük hareketliyi kaçırmamak."""
+    use_session = v20_resolve_session(session_name)
+    active_session = get_active_session_et()
+
+    if use_session == "premarket":
+        sort_field = "premarket_change"
+        vol_field = "premarket_volume"
+        price_field = "premarket_close"
+        change_source = "PREMARKET"
+    elif use_session == "afterhours":
+        sort_field = "postmarket_change"
+        vol_field = "postmarket_volume"
+        price_field = "postmarket_close"
+        change_source = "AFTERHOURS"
+    else:
+        sort_field = "change"
+        vol_field = "volume"
+        price_field = "close"
+        change_source = "REGULAR"
+
+    filters = [
+        {"left": price_field, "operation": "in_range", "right": [float(min_price), float(max_price)]},
+        {"left": vol_field, "operation": "greater", "right": int(min_volume)},
+        {"left": sort_field, "operation": "greater", "right": float(min_change_pct)},
+        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
+    ]
+    columns = [
+        "name", "description", price_field, sort_field, vol_field,
+        "market_cap_basic", "relative_volume_10d_calc", "float_shares_outstanding",
+    ]
+    raw = tradingview_scan(
+        base_filters=filters,
+        columns=columns,
+        sort_field=sort_field,
+        max_records=int(max_records),
+        page_size=min(100, int(max_records)),
+    )
+    rows, seen = [], set()
+    for item in raw:
+        d = item.get("d", [])
+        if len(d) < 5:
+            continue
+        symbol = str(d[0]).upper().strip()
+        company = d[1] or ""
+        if not symbol or symbol in seen:
+            continue
+        if is_likely_non_common_stock(symbol, company):
+            continue
+        seen.add(symbol)
+        price = safe_float(d[2], np.nan)
+        chg = safe_float(d[3], np.nan)
+        vol = safe_float(d[4], np.nan)
+        mcap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
+        rvol = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
+        flt = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
+        dollar_volume = price * vol if pd.notna(price) and pd.notna(vol) else np.nan
+        rows.append({
+            "symbol": symbol,
+            "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
+            "description": company,
+            "live_price": price,
+            "live_change_pct": chg,
+            "live_volume": vol,
+            "market_cap": mcap,
+            "tv_rvol": rvol,
+            "float_shares": flt,
+            "Float_Rotation_Proxy": v23_float_rotation(vol, flt),
+            "Dollar_Volume": dollar_volume,
+            "Dollar_Volume_M": round(dollar_volume / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
+            "change_source": change_source,
+            "data_status": f"V23_{change_source}_HOT_MOVER",
+            "active_session_et": active_session,
+        })
+    return pd.DataFrame(rows)
+
+
+def v23_manual_symbol_candidates(symbols_text: str) -> pd.DataFrame:
+    base = v20_manual_symbol_candidates(symbols_text)
+    if base is None or base.empty:
+        return pd.DataFrame()
+    base = base.copy()
+    base["Float_Rotation_Proxy"] = base.apply(lambda r: v23_float_rotation(r.get("live_volume"), r.get("float_shares")), axis=1)
+    base["Dollar_Volume"] = base["live_price"].astype(float) * base["live_volume"].astype(float)
+    base["Dollar_Volume_M"] = (base["Dollar_Volume"] / 1_000_000).round(2)
+    base["data_status"] = "V23_MANUAL_HOT_CHECK"
+    return base
+
+
+def v23_combine_universes(*dfs: pd.DataFrame) -> pd.DataFrame:
+    frames = [d for d in dfs if d is not None and not d.empty]
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    if "symbol" not in df.columns:
+        return pd.DataFrame()
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df = df.drop_duplicates(subset=["symbol"], keep="first")
+    sort_cols = [c for c in ["live_change_pct", "Dollar_Volume"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    return df.reset_index(drop=True)
+
+
+def v23_fetch_daily_intraday_for_symbol(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ys = normalize_symbol_for_yahoo(symbol)
+    daily_df, intraday_df = pd.DataFrame(), pd.DataFrame()
+    try:
+        t = yf.Ticker(ys)
+        daily_df = t.history(period="90d", interval="1d", auto_adjust=False)
+        intraday_df = t.history(period="2d", interval="1m", prepost=True, auto_adjust=False)
+    except Exception as exc:
+        log_debug(f"v23 fetch detail error {symbol}: {exc}")
+    return daily_df, intraday_df
+
+
+def v23_classify_scored_candidate(row: dict) -> dict:
+    change = safe_float(row.get("Change_%"), np.nan)
+    price = safe_float(row.get("Price"), np.nan)
+    dollar_m = safe_float(row.get("Dollar_Volume_M"), np.nan)
+    dollar = dollar_m * 1_000_000 if pd.notna(dollar_m) else np.nan
+    rvol = safe_float(row.get("TV_RVOL"), np.nan)
+    range_pos = safe_float(row.get("Range_Position"), np.nan)
+    high_drop = safe_float(row.get("High_to_Current_Drop_%"), np.nan)
+    above_vwap = bool(row.get("Above_VWAP"))
+    tape = safe_float(row.get("Tape_Burst_Proxy"), np.nan)
+    late_pct = safe_float(row.get("Late_Entry_%"), np.nan)
+    micro = str(row.get("Microcap_Decision", "UNKNOWN"))
+    already = bool(row.get("Already_Exploded")) or (pd.notna(change) and change >= V23_ALREADY_EXPLODED_CHANGE)
+    tp0_hit = bool(row.get("TP0_Already_Reached_From_Trigger"))
+    float_rot = safe_float(row.get("Float_Rotation_Proxy"), np.nan)
+    if pd.isna(float_rot):
+        vol = safe_float(row.get("Live_Volume"), np.nan)
+        flt_m = safe_float(row.get("Float_M"), np.nan)
+        float_rot = v23_float_rotation(vol, flt_m * 1_000_000 if pd.notna(flt_m) else np.nan)
+
+    blocks = []
+    notes = []
+    if pd.isna(change): blocks.append("change_missing")
+    if pd.isna(dollar) or dollar < V23_MIN_DOLLAR_VOLUME: blocks.append("dollar_volume_low")
+    if pd.notna(rvol) and rvol < V23_MIN_RVOL: blocks.append("rvol_low")
+    if not above_vwap: blocks.append("below_or_unconfirmed_vwap")
+    if pd.notna(range_pos) and range_pos < V23_MIN_RANGE_POSITION: blocks.append("not_near_high")
+    if pd.notna(high_drop) and high_drop < V23_MAX_HIGH_FADE_FRESH: blocks.append("high_fade")
+    if pd.notna(late_pct) and late_pct >= V23_MAX_LATE_ENTRY_FRESH: blocks.append("late_entry_pullback_only")
+    if tp0_hit: blocks.append("tp0_already_reached")
+    if micro == "HARD_REJECT": blocks.append("microcap_hard_reject")
+
+    if pd.notna(float_rot):
+        if float_rot >= 1.0:
+            notes.append("float_rotation_1x_plus")
+        elif float_rot >= 0.5:
+            notes.append("float_rotation_0_5x_plus")
+        else:
+            notes.append("float_rotation_low")
+
+    # Discovery bucket: bulma/sınıflama, alım izni değildir.
+    if already:
+        bucket = "ALREADY_EXPLODED_NO_CHASE"
+        action = "+100% üstü veya aşırı uzamış; taze giriş yok, sadece pullback/reclaim izlenir."
+        tradeable = False
+    elif pd.notna(change) and change >= 60:
+        bucket = "HOT_MOVER_RISK_TAG_PULLBACK_ONLY"
+        action = "%60-95 arası sıcak hareket; kovalamak yok, VWAP/EMA pullback + reclaim gerekir."
+        tradeable = False
+    elif pd.notna(change) and V23_MIN_TRADEABLE_CHANGE <= change <= V23_MAX_TRADEABLE_CHANGE:
+        ok = (
+            above_vwap
+            and (pd.isna(range_pos) or range_pos >= V23_MIN_RANGE_POSITION)
+            and (pd.isna(high_drop) or high_drop >= V23_MAX_HIGH_FADE_FRESH)
+            and (pd.isna(dollar) or dollar >= V23_MIN_DOLLAR_VOLUME)
+            and (pd.isna(rvol) or rvol >= V23_MIN_RVOL)
+            and (pd.isna(tape) or tape >= 60)
+            and (pd.isna(late_pct) or late_pct < V23_MAX_LATE_ENTRY_FRESH)
+            and not tp0_hit
+            and micro != "HARD_REJECT"
+        )
+        if ok and micro == "PASS":
+            bucket = "PAPER_READY_SQUEEZE"
+            action = "Paper trade adayı: entry/VWAP üstünde 5-15dk tutunma + spread/stop kontrolü şart."
+            tradeable = True
+        elif ok:
+            bucket = "PAPER_READY_SQUEEZE_RISK_TAGGED"
+            action = "Risk etiketli paper adayı: micro risk/strict review; tiny paper dışında işlem yok."
+            tradeable = True
+        else:
+            bucket = "EARLY_SQUEEZE_WATCH"
+            action = "Erken hareket var ama eksik teyit var: " + "; ".join(blocks[:4])
+            tradeable = False
+    elif pd.notna(change) and 5 <= change < V23_MIN_TRADEABLE_CHANGE:
+        bucket = "PRE_IGNITION_TO_EARLY_WATCH"
+        action = "Hareket yeni başlıyor olabilir; hacim/VWAP/HOD kırılımı bekle."
+        tradeable = False
+    else:
+        bucket = "HOT_MOVER_RADAR"
+        action = "Radar kaydı; işlem için yeterli erken squeeze kapısı yok."
+        tradeable = False
+
+    # Skor: discovery için ayrı, risk engine yerine geçmez.
+    score = 0.0
+    if pd.notna(change): score += min(28, max(0, change / 60 * 28))
+    if pd.notna(dollar): score += min(18, np.log10(max(dollar, 1)) * 4 - 10)
+    if pd.notna(rvol): score += min(16, rvol * 3)
+    if above_vwap: score += 10
+    if pd.notna(range_pos): score += min(12, range_pos * 12)
+    if pd.notna(high_drop): score += 10 if high_drop >= -5 else (5 if high_drop >= -10 else -8)
+    if pd.notna(float_rot) and float_rot >= 0.5: score += 6
+    if tp0_hit: score -= 10
+    if pd.notna(late_pct) and late_pct >= 5: score -= 12
+    if already: score -= 25
+    if micro == "HARD_REJECT": score -= 18
+    score = round(float(max(0, min(100, score))), 1)
+
+    return {
+        "V23_Bucket": bucket,
+        "V23_Discovery_Score": score,
+        "V23_Tradeable_Paper": bool(tradeable),
+        "V23_Action": action,
+        "V23_Blocks": "; ".join(blocks),
+        "V23_Notes": "; ".join(notes),
+        "Float_Rotation_Proxy": round(float_rot, 3) if pd.notna(float_rot) else np.nan,
+    }
+
+
+def v23_deep_score_universe(universe_df: pd.DataFrame, top_n: int = 40, session_name: str = "auto") -> pd.DataFrame:
+    if universe_df is None or universe_df.empty:
+        return pd.DataFrame()
+    rows = []
+    work = universe_df.head(int(top_n)).copy()
+    preferred = v20_resolve_session(session_name)
+    progress = st.progress(0, text="v23 deep scoring hazırlanıyor...") if "streamlit" in str(type(st)) else None
+    total = max(1, len(work))
+    for i, (_, r) in enumerate(work.iterrows(), start=1):
+        symbol = str(r.get("symbol", r.get("Symbol", ""))).upper()
+        try:
+            if progress:
+                progress.progress(i / total, text=f"v23 deep scoring: {symbol} ({i}/{total})")
+            daily_df, intraday_df = v23_fetch_daily_intraday_for_symbol(symbol)
+            scored = v20_score_explosive_candidate(r.to_dict(), daily_df=daily_df, intraday_df=intraday_df, preferred_session=preferred)
+            # TV universe alanlarından eksik kalanları geri taşı.
+            if "Float_Rotation_Proxy" not in scored or pd.isna(scored.get("Float_Rotation_Proxy", np.nan)):
+                scored["Float_Rotation_Proxy"] = r.get("Float_Rotation_Proxy", np.nan)
+            scored["Discovery_Source"] = r.get("data_status", "V23")
+            scored.update(v23_classify_scored_candidate(scored))
+            rows.append(scored)
+        except Exception as exc:
+            rows.append({"Symbol": symbol, "V23_Bucket": "DATA_ERROR", "V23_Action": str(exc), "Discovery_Source": r.get("data_status", "V23")})
+    if progress:
+        progress.empty()
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    rank = {
+        "PAPER_READY_SQUEEZE": 0,
+        "PAPER_READY_SQUEEZE_RISK_TAGGED": 1,
+        "EARLY_SQUEEZE_WATCH": 2,
+        "PRE_IGNITION_TO_EARLY_WATCH": 3,
+        "HOT_MOVER_RISK_TAG_PULLBACK_ONLY": 4,
+        "ALREADY_EXPLODED_NO_CHASE": 5,
+        "HOT_MOVER_RADAR": 6,
+        "DATA_ERROR": 9,
+    }
+    out["V23_Rank"] = out["V23_Bucket"].map(rank).fillna(8)
+    return out.sort_values(["V23_Rank", "V23_Discovery_Score", "Change_%"], ascending=[True, False, False]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def v23_prior_runner_scan_cached(tickers: list[str], max_tickers: int = 400, min_prior_spike_pct: float = 45.0, seed_salt: str = "") -> pd.DataFrame:
+    """Bir gün/iki gün önce aşırı yükselenleri D+1/D+2 ikinci dalga için bulur. Daily veri tabanlı watchlisttir."""
+    if not tickers:
+        return pd.DataFrame()
+    clean = _clean_ticker_list(tickers)
+    if not clean:
+        return pd.DataFrame()
+    # Günlük deterministik shuffle: her gün farklı coverage.
+    seed = int(datetime.now().strftime("%Y%m%d")) + abs(hash(seed_salt)) % 10_000
+    rng = np.random.default_rng(seed)
+    arr = np.array(clean)
+    if len(arr) > max_tickers:
+        arr = rng.choice(arr, size=int(max_tickers), replace=False)
+    symbols = list(arr)
+    rows = []
+    chunk_size = 80
+    for start in range(0, len(symbols), chunk_size):
+        chunk = symbols[start:start + chunk_size]
+        try:
+            data = yf.download(chunk, period="12d", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            continue
+        for sym in chunk:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if sym not in data.columns.get_level_values(0):
+                        continue
+                    df = data[sym].dropna()
+                else:
+                    df = data.dropna()
+                if df is None or df.empty or len(df) < 5:
+                    continue
+                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+                if len(df) < 5:
+                    continue
+                c = df["Close"]
+                last_ret = v23_safe_pct(c.iloc[-1], c.iloc[-2])
+                prior1 = v23_safe_pct(c.iloc[-2], c.iloc[-3])
+                prior2 = v23_safe_pct(c.iloc[-3], c.iloc[-4])
+                prior3 = v23_safe_pct(c.iloc[-4], c.iloc[-5]) if len(df) >= 5 else np.nan
+                max_prior = np.nanmax([prior1, prior2, prior3])
+                if pd.isna(max_prior) or max_prior < min_prior_spike_pct:
+                    continue
+                last_close = float(c.iloc[-1])
+                last_vol = float(df["Volume"].iloc[-1])
+                avg20 = float(df["Volume"].tail(min(10, len(df))).mean())
+                dollar = last_close * last_vol
+                hold_score = 0.0
+                # Spike sonrası tamamen çökmemişse ikinci dalga ihtimali daha yüksek.
+                recent_high = float(df["High"].tail(4).max())
+                recent_low = float(df["Low"].tail(4).min())
+                range_pos = (last_close - recent_low) / max(recent_high - recent_low, 0.01)
+                if range_pos >= 0.65: hold_score += 25
+                if last_ret >= -10: hold_score += 18
+                if last_vol >= avg20 * 1.2: hold_score += 18
+                if dollar >= 2_000_000: hold_score += 18
+                if max_prior >= 80: hold_score += 12
+                if 0 <= last_ret <= 40: hold_score += 9
+                rows.append({
+                    "Symbol": sym,
+                    "Stage": "D1_D2_SECOND_WAVE_WATCH",
+                    "Prior_Max_Spike_%": round(float(max_prior), 2),
+                    "Last_Return_%": round(float(last_ret), 2) if pd.notna(last_ret) else np.nan,
+                    "Second_Wave_Score": round(min(100, hold_score), 1),
+                    "Close": round(last_close, v17_price_round(last_close)),
+                    "Last_Volume": int(last_vol),
+                    "Dollar_Volume_M": round(dollar / 1_000_000, 2),
+                    "Recent_Range_Position": round(range_pos, 2),
+                    "Action": "D+1/D+2 takip: premarket/regular VWAP reclaim + hacim patlaması bekle",
+                })
+            except Exception:
+                continue
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Second_Wave_Score", "Prior_Max_Spike_%", "Dollar_Volume_M"], ascending=[False, False, False]).reset_index(drop=True)
+
+
+def v23_missed_movers_audit(hot_df: pd.DataFrame, scored_df: pd.DataFrame) -> pd.DataFrame:
+    if hot_df is None or hot_df.empty:
+        return pd.DataFrame()
+    shown = set()
+    category = {}
+    if scored_df is not None and not scored_df.empty and "Symbol" in scored_df.columns:
+        for _, r in scored_df.iterrows():
+            s = str(r.get("Symbol", "")).upper()
+            if s:
+                shown.add(s)
+                category[s] = r.get("V23_Bucket", r.get("Signal", "SCORED"))
+    rows = []
+    for _, r in hot_df.iterrows():
+        s = str(r.get("symbol", "")).upper()
+        chg = safe_float(r.get("live_change_pct"), np.nan)
+        rows.append({
+            "Symbol": s,
+            "Actual_Change_%": round(chg, 2) if pd.notna(chg) else np.nan,
+            "Was_In_Hot_Universe": True,
+            "Was_Deep_Scored": s in shown,
+            "V23_Category": category.get(s, "NOT_DEEP_SCORED"),
+            "Audit_Note": "Derin skorlandı" if s in shown else "Top N dışında kaldı veya deep scoring limiti düşük",
+        })
+    return pd.DataFrame(rows).sort_values("Actual_Change_%", ascending=False).reset_index(drop=True)
+
+
+def render_v23_discovery_tab():
+    st.subheader("🔥 v23 Hot Mover Discovery + Early Squeeze + Second-Wave Engine")
+    st.info(
+        "Amaç: HCWB/SLXN/VIDA/GCL gibi sıcak hisseleri kaçırmamak; önce görünür yapmak, sonra early/tradeable/late/trap diye ayırmak. "
+        "Bu modül gerçek para izni vermez; v22 Risk Engine son kapı olarak kalır."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        session_choice = st.selectbox("Seans", ["auto", "regular", "premarket", "afterhours"], index=0, key="v23_session")
+        min_change = st.slider("Min canlı artış %", 1.0, 50.0, 5.0, 1.0, key="v23_min_change")
+    with c2:
+        max_records = st.number_input("Hot universe max", 50, 1500, 700, 50, key="v23_max_records")
+        deep_top_n = st.number_input("Derin teyit top N", 10, 150, 60, 5, key="v23_deep_n")
+    with c3:
+        min_volume = st.number_input("Min canlı hacim", 0, 5_000_000, 50_000, 10_000, key="v23_min_volume")
+        min_price = st.number_input("Min fiyat", 0.01, 50.0, 0.50, 0.05, key="v23_min_price")
+    with c4:
+        max_price = st.number_input("Max fiyat", 1.0, 1000.0, 80.0, 1.0, key="v23_max_price")
+        manual_symbols = st.text_input("Zorunlu sembol kontrolü", value="", placeholder="HCWB,SLXN,VIDA,GCL,PHGE,MTVA", key="v23_manual")
+
+    st.caption(
+        "Early tradeable eşikler: change %12-60, VWAP üstü, range position >=0.80, high fade > -8%, RVOL>=3, dollar volume>=2M, late entry <5%. "
+        "%60-95 pullback-only; %100+ already exploded/no fresh buy."
+    )
+
+    st.divider()
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        enable_prior = st.checkbox("D+1/D+2 prior-runner scan çalıştır", value=True, key="v23_prior_enable")
+    with d2:
+        prior_max = st.number_input("Prior scan max ticker", 100, 3000, 600, 100, key="v23_prior_max")
+    with d3:
+        prior_spike = st.slider("Min önceki spike %", 20.0, 150.0, 45.0, 5.0, key="v23_prior_spike")
+
+    prior_csv = st.file_uploader("D+1/D+2 için ticker CSV yükle (opsiyonel)", type=["csv"], key="v23_prior_csv")
+    prior_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v23_prior_col")
+
+    if st.button("🔥 v23 Discovery Çalıştır", key="v23_run"):
+        hot = v23_fetch_hot_mover_universe(
+            session_name=session_choice,
+            max_records=int(max_records),
+            min_change_pct=float(min_change),
+            min_volume=int(min_volume),
+            min_price=float(min_price),
+            max_price=float(max_price),
+        )
+        manual = v23_manual_symbol_candidates(manual_symbols)
+        universe = v23_combine_universes(hot, manual)
+
+        if universe.empty:
+            st.warning("Hot mover evreni boş döndü. Min artış/hacim/fiyat eşiğini düşür veya manuel sembol ekle.")
+        else:
+            st.markdown("### 🔥 Hot Movers Radar — önce gör, sonra sınıflandır")
+            st.dataframe(universe.head(100), use_container_width=True)
+
+            scored = v23_deep_score_universe(universe, top_n=int(deep_top_n), session_name=session_choice)
+            if scored.empty:
+                st.warning("Derin skor üretilemedi.")
+            else:
+                st.markdown("### ⚡ Early Tradeable Squeeze / Supernova adayları")
+                tradeable = scored[scored["V23_Bucket"].isin(["PAPER_READY_SQUEEZE", "PAPER_READY_SQUEEZE_RISK_TAGGED"])]
+                if tradeable.empty:
+                    st.info("Bu anda PAPER_READY_SQUEEZE yok. Hot moverlar aşağıda sınıflandırıldı; kovalamak yok.")
+                else:
+                    st.dataframe(tradeable, use_container_width=True)
+
+                st.markdown("### 📊 Tüm v23 derin sınıflandırma")
+                st.dataframe(scored, use_container_width=True)
+                st.download_button(
+                    "⬇️ v23 deep scored CSV indir",
+                    data=scored.to_csv(index=False).encode("utf-8"),
+                    file_name=f"v23_discovery_deep_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="v23_deep_download",
+                )
+
+                audit = v23_missed_movers_audit(universe, scored)
+                st.markdown("### 🧾 Missed Movers Audit — gördük mü, skora soktuk mu?")
+                st.dataframe(audit.head(150), use_container_width=True)
+                st.download_button(
+                    "⬇️ v23 missed movers audit CSV indir",
+                    data=audit.to_csv(index=False).encode("utf-8"),
+                    file_name=f"v23_missed_movers_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="v23_audit_download",
+                )
+
+        if enable_prior:
+            try:
+                if prior_csv is not None:
+                    prior_csv.seek(0)
+                    tickers = load_tickers_from_uploaded_csv(prior_csv, prior_col.strip() or None)
+                    source_note = "Uploaded CSV"
+                else:
+                    tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", prior_col.strip() or None)
+                    source_note = "Repo nasdaq_nyse_tickers.csv"
+                if not tickers:
+                    st.warning("D+1/D+2 scan için ticker listesi yok. CSV yükle veya repo'ya nasdaq_nyse_tickers.csv ekle.")
+                else:
+                    second = v23_prior_runner_scan_cached(tickers, max_tickers=int(prior_max), min_prior_spike_pct=float(prior_spike), seed_salt=source_note)
+                    st.markdown("### 🔁 D+1 / D+2 Second-Wave Watchlist")
+                    st.caption(f"Kaynak: {source_note} | taranan yaklaşık ticker: {min(len(tickers), int(prior_max))}")
+                    if second.empty:
+                        st.info("Önceki gün/iki gün +spike sonrası ikinci dalga watchlist adayı çıkmadı.")
+                    else:
+                        st.dataframe(second.head(100), use_container_width=True)
+                        st.download_button(
+                            "⬇️ v23 second-wave CSV indir",
+                            data=second.to_csv(index=False).encode("utf-8"),
+                            file_name=f"v23_second_wave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="v23_second_download",
+                        )
+            except Exception as exc:
+                st.error(f"D+1/D+2 prior runner scan hata: {exc}")
+
+
 # ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
     [
         "⚡ Radar",
         "🧠 Intraday",
@@ -8047,6 +8582,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
         "🐋 v19",
         "🚀 v21.4 Supernova",
         "🛡️ v22 Risk",
+        "🔥 v23 Discovery",
     ]
 )
 
@@ -9256,3 +9792,10 @@ st.caption(
     "Bu araç yatırım tavsiyesi değildir. Önce paper trading ile test edilmesi gerekir. "
     "Dış veri kaynaklarında rate-limit ve veri uyuşmazlığı olabilir."
 )
+
+
+# ============================================================
+# TAB 10 - v23 HOT MOVER DISCOVERY
+# ============================================================
+with tab10:
+    render_v23_discovery_tab()
