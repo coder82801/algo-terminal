@@ -3,6 +3,7 @@ import gc
 import time
 import math
 import traceback
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -18,8 +19,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v23 (Hot Mover Discovery + Second-Wave Engine)")
-st.sidebar.success("v23 build aktif — Hot Mover Discovery + Second-Wave Engine aktif")
+st.title("🎯 NextDay Scanner Pro v24 (Runner DNA Calibration + Hot Mover Discovery)")
+st.sidebar.success("v24 build aktif — Runner DNA Lab + Hot Mover Discovery aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8568,10 +8569,683 @@ def render_v23_discovery_tab():
                 st.error(f"D+1/D+2 prior runner scan hata: {exc}")
 
 
+
+
+# ============================================================
+# v24 EXTREME GAINERS COLLECTOR + RUNNER DNA CALIBRATION LAB
+# ============================================================
+V24_DEFAULT_LOOKBACK_DAYS = 90
+V24_MIN_EXTREME_GAIN_PCT = 50.0
+V24_BIG_RUNNER_GAIN_PCT = 100.0
+V24_MIN_HISTORY_BARS_FOR_FEATURES = 25
+
+
+def v24_parse_date_any(x):
+    """Farklı CSV tarih formatlarını güvenli biçimde YYYY-MM-DD string'e çevirir."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    try:
+        dt = pd.to_datetime(x, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def v24_symbol_clean(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    s = str(x).strip().upper()
+    s = s.replace(".", "-")
+    if s in {"", "NAN", "NONE", "NULL", "-"}:
+        return ""
+    return s
+
+
+def v24_detect_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty:
+        return None
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    # partial fallback
+    for c in df.columns:
+        lc = str(c).lower()
+        for cand in candidates:
+            if cand.lower() in lc:
+                return c
+    return None
+
+
+def v24_normalize_extreme_gainers_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """FinScreener/AInvest veya manuel extreme-gainer CSV'lerini ortak formata getirir."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sym_col = v24_detect_col(df, ["Symbol", "Ticker", "code", "Code", "symbol", "ticker", "yahoo_symbol"])
+    date_col = v24_detect_col(df, ["date", "Date", "Trade_Date", "trade_date", "outcome_date", "Outcome_Date"])
+    pct_col = v24_detect_col(df, ["pct_change_on_day", "Actual_Change_%", "Change_%", "Percentage Change", "Percentage Change(%)", "change_pct", "Change"])
+    name_col = v24_detect_col(df, ["name", "Name", "Company", "description", "Description"])
+    mcap_col = v24_detect_col(df, ["MarketCap", "Market Cap", "latest_market_cap_usd", "Latest Market Cap(USD)", "market_cap"])
+    if sym_col is None or pct_col is None:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["date"] = df[date_col].apply(v24_parse_date_any) if date_col else None
+    out["Symbol"] = df[sym_col].apply(v24_symbol_clean)
+    out["Name"] = df[name_col] if name_col else ""
+    out["Actual_Change_%"] = pd.to_numeric(df[pct_col], errors="coerce")
+    out["Bucket"] = np.where(out["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
+    out["MarketCap"] = pd.to_numeric(df[mcap_col], errors="coerce") if mcap_col else np.nan
+    out["Collector_Source"] = "Uploaded_Extreme_CSV"
+    out = out[(out["Symbol"] != "") & out["Actual_Change_%"].notna()].copy()
+    return out.reset_index(drop=True)
+
+
+def v24_normalize_downloaded_df(raw: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
+    """yfinance çıktısını standart OHLCV DataFrame'e çevirir."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        # Eğer tek sembol alt kolon olarak geldiyse onu seç.
+        if symbol and symbol in df.columns.get_level_values(0):
+            df = df[symbol].copy()
+        elif symbol and symbol in df.columns.get_level_values(-1):
+            df = df.xs(symbol, axis=1, level=-1, drop_level=True).copy()
+        else:
+            # Son çare: ilk level'i indir.
+            try:
+                df.columns = df.columns.get_level_values(-1)
+            except Exception:
+                pass
+    cols = {str(c).lower(): c for c in df.columns}
+    required = []
+    rename = {}
+    for k in ["open", "high", "low", "close", "volume"]:
+        c = cols.get(k)
+        if c is not None:
+            rename[c] = k.capitalize() if k != "volume" else "Volume"
+            required.append(k.capitalize() if k != "volume" else "Volume")
+    if "Close" not in rename.values() and "adj close" in cols:
+        rename[cols["adj close"]] = "Close"
+    df = df.rename(columns=rename)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if not keep or "Close" not in keep:
+        return pd.DataFrame()
+    df = df[keep].copy()
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    for c in keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    return df
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def v24_yf_download_history_cached(tickers_tuple: tuple[str, ...], start_date: str, end_date: str, chunk_size: int = 50) -> dict:
+    """Verilen ticker listesi için günlük OHLCV indirir. Cache, v24 lab'i hızlandırır."""
+    tickers = [v24_symbol_clean(t) for t in tickers_tuple if v24_symbol_clean(t)]
+    out = {}
+    if not tickers:
+        return out
+    # yfinance end exclusive olduğu için 1 gün ileri al.
+    try:
+        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        end_plus = end_date
+    for i in range(0, len(tickers), int(chunk_size)):
+        chunk = tickers[i:i + int(chunk_size)]
+        try:
+            raw = yf.download(
+                tickers=" ".join(chunk),
+                start=start_date,
+                end=end_plus,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                prepost=False,
+                progress=False,
+                threads=True,
+            )
+        except Exception:
+            raw = pd.DataFrame()
+        if raw is None or raw.empty:
+            continue
+        if len(chunk) == 1:
+            sym = chunk[0]
+            df = v24_normalize_downloaded_df(raw, sym)
+            if not df.empty:
+                out[sym] = df
+        else:
+            for sym in chunk:
+                df = pd.DataFrame()
+                try:
+                    if isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.get_level_values(0):
+                        df = v24_normalize_downloaded_df(raw[sym], sym)
+                    elif isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.get_level_values(-1):
+                        df = v24_normalize_downloaded_df(raw.xs(sym, axis=1, level=-1, drop_level=True), sym)
+                except Exception:
+                    df = pd.DataFrame()
+                if not df.empty:
+                    out[sym] = df
+    return out
+
+
+def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Runner günü ve bir gün öncesi için temel OHLCV feature seti."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
+    out = df.copy().sort_index()
+    out["Prev_Close"] = out["Close"].shift(1)
+    out["Return_%"] = (out["Close"] / out["Prev_Close"] - 1.0) * 100.0
+    out["Gap_%"] = (out["Open"] / out["Prev_Close"] - 1.0) * 100.0 if "Open" in out.columns else np.nan
+    out["DollarVolume"] = out["Close"] * out.get("Volume", np.nan)
+    out["AvgVol20"] = out["Volume"].shift(1).rolling(20, min_periods=5).mean() if "Volume" in out.columns else np.nan
+    out["RVOL20"] = out["Volume"] / out["AvgVol20"]
+    rng = (out["High"] - out["Low"]).replace(0, np.nan) if all(c in out.columns for c in ["High", "Low"]) else np.nan
+    out["CloseStrength"] = (out["Close"] - out["Low"]) / rng if isinstance(rng, pd.Series) else np.nan
+    out["Range_%"] = (out["High"] - out["Low"]) / out["Prev_Close"] * 100.0 if all(c in out.columns for c in ["High", "Low"]) else np.nan
+    # ATR14
+    if all(c in out.columns for c in ["High", "Low", "Close"]):
+        prev_close = out["Close"].shift(1)
+        tr = pd.concat([
+            (out["High"] - out["Low"]).abs(),
+            (out["High"] - prev_close).abs(),
+            (out["Low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        out["ATR14"] = tr.rolling(14, min_periods=5).mean()
+        out["ATR14_%"] = out["ATR14"] / out["Close"] * 100.0
+    else:
+        out["ATR14"] = np.nan
+        out["ATR14_%"] = np.nan
+    # Basit EMA/VWAP proxy: daily cumulative VWAP yerine close*volume average; daily için kaba referans.
+    out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
+    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
+    out["Close_Above_EMA9"] = out["Close"] > out["EMA9"]
+    out["EMA9_Above_EMA20"] = out["EMA9"] > out["EMA20"]
+    # OBV slope proxy
+    if "Volume" in out.columns:
+        direction = np.sign(out["Close"].diff()).fillna(0)
+        out["OBV"] = (direction * out["Volume"].fillna(0)).cumsum()
+        out["OBV_Slope5"] = out["OBV"].diff(5)
+    else:
+        out["OBV"] = np.nan
+        out["OBV_Slope5"] = np.nan
+    return out
+
+
+def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symbol: str, actual_change: float, name: str = "") -> dict:
+    """Extreme event günü için bir gün önceki feature snapshot'ını üretir."""
+    try:
+        event_date = pd.to_datetime(event_date).tz_localize(None)
+    except Exception:
+        return {}
+    if features is None or features.empty:
+        return {}
+    idx = features.index
+    if event_date not in idx:
+        # trading holiday/format farkı durumunda en yakın aynı veya önceki tarih
+        before_or_equal = idx[idx <= event_date]
+        if len(before_or_equal) == 0:
+            return {}
+        event_date = before_or_equal[-1]
+    loc = features.index.get_loc(event_date)
+    if isinstance(loc, slice):
+        loc = loc.start
+    if loc <= 0:
+        return {}
+    prev = features.iloc[loc - 1]
+    cur = features.iloc[loc]
+    bucket = "100_PLUS" if actual_change >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
+    return {
+        "date": event_date.strftime("%Y-%m-%d"),
+        "Symbol": symbol,
+        "Name": name,
+        "Actual_Change_%": round(float(actual_change), 2) if pd.notna(actual_change) else np.nan,
+        "Bucket": bucket,
+        "Prev_Date": features.index[loc - 1].strftime("%Y-%m-%d"),
+        "Prev_Close": round(safe_float(prev.get("Close"), np.nan), 4),
+        "Prev_Change_%": round(safe_float(prev.get("Return_%"), np.nan), 2),
+        "Prev_Gap_%": round(safe_float(prev.get("Gap_%"), np.nan), 2),
+        "Prev_RVOL20": round(safe_float(prev.get("RVOL20"), np.nan), 2),
+        "Prev_DollarVolume": round(safe_float(prev.get("DollarVolume"), np.nan), 0),
+        "Prev_CloseStrength": round(safe_float(prev.get("CloseStrength"), np.nan), 3),
+        "Prev_Range_%": round(safe_float(prev.get("Range_%"), np.nan), 2),
+        "Prev_ATR14_%": round(safe_float(prev.get("ATR14_%"), np.nan), 2),
+        "Prev_Close_Above_EMA9": bool(prev.get("Close_Above_EMA9", False)),
+        "Prev_EMA9_Above_EMA20": bool(prev.get("EMA9_Above_EMA20", False)),
+        "Prev_OBV_Slope5": round(safe_float(prev.get("OBV_Slope5"), np.nan), 0),
+        "Event_Open": round(safe_float(cur.get("Open"), np.nan), 4),
+        "Event_High": round(safe_float(cur.get("High"), np.nan), 4),
+        "Event_Low": round(safe_float(cur.get("Low"), np.nan), 4),
+        "Event_Close": round(safe_float(cur.get("Close"), np.nan), 4),
+        "Event_Volume": round(safe_float(cur.get("Volume"), np.nan), 0),
+        "Collector_Source": "Yahoo_Daily_Collector",
+    }
+
+
+def v24_collect_extreme_gainers_from_history(tickers: list[str], start_date: str, end_date: str, min_pct: float = 50.0, max_tickers: int = 800, sample_mode: str = "daily_shuffle") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar."""
+    clean = [v24_symbol_clean(t) for t in tickers if v24_symbol_clean(t)]
+    clean = list(dict.fromkeys(clean))
+    if not clean:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    if max_tickers and len(clean) > int(max_tickers):
+        if sample_mode == "first_n":
+            selected = clean[:int(max_tickers)]
+        else:
+            seed = int(pd.to_datetime(end_date).strftime("%Y%m%d"))
+            selected = pd.Series(clean).sample(n=int(max_tickers), random_state=seed).tolist()
+    else:
+        selected = clean
+    # Feature için 40 gün buffer gerekli.
+    start_buffer = (pd.to_datetime(start_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    hist_dict = v24_yf_download_history_cached(tuple(selected), start_buffer, end_date, chunk_size=50)
+    rows = []
+    errors = []
+    for sym in selected:
+        raw = hist_dict.get(sym, pd.DataFrame())
+        if raw is None or raw.empty or len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES:
+            errors.append({"Symbol": sym, "Error": "insufficient_history_or_no_data"})
+            continue
+        feat = v24_compute_daily_features(raw)
+        if feat.empty or "Return_%" not in feat.columns:
+            errors.append({"Symbol": sym, "Error": "feature_calc_failed"})
+            continue
+        mask = (feat.index >= pd.to_datetime(start_date)) & (feat.index <= pd.to_datetime(end_date)) & (feat["Return_%"] >= float(min_pct))
+        events = feat.loc[mask]
+        for event_date, ev in events.iterrows():
+            row = v24_prior_feature_row(feat, event_date, sym, safe_float(ev.get("Return_%"), np.nan))
+            if row:
+                rows.append(row)
+    extreme = pd.DataFrame(rows)
+    errors_df = pd.DataFrame(errors)
+    summary = v24_extreme_daily_summary(extreme)
+    return extreme, summary, errors_df
+
+
+def v24_extreme_daily_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
+    if extreme_df is None or extreme_df.empty or "date" not in extreme_df.columns:
+        return pd.DataFrame()
+    df = extreme_df.copy()
+    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
+    out = df.groupby(["date", "Bucket"]).size().unstack(fill_value=0).reset_index()
+    if "50_99" not in out.columns:
+        out["50_99"] = 0
+    if "100_PLUS" not in out.columns:
+        out["100_PLUS"] = 0
+    out["Total_50Plus"] = out["50_99"] + out["100_PLUS"]
+    return out.sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def v24_runner_dna_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
+    if extreme_df is None or extreme_df.empty or "Symbol" not in extreme_df.columns:
+        return pd.DataFrame()
+    df = extreme_df.copy()
+    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
+    grp = df.groupby("Symbol", dropna=False)
+    rows = []
+    for sym, g in grp:
+        plus50 = len(g)
+        plus100 = int((g["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT).sum())
+        max_gain = safe_float(g["Actual_Change_%"].max(), np.nan)
+        avg_gain = safe_float(g["Actual_Change_%"].mean(), np.nan)
+        last_date = str(g["date"].max()) if "date" in g.columns else ""
+        # DNA score: tekrar + 100+ + max gain; sadece öncelik skoru, al sinyali değil.
+        score = min(100.0, plus50 * 18 + plus100 * 20 + min(max_gain or 0, 200) * 0.12)
+        name = ""
+        if "Name" in g.columns:
+            vals = [x for x in g["Name"].dropna().astype(str).unique().tolist() if x.strip()]
+            name = vals[0] if vals else ""
+        rows.append({
+            "Symbol": sym,
+            "Name": name,
+            "Runner_50Plus_Count": int(plus50),
+            "Runner_100Plus_Count": int(plus100),
+            "Last_Runner_Date": last_date,
+            "Avg_Runner_Gain_%": round(avg_gain, 2) if pd.notna(avg_gain) else np.nan,
+            "Max_Runner_Gain_%": round(max_gain, 2) if pd.notna(max_gain) else np.nan,
+            "Runner_DNA_Score": round(score, 1),
+        })
+    return pd.DataFrame(rows).sort_values(["Runner_DNA_Score", "Runner_100Plus_Count", "Runner_50Plus_Count"], ascending=False).reset_index(drop=True)
+
+
+def v24_calibration_feature_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
+    """%50+ ve %100+ gruplarının bir gün önceki feature özetini verir."""
+    if extreme_df is None or extreme_df.empty:
+        return pd.DataFrame()
+    num_cols = [
+        "Prev_Change_%", "Prev_Gap_%", "Prev_RVOL20", "Prev_DollarVolume",
+        "Prev_CloseStrength", "Prev_Range_%", "Prev_ATR14_%", "Prev_OBV_Slope5",
+        "Actual_Change_%",
+    ]
+    rows = []
+    df = extreme_df.copy()
+    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
+    for bucket, g in df.groupby("Bucket"):
+        base = {"Group": bucket, "N": len(g)}
+        for c in num_cols:
+            if c in g.columns:
+                vals = pd.to_numeric(g[c], errors="coerce")
+                base[f"{c}_median"] = round(vals.median(), 3) if vals.notna().any() else np.nan
+                base[f"{c}_mean"] = round(vals.mean(), 3) if vals.notna().any() else np.nan
+        for c in ["Prev_Close_Above_EMA9", "Prev_EMA9_Above_EMA20"]:
+            if c in g.columns:
+                base[f"{c}_rate_%"] = round(pd.Series(g[c]).astype(bool).mean() * 100, 1)
+        rows.append(base)
+    # genel grup
+    base = {"Group": "ALL_50_PLUS", "N": len(df)}
+    for c in num_cols:
+        if c in df.columns:
+            vals = pd.to_numeric(df[c], errors="coerce")
+            base[f"{c}_median"] = round(vals.median(), 3) if vals.notna().any() else np.nan
+            base[f"{c}_mean"] = round(vals.mean(), 3) if vals.notna().any() else np.nan
+    for c in ["Prev_Close_Above_EMA9", "Prev_EMA9_Above_EMA20"]:
+        if c in df.columns:
+            base[f"{c}_rate_%"] = round(pd.Series(df[c]).astype(bool).mean() * 100, 1)
+    rows.append(base)
+    return pd.DataFrame(rows)
+
+
+def v24_extract_signal_date_from_filename(name: str) -> str | None:
+    if not name:
+        return None
+    m = re.search(r"(20\d{6})", str(name))
+    if not m:
+        return None
+    try:
+        return pd.to_datetime(m.group(1), format="%Y%m%d").strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def v24_load_signal_csvs(uploaded_files) -> pd.DataFrame:
+    """Geçmiş NextDay/Night/Supernova/v23 CSV'lerini tek sinyal tablosuna çevirir."""
+    if not uploaded_files:
+        return pd.DataFrame()
+    frames = []
+    for f in uploaded_files:
+        try:
+            f.seek(0)
+            df = pd.read_csv(f)
+        except UnicodeDecodeError:
+            f.seek(0)
+            df = pd.read_csv(f, encoding="latin-1")
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        sym_col = v24_detect_col(df, ["Symbol", "Ticker", "Hisse", "code", "yahoo_symbol"])
+        if sym_col is None:
+            continue
+        sig_date = v24_extract_signal_date_from_filename(getattr(f, "name", ""))
+        date_col = v24_detect_col(df, ["Signal_Date", "signal_date", "Date", "date", "Trade_Date"])
+        mod = "UNKNOWN"
+        lname = getattr(f, "name", "").lower()
+        if "nextday" in lname:
+            mod = "NEXTDAY"
+        elif "night" in lname:
+            mod = "NIGHT"
+        elif "supernova" in lname or "tradable" in lname:
+            mod = "SUPERNOVA"
+        elif "v23" in lname or "discovery" in lname:
+            mod = "V23_DISCOVERY"
+        elif "runner" in lname:
+            mod = "RUNNER"
+        out = pd.DataFrame()
+        out["Symbol"] = df[sym_col].apply(v24_symbol_clean)
+        out["Signal_Date"] = df[date_col].apply(v24_parse_date_any) if date_col else sig_date
+        out["Model_Module"] = mod
+        out["Source_File"] = getattr(f, "name", "uploaded.csv")
+        # Useful optional columns
+        for target_col in ["Confidence", "Final_Score", "Score", "V23_Discovery_Score", "Supernova_Tradability_Score", "Trade_Readiness", "Signal", "V23_Bucket", "Trade_Status"]:
+            src_col = v24_detect_col(df, [target_col])
+            if src_col:
+                out[target_col] = df[src_col]
+        out = out[(out["Symbol"] != "") & out["Signal_Date"].notna()].copy()
+        frames.append(out)
+    if not frames:
+        return pd.DataFrame()
+    sig = pd.concat(frames, ignore_index=True, sort=False)
+    sig["Signal_Date"] = sig["Signal_Date"].apply(v24_parse_date_any)
+    sig["Outcome_Date_D1"] = (pd.to_datetime(sig["Signal_Date"]) + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    sig["Outcome_Date_D2"] = (pd.to_datetime(sig["Signal_Date"]) + pd.Timedelta(days=2)).dt.strftime("%Y-%m-%d")
+    return sig.reset_index(drop=True)
+
+
+def v24_join_signals_to_extremes(signals_df: pd.DataFrame, extreme_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if signals_df is None or signals_df.empty or extreme_df is None or extreme_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    ex = extreme_df.copy()
+    ex["Symbol"] = ex["Symbol"].apply(v24_symbol_clean)
+    ex["date"] = ex["date"].apply(v24_parse_date_any)
+    ex_key = ex[["Symbol", "date", "Actual_Change_%", "Bucket"]].drop_duplicates(["Symbol", "date"])
+    sig = signals_df.copy()
+    # D+1 join
+    d1 = sig.merge(ex_key.rename(columns={"date": "Outcome_Date_D1", "Actual_Change_%": "D1_Actual_Change_%", "Bucket": "D1_Bucket"}), on=["Symbol", "Outcome_Date_D1"], how="left")
+    # D+2 join
+    d2 = d1.merge(ex_key.rename(columns={"date": "Outcome_Date_D2", "Actual_Change_%": "D2_Actual_Change_%", "Bucket": "D2_Bucket"}), on=["Symbol", "Outcome_Date_D2"], how="left")
+    d2["Hit_50Plus_D1"] = d2["D1_Actual_Change_%"].notna()
+    d2["Hit_100Plus_D1"] = d2["D1_Actual_Change_%"] >= 100
+    d2["Hit_50Plus_D2"] = d2["D2_Actual_Change_%"].notna()
+    d2["Hit_100Plus_D2"] = d2["D2_Actual_Change_%"] >= 100
+    # Summary by module
+    rows = []
+    for mod, g in d2.groupby("Model_Module", dropna=False):
+        n = len(g)
+        rows.append({
+            "Model_Module": mod,
+            "Signal_Count": int(n),
+            "D1_50Plus_Hits": int(g["Hit_50Plus_D1"].sum()),
+            "D1_50Plus_HitRate_%": round(g["Hit_50Plus_D1"].mean() * 100, 2) if n else 0,
+            "D1_100Plus_Hits": int(g["Hit_100Plus_D1"].sum()),
+            "D1_100Plus_HitRate_%": round(g["Hit_100Plus_D1"].mean() * 100, 2) if n else 0,
+            "D2_50Plus_Hits": int(g["Hit_50Plus_D2"].sum()),
+            "D2_50Plus_HitRate_%": round(g["Hit_50Plus_D2"].mean() * 100, 2) if n else 0,
+            "D2_100Plus_Hits": int(g["Hit_100Plus_D2"].sum()),
+            "D2_100Plus_HitRate_%": round(g["Hit_100Plus_D2"].mean() * 100, 2) if n else 0,
+        })
+    return d2, pd.DataFrame(rows).sort_values(["D1_50Plus_HitRate_%", "D2_50Plus_HitRate_%"], ascending=False)
+
+
+def v24_event_tag_from_text(text: str) -> str:
+    s = str(text or "").lower()
+    if not s.strip():
+        return "NO_HEADLINE"
+    if any(k in s for k in ["fda", "phase", "trial", "clinical", "biotech", "orphan", "drug", "therapeutic", "pharma"]):
+        return "FDA_BIOTECH"
+    if any(k in s for k in ["merger", "acquisition", "buyout", "going private", "strategic review", "takeover"]):
+        return "M&A_BUYOUT_STRATEGIC"
+    if any(k in s for k in ["contract", "partnership", "agreement", "award", "order", "customer"]):
+        return "CONTRACT_PARTNERSHIP"
+    if any(k in s for k in ["earnings", "revenue", "eps", "profit", "guidance", "q1", "q2", "q3", "q4"]):
+        return "EARNINGS"
+    if any(k in s for k in ["offering", "registered direct", "warrant", "atm", "dilution", "convertible"]):
+        return "OFFERING_DILUTION_RISK"
+    if any(k in s for k in ["nasdaq compliance", "reverse split", "split"]):
+        return "LISTING_SPLIT_RISK"
+    return "OTHER_NEWS"
+
+
+def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFrame:
+    if extreme_df is None or extreme_df.empty or news_df is None or news_df.empty:
+        return extreme_df
+    sym_col = v24_detect_col(news_df, ["Symbol", "Ticker", "code"])
+    date_col = v24_detect_col(news_df, ["date", "Date", "News_Date"])
+    headline_col = v24_detect_col(news_df, ["headline", "Headline", "title", "Title", "News"])
+    if sym_col is None or headline_col is None:
+        return extreme_df
+    n = pd.DataFrame()
+    n["Symbol"] = news_df[sym_col].apply(v24_symbol_clean)
+    n["date"] = news_df[date_col].apply(v24_parse_date_any) if date_col else None
+    n["Headline"] = news_df[headline_col].astype(str)
+    n["Event_Tag"] = n["Headline"].apply(v24_event_tag_from_text)
+    # date yoksa symbol bazlı son/tek haber etiketi.
+    ex = extreme_df.copy()
+    if date_col:
+        ex = ex.merge(n[["Symbol", "date", "Headline", "Event_Tag"]].drop_duplicates(["Symbol", "date"]), on=["Symbol", "date"], how="left")
+    else:
+        ex = ex.merge(n[["Symbol", "Headline", "Event_Tag"]].drop_duplicates(["Symbol"]), on="Symbol", how="left")
+    ex["Event_Tag"] = ex["Event_Tag"].fillna("NO_OBVIOUS_NEWS")
+    return ex
+
+
+def render_v24_runner_dna_lab_tab():
+    st.subheader("📊 v24 Historical Runner DNA Lab — Extreme Gainers Calibration")
+    st.caption(
+        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. "
+        "Bu sekme alım sinyali üretmez; v23/v22 skorlarını veriyle kalibre eder."
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        end_date = st.date_input("Bitiş tarihi", value=datetime.now(ZoneInfo("America/New_York")).date(), key="v24_end_date")
+    with col2:
+        lookback_days = st.number_input("Geriye dönük gün", min_value=10, max_value=365, value=90, step=10, key="v24_lookback")
+    with col3:
+        min_gain = st.slider("Extreme gain eşiği %", 20.0, 150.0, 50.0, 5.0, key="v24_min_gain")
+    with col4:
+        max_tickers = st.number_input("Max ticker tarama", min_value=50, max_value=6000, value=900, step=50, key="v24_max_tickers")
+
+    start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
+    end_date_s = pd.to_datetime(end_date).strftime("%Y-%m-%d")
+
+    st.info(
+        f"Tarih aralığı: {start_date} → {end_date_s}. Tam evren taraması veri kaynağı/rate-limit nedeniyle yavaş olabilir. "
+        "İlk testte 500–1000 sembol yeterli; sonra repo CSV / uploaded CSV ile genişlet."
+    )
+
+    tab_collect, tab_upload, tab_join = st.tabs(["1️⃣ Extreme Collector", "2️⃣ Uploaded Extreme CSV", "3️⃣ Model Signal Join"])
+
+    with tab_collect:
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            ticker_csv = st.file_uploader("Ticker evren CSV yükle (opsiyonel)", type=["csv"], key="v24_ticker_csv")
+            ticker_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v24_ticker_col")
+        with c2:
+            sample_mode = st.selectbox("Örnekleme", ["daily_shuffle", "first_n"], index=0, key="v24_sample_mode")
+            st.caption("daily_shuffle üretim için; first_n yalnız diagnostik.")
+
+        if st.button("📊 Son dönem %50+ runner listesini oluştur", key="v24_collect_run"):
+            try:
+                if ticker_csv is not None:
+                    tickers = load_tickers_from_uploaded_csv(ticker_csv, ticker_col.strip() or None)
+                    source = "Uploaded CSV"
+                else:
+                    tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", ticker_col.strip() or None)
+                    source = "Repo nasdaq_nyse_tickers.csv"
+                if not tickers:
+                    st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
+                else:
+                    with st.spinner(f"v24 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
+                        extreme, daily_summary, errors = v24_collect_extreme_gainers_from_history(
+                            tickers=tickers,
+                            start_date=start_date,
+                            end_date=end_date_s,
+                            min_pct=float(min_gain),
+                            max_tickers=int(max_tickers),
+                            sample_mode=sample_mode,
+                        )
+                    st.session_state["v24_extreme_df"] = extreme
+                    st.session_state["v24_daily_summary_df"] = daily_summary
+                    st.session_state["v24_errors_df"] = errors
+                    if extreme.empty:
+                        st.warning("Bu evren/aralık/eşikle %50+ runner bulunamadı veya veri kaynağı boş döndü.")
+                    else:
+                        st.success(f"Extreme runner olayı bulundu: {len(extreme)}")
+                        st.markdown("### Günlük 50–99 / 100+ özeti")
+                        st.dataframe(daily_summary, use_container_width=True)
+                        st.markdown("### Extreme runner olayları + bir gün önceki feature snapshot")
+                        st.dataframe(extreme.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).head(300), use_container_width=True)
+                        dna = v24_runner_dna_summary(extreme)
+                        feature_summary = v24_calibration_feature_summary(extreme)
+                        st.markdown("### Runner DNA — tekrar eden runner listesi")
+                        st.dataframe(dna.head(100), use_container_width=True)
+                        st.markdown("### Bir gün önceki feature kalibrasyon özeti")
+                        st.dataframe(feature_summary, use_container_width=True)
+                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        st.download_button("⬇️ v24 extreme events CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"v24_extreme_events_{now}.csv", "text/csv", key="v24_dl_extreme")
+                        st.download_button("⬇️ v24 daily summary CSV", daily_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_daily_summary_{now}.csv", "text/csv", key="v24_dl_daily")
+                        st.download_button("⬇️ v24 runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"v24_runner_dna_{now}.csv", "text/csv", key="v24_dl_dna")
+                        st.download_button("⬇️ v24 feature summary CSV", feature_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_feature_summary_{now}.csv", "text/csv", key="v24_dl_feat_summary")
+                    with st.expander("Collector errors / skipped tickers"):
+                        if errors is not None and not errors.empty:
+                            st.dataframe(errors.head(500), use_container_width=True)
+                        else:
+                            st.write("Hata yok veya kayıt tutulmadı.")
+            except Exception as exc:
+                st.error(f"v24 collector hata: {exc}")
+                if DEBUG_MODE:
+                    st.code(traceback.format_exc())
+
+    with tab_upload:
+        extreme_upload = st.file_uploader("AInvest/FinScreener extreme gainer CSV yükle", type=["csv"], key="v24_extreme_upload")
+        news_upload = st.file_uploader("Opsiyonel haber/event CSV yükle (Symbol, Date, Headline)", type=["csv"], key="v24_news_upload")
+        if st.button("📥 Uploaded extreme CSV analiz et", key="v24_upload_analyze"):
+            try:
+                if extreme_upload is None:
+                    st.warning("Önce extreme gainer CSV yükleyin.")
+                else:
+                    extreme_upload.seek(0)
+                    raw = pd.read_csv(extreme_upload)
+                    extreme = v24_normalize_extreme_gainers_csv(raw)
+                    if news_upload is not None:
+                        news_upload.seek(0)
+                        news_df = pd.read_csv(news_upload)
+                        extreme = v24_merge_news_tags(extreme, news_df)
+                    st.session_state["v24_extreme_df"] = extreme
+                    daily_summary = v24_extreme_daily_summary(extreme)
+                    dna = v24_runner_dna_summary(extreme)
+                    st.success(f"Uploaded extreme runner satırı: {len(extreme)}")
+                    st.dataframe(extreme.head(300), use_container_width=True)
+                    st.markdown("### Günlük özet")
+                    st.dataframe(daily_summary, use_container_width=True)
+                    st.markdown("### Runner DNA")
+                    st.dataframe(dna.head(100), use_container_width=True)
+                    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.download_button("⬇️ normalized extreme CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"v24_uploaded_extreme_normalized_{now}.csv", "text/csv", key="v24_dl_uploaded_norm")
+            except Exception as exc:
+                st.error(f"Uploaded extreme analiz hata: {exc}")
+                if DEBUG_MODE:
+                    st.code(traceback.format_exc())
+
+    with tab_join:
+        st.caption("Geçmiş NextDay/Night/Supernova/v23 CSV dosyalarını yükle; v24 extreme runner tablosuyla D+1/D+2 eşleştirir.")
+        signal_files = st.file_uploader("Model sinyal CSV'leri", type=["csv"], accept_multiple_files=True, key="v24_signal_files")
+        if st.button("🔗 Model sinyallerini extreme runner outcome ile eşleştir", key="v24_join_run"):
+            try:
+                extreme = st.session_state.get("v24_extreme_df", pd.DataFrame())
+                if extreme is None or extreme.empty:
+                    st.warning("Önce Collector veya Uploaded CSV sekmesinden v24 extreme runner tablosu oluşturun.")
+                else:
+                    signals = v24_load_signal_csvs(signal_files)
+                    if signals.empty:
+                        st.warning("Sinyal CSV okunamadı veya Symbol/Date bulunamadı.")
+                    else:
+                        joined, summary = v24_join_signals_to_extremes(signals, extreme)
+                        st.success(f"Sinyal satırı: {len(signals)} | Join sonucu: {len(joined)}")
+                        st.markdown("### Modül bazlı D+1 / D+2 %50+ hit özeti")
+                        st.dataframe(summary, use_container_width=True)
+                        st.markdown("### Sinyal → Extreme outcome eşleşmeleri")
+                        st.dataframe(joined.sort_values(["Hit_50Plus_D1", "Hit_50Plus_D2", "Signal_Date"], ascending=[False, False, False]).head(500), use_container_width=True)
+                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        st.download_button("⬇️ v24 signal outcome joined CSV", joined.to_csv(index=False).encode("utf-8-sig"), f"v24_signal_extreme_join_{now}.csv", "text/csv", key="v24_dl_join")
+                        st.download_button("⬇️ v24 module hit summary CSV", summary.to_csv(index=False).encode("utf-8-sig"), f"v24_module_hit_summary_{now}.csv", "text/csv", key="v24_dl_join_summary")
+            except Exception as exc:
+                st.error(f"v24 join hata: {exc}")
+                if DEBUG_MODE:
+                    st.code(traceback.format_exc())
+
+    st.warning(
+        "v24 Runner DNA Lab alım/satım tavsiyesi değildir. Amaç, %50+/%100+ runner olaylarını ve modelin bunları yakalama oranını ölçerek "
+        "v23 Discovery / NextDay / Night skorlarını gerçek outcome datasıyla kalibre etmektir."
+    )
+
+
 # ============================================================
 # EKRANLAR
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     [
         "⚡ Radar",
         "🧠 Intraday",
@@ -8583,6 +9257,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
         "🚀 v21.4 Supernova",
         "🛡️ v22 Risk",
         "🔥 v23 Discovery",
+        "📊 v24 Runner DNA",
     ]
 )
 
@@ -9799,3 +10474,10 @@ st.caption(
 # ============================================================
 with tab10:
     render_v23_discovery_tab()
+
+
+# ============================================================
+# TAB 11 - v24 RUNNER DNA CALIBRATION LAB
+# ============================================================
+with tab11:
+    render_v24_runner_dna_lab_tab()
