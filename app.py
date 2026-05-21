@@ -19,8 +19,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v24 (Runner DNA Calibration + Hot Mover Discovery)")
-st.sidebar.success("v24 build aktif — Runner DNA Lab + Hot Mover Discovery aktif")
+st.title("🎯 NextDay Scanner Pro v24.1 (ISO Collector Fix + Runner DNA Calibration)")
+st.sidebar.success("v24.1 build aktif — ISO Collector Fix + Runner DNA Lab aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8578,6 +8578,7 @@ V24_DEFAULT_LOOKBACK_DAYS = 90
 V24_MIN_EXTREME_GAIN_PCT = 50.0
 V24_BIG_RUNNER_GAIN_PCT = 100.0
 V24_MIN_HISTORY_BARS_FOR_FEATURES = 25
+V24_DEBUG_GAIN_PCT = 20.0
 
 
 def v24_parse_date_any(x):
@@ -8824,44 +8825,137 @@ def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symb
     }
 
 
-def v24_collect_extreme_gainers_from_history(tickers: list[str], start_date: str, end_date: str, min_pct: float = 50.0, max_tickers: int = 800, sample_mode: str = "daily_shuffle") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar."""
+def v24_iso_date_query_preview(min_pct: float, date_s: str) -> str:
+    """Locale bağımsız FinScreener sorgu örneği. Ay adı kullanmaz."""
+    date_s = v24_parse_date_any(date_s) or str(date_s)
+    return (
+        f"Stock with Percentage Change >= {float(min_pct):g} on {date_s}; "
+        "Last Price, Last Percentage Change, Volume, Market Cap"
+    )
+
+
+def v24_collect_extreme_gainers_from_history(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    min_pct: float = 50.0,
+    max_tickers: int = 800,
+    sample_mode: str = "daily_shuffle",
+    debug_pct: float = V24_DEBUG_GAIN_PCT,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar.
+
+    v24.1 notu: Bu collector ana veri kaynağı olarak yfinance günlük OHLCV kullanır ve tarihleri
+    her yerde YYYY-MM-DD ISO formatında normalize eder. FinScreener/AInvest dış CSV kullanıldığında
+    da ay adı/locale bağımlılığına düşmemek için query preview ISO formatla gösterilir.
+    """
+    start_iso = v24_parse_date_any(start_date) or str(start_date)
+    end_iso = v24_parse_date_any(end_date) or str(end_date)
     clean = [v24_symbol_clean(t) for t in tickers if v24_symbol_clean(t)]
     clean = list(dict.fromkeys(clean))
+
+    diagnostics = {
+        "Collector_Version": "v24.1_ISO_DIAGNOSTICS",
+        "Locale_Safe_Date_Mode": "YYYY-MM-DD",
+        "Start_Date_ISO": start_iso,
+        "End_Date_ISO": end_iso,
+        "Threshold_%": float(min_pct),
+        "Debug_Threshold_%": float(debug_pct),
+        "Ticker_Universe_Total": len(clean),
+        "Sample_Mode": sample_mode,
+        "FinScreener_Query_Preview_ISO": v24_iso_date_query_preview(min_pct, end_iso),
+    }
+
     if not clean:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        diagnostics.update({"Selected_Tickers": 0, "Scanned_Tickers": 0, "Data_OK_Tickers": 0, "Events_ThresholdPlus": 0, "Events_DebugPlus": 0})
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([diagnostics])
+
     if max_tickers and len(clean) > int(max_tickers):
         if sample_mode == "first_n":
             selected = clean[:int(max_tickers)]
         else:
-            seed = int(pd.to_datetime(end_date).strftime("%Y%m%d"))
+            seed = int(pd.to_datetime(end_iso).strftime("%Y%m%d"))
             selected = pd.Series(clean).sample(n=int(max_tickers), random_state=seed).tolist()
     else:
         selected = clean
-    # Feature için 40 gün buffer gerekli.
-    start_buffer = (pd.to_datetime(start_date) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    hist_dict = v24_yf_download_history_cached(tuple(selected), start_buffer, end_date, chunk_size=50)
+
+    diagnostics["Selected_Tickers"] = len(selected)
+    diagnostics["Scanned_Tickers"] = len(selected)
+    diagnostics["Selected_First_20"] = ",".join(selected[:20])
+
+    # Feature için 45 gün buffer gerekli.
+    start_buffer = (pd.to_datetime(start_iso) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    hist_dict = v24_yf_download_history_cached(tuple(selected), start_buffer, end_iso, chunk_size=50)
+
     rows = []
     errors = []
+    debug_rows = []
+    data_ok = 0
+    insufficient = 0
+    feature_failed = 0
+    max_observed = np.nan
+
     for sym in selected:
         raw = hist_dict.get(sym, pd.DataFrame())
-        if raw is None or raw.empty or len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES:
-            errors.append({"Symbol": sym, "Error": "insufficient_history_or_no_data"})
+        if raw is None or raw.empty:
+            insufficient += 1
+            errors.append({"Symbol": sym, "Error": "no_data", "Rows": 0})
             continue
+        if len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES:
+            insufficient += 1
+            errors.append({"Symbol": sym, "Error": "insufficient_history", "Rows": int(len(raw))})
+            continue
+        data_ok += 1
         feat = v24_compute_daily_features(raw)
         if feat.empty or "Return_%" not in feat.columns:
-            errors.append({"Symbol": sym, "Error": "feature_calc_failed"})
+            feature_failed += 1
+            errors.append({"Symbol": sym, "Error": "feature_calc_failed", "Rows": int(len(raw))})
             continue
-        mask = (feat.index >= pd.to_datetime(start_date)) & (feat.index <= pd.to_datetime(end_date)) & (feat["Return_%"] >= float(min_pct))
-        events = feat.loc[mask]
+
+        in_range = (feat.index >= pd.to_datetime(start_iso)) & (feat.index <= pd.to_datetime(end_iso))
+        if in_range.any():
+            local_max = safe_float(feat.loc[in_range, "Return_%"].max(), np.nan)
+            if pd.notna(local_max):
+                max_observed = np.nanmax([max_observed, local_max]) if pd.notna(max_observed) else local_max
+
+        debug_events = feat.loc[in_range & (feat["Return_%"] >= float(debug_pct))].copy()
+        for event_date, ev in debug_events.iterrows():
+            debug_rows.append({
+                "date": event_date.strftime("%Y-%m-%d"),
+                "Symbol": sym,
+                "Debug_Change_%": round(safe_float(ev.get("Return_%"), np.nan), 2),
+            })
+
+        events = feat.loc[in_range & (feat["Return_%"] >= float(min_pct))]
         for event_date, ev in events.iterrows():
             row = v24_prior_feature_row(feat, event_date, sym, safe_float(ev.get("Return_%"), np.nan))
             if row:
+                row["Collector_Date_Query_Format"] = "YYYY-MM-DD"
                 rows.append(row)
+
     extreme = pd.DataFrame(rows)
+    if not extreme.empty:
+        extreme["Is_100Plus"] = extreme["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT
+        extreme["Is_Debug_20Plus"] = extreme["Actual_Change_%"] >= float(debug_pct)
+
     errors_df = pd.DataFrame(errors)
+    debug_df = pd.DataFrame(debug_rows)
     summary = v24_extreme_daily_summary(extreme)
-    return extreme, summary, errors_df
+
+    diagnostics.update({
+        "Data_OK_Tickers": int(data_ok),
+        "NoData_or_Insufficient_Tickers": int(insufficient),
+        "Feature_Failed_Tickers": int(feature_failed),
+        "Skipped_Total": int(len(selected) - data_ok + feature_failed),
+        "Events_ThresholdPlus": int(len(extreme)),
+        "Events_100Plus": int((extreme.get("Actual_Change_%", pd.Series(dtype=float)) >= 100).sum()) if not extreme.empty else 0,
+        "Events_DebugPlus": int(len(debug_df)),
+        "Max_Observed_Return_%": round(float(max_observed), 2) if pd.notna(max_observed) else np.nan,
+        "Data_Source": "Yahoo_Daily_OHLCV",
+        "Diagnostic_Note": "If Events_DebugPlus is 0 even at 20%, check ticker universe/data provider. ISO date query is locale-safe.",
+    })
+    diag_df = pd.DataFrame([diagnostics])
+    return extreme, summary, errors_df, diag_df
 
 
 def v24_extreme_daily_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
@@ -9091,9 +9185,9 @@ def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.D
 
 
 def render_v24_runner_dna_lab_tab():
-    st.subheader("📊 v24 Historical Runner DNA Lab — Extreme Gainers Calibration")
+    st.subheader("📊 v24.1 Historical Runner DNA Lab — ISO Collector Fix + Diagnostics")
     st.caption(
-        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. "
+        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.1 ISO tarih/diagnostics patch içerir. "
         "Bu sekme alım sinyali üretmez; v23/v22 skorlarını veriyle kalibre eder."
     )
 
@@ -9122,9 +9216,18 @@ def render_v24_runner_dna_lab_tab():
         with c1:
             ticker_csv = st.file_uploader("Ticker evren CSV yükle (opsiyonel)", type=["csv"], key="v24_ticker_csv")
             ticker_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v24_ticker_col")
+            manual_symbols_raw = st.text_area(
+                "Manual smoke sembolleri (opsiyonel, virgülle)",
+                value="HCWB,SLXN,VIDA,GCL,PHGE,MTVA",
+                key="v24_manual_smoke_symbols",
+                help="Collector boş dönüyorsa önce bilinen runner sembollerle veri kaynağı/evren testi yap.",
+            )
         with c2:
             sample_mode = st.selectbox("Örnekleme", ["daily_shuffle", "first_n"], index=0, key="v24_sample_mode")
-            st.caption("daily_shuffle üretim için; first_n yalnız diagnostik.")
+            debug_gain = st.slider("Debug gain eşiği %", 10.0, 50.0, 20.0, 5.0, key="v24_debug_gain")
+            st.caption("daily_shuffle üretim için; first_n yalnız diagnostik. Tarih sorguları ISO YYYY-MM-DD; ay adı/locale yok.")
+
+        st.caption(f"ISO sorgu önizleme: `{v24_iso_date_query_preview(float(min_gain), end_date_s)}`")
 
         if st.button("📊 Son dönem %50+ runner listesini oluştur", key="v24_collect_run"):
             try:
@@ -9134,23 +9237,31 @@ def render_v24_runner_dna_lab_tab():
                 else:
                     tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", ticker_col.strip() or None)
                     source = "Repo nasdaq_nyse_tickers.csv"
+                manual_symbols = [v24_symbol_clean(x) for x in re.split(r"[,\s]+", manual_symbols_raw or "") if v24_symbol_clean(x)]
+                if manual_symbols:
+                    tickers = list(dict.fromkeys(manual_symbols + list(tickers)))
+                    source += " + Manual smoke symbols"
                 if not tickers:
                     st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
                 else:
-                    with st.spinner(f"v24 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
-                        extreme, daily_summary, errors = v24_collect_extreme_gainers_from_history(
+                    with st.spinner(f"v24.1 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
+                        extreme, daily_summary, errors, diagnostics = v24_collect_extreme_gainers_from_history(
                             tickers=tickers,
                             start_date=start_date,
                             end_date=end_date_s,
                             min_pct=float(min_gain),
                             max_tickers=int(max_tickers),
                             sample_mode=sample_mode,
+                            debug_pct=float(debug_gain),
                         )
                     st.session_state["v24_extreme_df"] = extreme
                     st.session_state["v24_daily_summary_df"] = daily_summary
                     st.session_state["v24_errors_df"] = errors
+                    st.session_state["v24_diagnostics_df"] = diagnostics
+                    st.markdown("### Collector diagnostics")
+                    st.dataframe(diagnostics, use_container_width=True)
                     if extreme.empty:
-                        st.warning("Bu evren/aralık/eşikle %50+ runner bulunamadı veya veri kaynağı boş döndü.")
+                        st.warning("Bu evren/aralık/eşikle threshold üstü runner bulunamadı veya veri kaynağı boş döndü. Diagnostics'te Events_DebugPlus ve Max_Observed_Return_% değerlerine bak.")
                     else:
                         st.success(f"Extreme runner olayı bulundu: {len(extreme)}")
                         st.markdown("### Günlük 50–99 / 100+ özeti")
@@ -9168,8 +9279,12 @@ def render_v24_runner_dna_lab_tab():
                         st.download_button("⬇️ v24 daily summary CSV", daily_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_daily_summary_{now}.csv", "text/csv", key="v24_dl_daily")
                         st.download_button("⬇️ v24 runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"v24_runner_dna_{now}.csv", "text/csv", key="v24_dl_dna")
                         st.download_button("⬇️ v24 feature summary CSV", feature_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_feature_summary_{now}.csv", "text/csv", key="v24_dl_feat_summary")
-                    with st.expander("Collector errors / skipped tickers"):
+                    with st.expander("Collector errors / skipped tickers + diagnostics"):
+                        if diagnostics is not None and not diagnostics.empty:
+                            st.markdown("#### Diagnostics")
+                            st.dataframe(diagnostics, use_container_width=True)
                         if errors is not None and not errors.empty:
+                            st.markdown("#### Errors / skipped")
                             st.dataframe(errors.head(500), use_container_width=True)
                         else:
                             st.write("Hata yok veya kayıt tutulmadı.")
