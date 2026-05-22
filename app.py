@@ -19,8 +19,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v24.2 (Forced Smoke + High Return Collector)")
-st.sidebar.success("v24.2 build aktif — Forced Smoke + High Return Collector aktif")
+st.title("🎯 NextDay Scanner Pro v24.3 (Collector Sort Guard + Forced Smoke Diagnostics)")
+st.sidebar.success("v24.3 build aktif — Forced Smoke + High Return Collector aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8735,7 +8735,7 @@ def v24_yf_download_history_cached(tickers_tuple: tuple[str, ...], start_date: s
 def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     """Runner günü ve bir gün öncesi için temel OHLCV feature seti.
 
-    v24.2 notu:
+    v24.3 notu:
     - Close_Return_%: kapanıştan kapanışa getiri.
     - High_Return_%: gün içi tepe / önceki kapanış getirisi.
     - Collector_Return_%: runner event tespiti için max(Close_Return_%, High_Return_%).
@@ -8874,7 +8874,7 @@ def v24_collect_extreme_gainers_from_history(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar.
 
-    v24.2 patch:
+    v24.3 patch:
     - Manual smoke semboller örneklemeden bağımsız şekilde ZORLA taramaya eklenir.
     - Event tespiti sadece close-to-close değil, max(close return, intraday high return) ile yapılır.
     - Collector boş dönse bile Top Observed Gainers ve Smoke Symbol diagnostics üretir.
@@ -8887,7 +8887,7 @@ def v24_collect_extreme_gainers_from_history(
     manual_clean = list(dict.fromkeys(manual_clean))
 
     diagnostics = {
-        "Collector_Version": "v24.2_FORCED_SMOKE_HIGH_RETURN",
+        "Collector_Version": "v24.3_SORT_GUARD_FORCED_SMOKE",
         "Locale_Safe_Date_Mode": "YYYY-MM-DD",
         "Return_Mode": "MAX_OF_CLOSE_RETURN_AND_INTRADAY_HIGH_RETURN",
         "Start_Date_ISO": start_iso,
@@ -9039,8 +9039,45 @@ def v24_collect_extreme_gainers_from_history(
         extreme["Is_Debug_20Plus"] = extreme["Actual_Change_%"] >= float(debug_pct)
 
     errors_df = pd.DataFrame(errors)
-    top_observed_df = pd.DataFrame(top_rows).sort_values("Max_Observed_Return_%", ascending=False) if top_rows else pd.DataFrame()
-    smoke_df = pd.DataFrame(smoke_rows).sort_values("Max_Observed_Return_%", ascending=False) if smoke_rows else pd.DataFrame()
+    # v24.3 SORT GUARD:
+    # Eğer bütün manual smoke semboller no_data/insufficient dönerse smoke_rows içinde
+    # Max_Observed_Return_% kolonu oluşmaz. Önceki sürüm bu kolona göre sort ederken
+    # KeyError veriyordu. Diagnostics asla collector'ı düşürmemeli; eksik kolonları
+    # NaN ile tamamlayıp sıralamayı güvenli yapıyoruz.
+    top_observed_cols = [
+        "Symbol", "Manual_Smoke", "Date_of_Max_Return", "Max_Observed_Return_%",
+        "Max_Close_Return_%", "Max_High_Return_%", "Close", "High",
+        "Prev_Close", "Volume", "Rows",
+    ]
+    smoke_cols = top_observed_cols + ["Data_OK", "Error"]
+
+    top_observed_df = pd.DataFrame(top_rows)
+    if top_observed_df.empty:
+        top_observed_df = pd.DataFrame(columns=top_observed_cols)
+    else:
+        for col in top_observed_cols:
+            if col not in top_observed_df.columns:
+                top_observed_df[col] = np.nan if col not in {"Symbol", "Error"} else ""
+        top_observed_df["Max_Observed_Return_%"] = pd.to_numeric(top_observed_df["Max_Observed_Return_%"], errors="coerce")
+        top_observed_df = top_observed_df.sort_values("Max_Observed_Return_%", ascending=False, na_position="last")
+
+    smoke_df = pd.DataFrame(smoke_rows)
+    if smoke_df.empty:
+        smoke_df = pd.DataFrame(columns=smoke_cols)
+    else:
+        for col in smoke_cols:
+            if col not in smoke_df.columns:
+                if col == "Data_OK":
+                    smoke_df[col] = False
+                elif col == "Error":
+                    smoke_df[col] = ""
+                elif col in {"Symbol", "Date_of_Max_Return"}:
+                    smoke_df[col] = ""
+                else:
+                    smoke_df[col] = np.nan
+        smoke_df["Max_Observed_Return_%"] = pd.to_numeric(smoke_df["Max_Observed_Return_%"], errors="coerce")
+        smoke_df = smoke_df.sort_values("Max_Observed_Return_%", ascending=False, na_position="last")
+
     debug_df = pd.DataFrame(debug_rows)
     summary = v24_extreme_daily_summary(extreme)
 
@@ -9058,7 +9095,7 @@ def v24_collect_extreme_gainers_from_history(
         "Top_Observed_Rows": int(len(top_observed_df)),
         "Manual_Smoke_Data_OK": int(smoke_df.get("Data_OK", pd.Series(dtype=bool)).fillna(False).sum()) if not smoke_df.empty else 0,
         "Data_Source": "Yahoo_Daily_OHLCV_HighOrClose",
-        "Diagnostic_Note": "v24.2 forces manual smoke symbols and uses max(Close_Return, High_Return) for runner detection. If smoke max returns stay low, provider data may be stale/missing or dates may not include runner day.",
+        "Diagnostic_Note": "v24.3 safely sorts diagnostics, forces manual smoke symbols and uses max(Close_Return, High_Return) for runner detection. If smoke max returns stay low, provider data may be stale/missing or dates may not include runner day.",
     })
     diag_df = pd.DataFrame([diagnostics])
     return extreme, summary, errors_df, diag_df, top_observed_df, smoke_df
@@ -9290,9 +9327,9 @@ def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.D
 
 
 def render_v24_runner_dna_lab_tab():
-    st.subheader("📊 v24.2 Historical Runner DNA Lab — Forced Smoke + High Return Collector")
+    st.subheader("📊 v24.3 Historical Runner DNA Lab — Forced Smoke + High Return Collector")
     st.caption(
-        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.2 forced smoke + high-return diagnostics patch içerir. "
+        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.3 forced smoke + high-return diagnostics patch içerir. "
         "Bu sekme alım sinyali üretmez; v23/v22 skorlarını veriyle kalibre eder."
     )
 
@@ -9349,7 +9386,7 @@ def render_v24_runner_dna_lab_tab():
                 if not tickers:
                     st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
                 else:
-                    with st.spinner(f"v24.2 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
+                    with st.spinner(f"v24.3 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
                         extreme, daily_summary, errors, diagnostics, top_observed, smoke_df = v24_collect_extreme_gainers_from_history(
                             tickers=tickers,
                             start_date=start_date,
