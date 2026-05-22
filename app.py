@@ -19,8 +19,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v24.1 (ISO Collector Fix + Runner DNA Calibration)")
-st.sidebar.success("v24.1 build aktif — ISO Collector Fix + Runner DNA Lab aktif")
+st.title("🎯 NextDay Scanner Pro v24.2 (Forced Smoke + High Return Collector)")
+st.sidebar.success("v24.2 build aktif — Forced Smoke + High Return Collector aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8733,12 +8733,28 @@ def v24_yf_download_history_cached(tickers_tuple: tuple[str, ...], start_date: s
 
 
 def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Runner günü ve bir gün öncesi için temel OHLCV feature seti."""
+    """Runner günü ve bir gün öncesi için temel OHLCV feature seti.
+
+    v24.2 notu:
+    - Close_Return_%: kapanıştan kapanışa getiri.
+    - High_Return_%: gün içi tepe / önceki kapanış getirisi.
+    - Collector_Return_%: runner event tespiti için max(Close_Return_%, High_Return_%).
+
+    Bunun nedeni: birçok sıcak mover gün içinde +50/+100 görüp kapanışta eşiğin altına dönebiliyor.
+    Sadece close-to-close bakmak hot mover audit'i eksik bırakır.
+    """
     if df is None or df.empty or "Close" not in df.columns:
         return pd.DataFrame()
     out = df.copy().sort_index()
     out["Prev_Close"] = out["Close"].shift(1)
-    out["Return_%"] = (out["Close"] / out["Prev_Close"] - 1.0) * 100.0
+    out["Close_Return_%"] = (out["Close"] / out["Prev_Close"] - 1.0) * 100.0
+    if "High" in out.columns:
+        out["High_Return_%"] = (out["High"] / out["Prev_Close"] - 1.0) * 100.0
+    else:
+        out["High_Return_%"] = np.nan
+    out["Collector_Return_%"] = pd.concat([out["Close_Return_%"], out["High_Return_%"]], axis=1).max(axis=1)
+    # Eski kolon geriye dönük uyumluluk için close-to-close anlamını korur.
+    out["Return_%"] = out["Close_Return_%"]
     out["Gap_%"] = (out["Open"] / out["Prev_Close"] - 1.0) * 100.0 if "Open" in out.columns else np.nan
     out["DollarVolume"] = out["Close"] * out.get("Volume", np.nan)
     out["AvgVol20"] = out["Volume"].shift(1).rolling(20, min_periods=5).mean() if "Volume" in out.columns else np.nan
@@ -8759,12 +8775,10 @@ def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["ATR14"] = np.nan
         out["ATR14_%"] = np.nan
-    # Basit EMA/VWAP proxy: daily cumulative VWAP yerine close*volume average; daily için kaba referans.
     out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
     out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
     out["Close_Above_EMA9"] = out["Close"] > out["EMA9"]
     out["EMA9_Above_EMA20"] = out["EMA9"] > out["EMA20"]
-    # OBV slope proxy
     if "Volume" in out.columns:
         direction = np.sign(out["Close"].diff()).fillna(0)
         out["OBV"] = (direction * out["Volume"].fillna(0)).cumsum()
@@ -8774,8 +8788,16 @@ def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
         out["OBV_Slope5"] = np.nan
     return out
 
-
-def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symbol: str, actual_change: float, name: str = "") -> dict:
+def v24_prior_feature_row(
+    features: pd.DataFrame,
+    event_date: pd.Timestamp,
+    symbol: str,
+    actual_change: float,
+    name: str = "",
+    actual_close_change: float | None = None,
+    actual_high_change: float | None = None,
+    return_basis: str = "HIGH_OR_CLOSE",
+) -> dict:
     """Extreme event günü için bir gün önceki feature snapshot'ını üretir."""
     try:
         event_date = pd.to_datetime(event_date).tz_localize(None)
@@ -8785,7 +8807,6 @@ def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symb
         return {}
     idx = features.index
     if event_date not in idx:
-        # trading holiday/format farkı durumunda en yakın aynı veya önceki tarih
         before_or_equal = idx[idx <= event_date]
         if len(before_or_equal) == 0:
             return {}
@@ -8797,16 +8818,24 @@ def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symb
         return {}
     prev = features.iloc[loc - 1]
     cur = features.iloc[loc]
-    bucket = "100_PLUS" if actual_change >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
+    close_chg = safe_float(actual_close_change, safe_float(cur.get("Close_Return_%"), np.nan))
+    high_chg = safe_float(actual_high_change, safe_float(cur.get("High_Return_%"), np.nan))
+    collector_chg = safe_float(actual_change, np.nan)
+    bucket = "100_PLUS" if collector_chg >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
     return {
         "date": event_date.strftime("%Y-%m-%d"),
         "Symbol": symbol,
         "Name": name,
-        "Actual_Change_%": round(float(actual_change), 2) if pd.notna(actual_change) else np.nan,
+        "Actual_Change_%": round(float(collector_chg), 2) if pd.notna(collector_chg) else np.nan,
+        "Actual_Close_Return_%": round(float(close_chg), 2) if pd.notna(close_chg) else np.nan,
+        "Actual_High_Return_%": round(float(high_chg), 2) if pd.notna(high_chg) else np.nan,
+        "Return_Basis": return_basis,
         "Bucket": bucket,
         "Prev_Date": features.index[loc - 1].strftime("%Y-%m-%d"),
         "Prev_Close": round(safe_float(prev.get("Close"), np.nan), 4),
-        "Prev_Change_%": round(safe_float(prev.get("Return_%"), np.nan), 2),
+        "Prev_Change_%": round(safe_float(prev.get("Close_Return_%", prev.get("Return_%")), np.nan), 2),
+        "Prev_High_Return_%": round(safe_float(prev.get("High_Return_%"), np.nan), 2),
+        "Prev_Collector_Return_%": round(safe_float(prev.get("Collector_Return_%"), np.nan), 2),
         "Prev_Gap_%": round(safe_float(prev.get("Gap_%"), np.nan), 2),
         "Prev_RVOL20": round(safe_float(prev.get("RVOL20"), np.nan), 2),
         "Prev_DollarVolume": round(safe_float(prev.get("DollarVolume"), np.nan), 0),
@@ -8821,9 +8850,8 @@ def v24_prior_feature_row(features: pd.DataFrame, event_date: pd.Timestamp, symb
         "Event_Low": round(safe_float(cur.get("Low"), np.nan), 4),
         "Event_Close": round(safe_float(cur.get("Close"), np.nan), 4),
         "Event_Volume": round(safe_float(cur.get("Volume"), np.nan), 0),
-        "Collector_Source": "Yahoo_Daily_Collector",
+        "Collector_Source": "Yahoo_Daily_Collector_HighOrClose",
     }
-
 
 def v24_iso_date_query_preview(min_pct: float, date_s: str) -> str:
     """Locale bağımsız FinScreener sorgu örneği. Ay adı kullanmaz."""
@@ -8842,95 +8870,167 @@ def v24_collect_extreme_gainers_from_history(
     max_tickers: int = 800,
     sample_mode: str = "daily_shuffle",
     debug_pct: float = V24_DEBUG_GAIN_PCT,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    manual_symbols: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar.
 
-    v24.1 notu: Bu collector ana veri kaynağı olarak yfinance günlük OHLCV kullanır ve tarihleri
-    her yerde YYYY-MM-DD ISO formatında normalize eder. FinScreener/AInvest dış CSV kullanıldığında
-    da ay adı/locale bağımlılığına düşmemek için query preview ISO formatla gösterilir.
+    v24.2 patch:
+    - Manual smoke semboller örneklemeden bağımsız şekilde ZORLA taramaya eklenir.
+    - Event tespiti sadece close-to-close değil, max(close return, intraday high return) ile yapılır.
+    - Collector boş dönse bile Top Observed Gainers ve Smoke Symbol diagnostics üretir.
     """
     start_iso = v24_parse_date_any(start_date) or str(start_date)
     end_iso = v24_parse_date_any(end_date) or str(end_date)
     clean = [v24_symbol_clean(t) for t in tickers if v24_symbol_clean(t)]
     clean = list(dict.fromkeys(clean))
+    manual_clean = [v24_symbol_clean(t) for t in (manual_symbols or []) if v24_symbol_clean(t)]
+    manual_clean = list(dict.fromkeys(manual_clean))
 
     diagnostics = {
-        "Collector_Version": "v24.1_ISO_DIAGNOSTICS",
+        "Collector_Version": "v24.2_FORCED_SMOKE_HIGH_RETURN",
         "Locale_Safe_Date_Mode": "YYYY-MM-DD",
+        "Return_Mode": "MAX_OF_CLOSE_RETURN_AND_INTRADAY_HIGH_RETURN",
         "Start_Date_ISO": start_iso,
         "End_Date_ISO": end_iso,
         "Threshold_%": float(min_pct),
         "Debug_Threshold_%": float(debug_pct),
         "Ticker_Universe_Total": len(clean),
+        "Manual_Smoke_Symbols": ",".join(manual_clean),
+        "Manual_Smoke_Count": len(manual_clean),
         "Sample_Mode": sample_mode,
         "FinScreener_Query_Preview_ISO": v24_iso_date_query_preview(min_pct, end_iso),
     }
 
-    if not clean:
+    if not clean and not manual_clean:
         diagnostics.update({"Selected_Tickers": 0, "Scanned_Tickers": 0, "Data_OK_Tickers": 0, "Events_ThresholdPlus": 0, "Events_DebugPlus": 0})
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([diagnostics])
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([diagnostics]), pd.DataFrame(), pd.DataFrame()
 
-    if max_tickers and len(clean) > int(max_tickers):
+    # Manual smoke semboller örneklemeden bağımsız; kalan max_tickers bütçesi evrene uygulanır.
+    base_universe = [t for t in clean if t not in set(manual_clean)]
+    remaining_n = max(int(max_tickers) - len(manual_clean), 0) if max_tickers else len(base_universe)
+    if max_tickers and len(base_universe) > remaining_n:
         if sample_mode == "first_n":
-            selected = clean[:int(max_tickers)]
+            sampled = base_universe[:remaining_n]
         else:
             seed = int(pd.to_datetime(end_iso).strftime("%Y%m%d"))
-            selected = pd.Series(clean).sample(n=int(max_tickers), random_state=seed).tolist()
+            sampled = pd.Series(base_universe).sample(n=remaining_n, random_state=seed).tolist() if remaining_n > 0 else []
     else:
-        selected = clean
+        sampled = base_universe
+    selected = list(dict.fromkeys(manual_clean + sampled))
 
     diagnostics["Selected_Tickers"] = len(selected)
     diagnostics["Scanned_Tickers"] = len(selected)
     diagnostics["Selected_First_20"] = ",".join(selected[:20])
+    diagnostics["Manual_Forced_In_Selected"] = all(t in selected for t in manual_clean) if manual_clean else True
 
-    # Feature için 45 gün buffer gerekli.
     start_buffer = (pd.to_datetime(start_iso) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
     hist_dict = v24_yf_download_history_cached(tuple(selected), start_buffer, end_iso, chunk_size=50)
 
-    rows = []
-    errors = []
-    debug_rows = []
+    rows: list[dict] = []
+    errors: list[dict] = []
+    debug_rows: list[dict] = []
+    top_rows: list[dict] = []
+    smoke_rows: list[dict] = []
     data_ok = 0
     insufficient = 0
     feature_failed = 0
     max_observed = np.nan
+    max_close_observed = np.nan
+    max_high_observed = np.nan
 
     for sym in selected:
+        is_manual = sym in set(manual_clean)
         raw = hist_dict.get(sym, pd.DataFrame())
         if raw is None or raw.empty:
             insufficient += 1
-            errors.append({"Symbol": sym, "Error": "no_data", "Rows": 0})
+            err = {"Symbol": sym, "Error": "no_data", "Rows": 0, "Manual_Smoke": is_manual}
+            errors.append(err)
+            if is_manual:
+                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": False, "Error": "no_data"})
             continue
         if len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES:
             insufficient += 1
-            errors.append({"Symbol": sym, "Error": "insufficient_history", "Rows": int(len(raw))})
+            err = {"Symbol": sym, "Error": "insufficient_history", "Rows": int(len(raw)), "Manual_Smoke": is_manual}
+            errors.append(err)
+            if is_manual:
+                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": False, "Rows": int(len(raw)), "Error": "insufficient_history"})
             continue
         data_ok += 1
         feat = v24_compute_daily_features(raw)
-        if feat.empty or "Return_%" not in feat.columns:
+        if feat.empty or "Collector_Return_%" not in feat.columns:
             feature_failed += 1
-            errors.append({"Symbol": sym, "Error": "feature_calc_failed", "Rows": int(len(raw))})
+            errors.append({"Symbol": sym, "Error": "feature_calc_failed", "Rows": int(len(raw)), "Manual_Smoke": is_manual})
+            if is_manual:
+                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": True, "Error": "feature_calc_failed"})
             continue
 
         in_range = (feat.index >= pd.to_datetime(start_iso)) & (feat.index <= pd.to_datetime(end_iso))
-        if in_range.any():
-            local_max = safe_float(feat.loc[in_range, "Return_%"].max(), np.nan)
-            if pd.notna(local_max):
-                max_observed = np.nanmax([max_observed, local_max]) if pd.notna(max_observed) else local_max
+        if not in_range.any():
+            errors.append({"Symbol": sym, "Error": "no_rows_in_date_range", "Rows": int(len(raw)), "Manual_Smoke": is_manual})
+            if is_manual:
+                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": True, "Rows": int(len(raw)), "Error": "no_rows_in_date_range"})
+            continue
 
-        debug_events = feat.loc[in_range & (feat["Return_%"] >= float(debug_pct))].copy()
+        ranged = feat.loc[in_range].copy()
+        local_max = safe_float(ranged["Collector_Return_%"].max(), np.nan)
+        local_max_close = safe_float(ranged.get("Close_Return_%", pd.Series(dtype=float)).max(), np.nan)
+        local_max_high = safe_float(ranged.get("High_Return_%", pd.Series(dtype=float)).max(), np.nan)
+        if pd.notna(local_max):
+            max_observed = np.nanmax([max_observed, local_max]) if pd.notna(max_observed) else local_max
+        if pd.notna(local_max_close):
+            max_close_observed = np.nanmax([max_close_observed, local_max_close]) if pd.notna(max_close_observed) else local_max_close
+        if pd.notna(local_max_high):
+            max_high_observed = np.nanmax([max_high_observed, local_max_high]) if pd.notna(max_high_observed) else local_max_high
+
+        if pd.notna(local_max):
+            max_idx = ranged["Collector_Return_%"].idxmax()
+            max_row = ranged.loc[max_idx]
+            top_row = {
+                "Symbol": sym,
+                "Manual_Smoke": is_manual,
+                "Date_of_Max_Return": max_idx.strftime("%Y-%m-%d"),
+                "Max_Observed_Return_%": round(safe_float(max_row.get("Collector_Return_%"), np.nan), 2),
+                "Max_Close_Return_%": round(safe_float(max_row.get("Close_Return_%"), np.nan), 2),
+                "Max_High_Return_%": round(safe_float(max_row.get("High_Return_%"), np.nan), 2),
+                "Close": round(safe_float(max_row.get("Close"), np.nan), 4),
+                "High": round(safe_float(max_row.get("High"), np.nan), 4),
+                "Prev_Close": round(safe_float(max_row.get("Prev_Close"), np.nan), 4),
+                "Volume": round(safe_float(max_row.get("Volume"), np.nan), 0),
+                "Rows": int(len(raw)),
+            }
+            top_rows.append(top_row)
+            if is_manual:
+                smoke_rows.append({**top_row, "Data_OK": True, "Error": ""})
+
+        debug_events = ranged.loc[ranged["Collector_Return_%"] >= float(debug_pct)].copy()
         for event_date, ev in debug_events.iterrows():
             debug_rows.append({
                 "date": event_date.strftime("%Y-%m-%d"),
                 "Symbol": sym,
-                "Debug_Change_%": round(safe_float(ev.get("Return_%"), np.nan), 2),
+                "Manual_Smoke": is_manual,
+                "Debug_Collector_Return_%": round(safe_float(ev.get("Collector_Return_%"), np.nan), 2),
+                "Debug_Close_Return_%": round(safe_float(ev.get("Close_Return_%"), np.nan), 2),
+                "Debug_High_Return_%": round(safe_float(ev.get("High_Return_%"), np.nan), 2),
             })
 
-        events = feat.loc[in_range & (feat["Return_%"] >= float(min_pct))]
+        events = ranged.loc[ranged["Collector_Return_%"] >= float(min_pct)]
         for event_date, ev in events.iterrows():
-            row = v24_prior_feature_row(feat, event_date, sym, safe_float(ev.get("Return_%"), np.nan))
+            collector_ret = safe_float(ev.get("Collector_Return_%"), np.nan)
+            close_ret = safe_float(ev.get("Close_Return_%"), np.nan)
+            high_ret = safe_float(ev.get("High_Return_%"), np.nan)
+            basis = "HIGH_RETURN" if pd.notna(high_ret) and (pd.isna(close_ret) or high_ret >= close_ret) else "CLOSE_RETURN"
+            row = v24_prior_feature_row(
+                feat,
+                event_date,
+                sym,
+                collector_ret,
+                actual_close_change=close_ret,
+                actual_high_change=high_ret,
+                return_basis=basis,
+            )
             if row:
                 row["Collector_Date_Query_Format"] = "YYYY-MM-DD"
+                row["Manual_Smoke"] = is_manual
                 rows.append(row)
 
     extreme = pd.DataFrame(rows)
@@ -8939,6 +9039,8 @@ def v24_collect_extreme_gainers_from_history(
         extreme["Is_Debug_20Plus"] = extreme["Actual_Change_%"] >= float(debug_pct)
 
     errors_df = pd.DataFrame(errors)
+    top_observed_df = pd.DataFrame(top_rows).sort_values("Max_Observed_Return_%", ascending=False) if top_rows else pd.DataFrame()
+    smoke_df = pd.DataFrame(smoke_rows).sort_values("Max_Observed_Return_%", ascending=False) if smoke_rows else pd.DataFrame()
     debug_df = pd.DataFrame(debug_rows)
     summary = v24_extreme_daily_summary(extreme)
 
@@ -8951,12 +9053,15 @@ def v24_collect_extreme_gainers_from_history(
         "Events_100Plus": int((extreme.get("Actual_Change_%", pd.Series(dtype=float)) >= 100).sum()) if not extreme.empty else 0,
         "Events_DebugPlus": int(len(debug_df)),
         "Max_Observed_Return_%": round(float(max_observed), 2) if pd.notna(max_observed) else np.nan,
-        "Data_Source": "Yahoo_Daily_OHLCV",
-        "Diagnostic_Note": "If Events_DebugPlus is 0 even at 20%, check ticker universe/data provider. ISO date query is locale-safe.",
+        "Max_Close_Return_%": round(float(max_close_observed), 2) if pd.notna(max_close_observed) else np.nan,
+        "Max_High_Return_%": round(float(max_high_observed), 2) if pd.notna(max_high_observed) else np.nan,
+        "Top_Observed_Rows": int(len(top_observed_df)),
+        "Manual_Smoke_Data_OK": int(smoke_df.get("Data_OK", pd.Series(dtype=bool)).fillna(False).sum()) if not smoke_df.empty else 0,
+        "Data_Source": "Yahoo_Daily_OHLCV_HighOrClose",
+        "Diagnostic_Note": "v24.2 forces manual smoke symbols and uses max(Close_Return, High_Return) for runner detection. If smoke max returns stay low, provider data may be stale/missing or dates may not include runner day.",
     })
     diag_df = pd.DataFrame([diagnostics])
-    return extreme, summary, errors_df, diag_df
-
+    return extreme, summary, errors_df, diag_df, top_observed_df, smoke_df
 
 def v24_extreme_daily_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
     if extreme_df is None or extreme_df.empty or "date" not in extreme_df.columns:
@@ -9185,9 +9290,9 @@ def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.D
 
 
 def render_v24_runner_dna_lab_tab():
-    st.subheader("📊 v24.1 Historical Runner DNA Lab — ISO Collector Fix + Diagnostics")
+    st.subheader("📊 v24.2 Historical Runner DNA Lab — Forced Smoke + High Return Collector")
     st.caption(
-        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.1 ISO tarih/diagnostics patch içerir. "
+        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.2 forced smoke + high-return diagnostics patch içerir. "
         "Bu sekme alım sinyali üretmez; v23/v22 skorlarını veriyle kalibre eder."
     )
 
@@ -9244,8 +9349,8 @@ def render_v24_runner_dna_lab_tab():
                 if not tickers:
                     st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
                 else:
-                    with st.spinner(f"v24.1 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
-                        extreme, daily_summary, errors, diagnostics = v24_collect_extreme_gainers_from_history(
+                    with st.spinner(f"v24.2 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
+                        extreme, daily_summary, errors, diagnostics, top_observed, smoke_df = v24_collect_extreme_gainers_from_history(
                             tickers=tickers,
                             start_date=start_date,
                             end_date=end_date_s,
@@ -9253,15 +9358,30 @@ def render_v24_runner_dna_lab_tab():
                             max_tickers=int(max_tickers),
                             sample_mode=sample_mode,
                             debug_pct=float(debug_gain),
+                            manual_symbols=manual_symbols,
                         )
                     st.session_state["v24_extreme_df"] = extreme
                     st.session_state["v24_daily_summary_df"] = daily_summary
                     st.session_state["v24_errors_df"] = errors
                     st.session_state["v24_diagnostics_df"] = diagnostics
+                    st.session_state["v24_top_observed_df"] = top_observed
+                    st.session_state["v24_smoke_df"] = smoke_df
                     st.markdown("### Collector diagnostics")
                     st.dataframe(diagnostics, use_container_width=True)
+
+                    if smoke_df is not None and not smoke_df.empty:
+                        st.markdown("### Manual smoke symbol diagnostics")
+                        st.caption("Bu tablo HCWB/SLXN/VIDA/GCL/PHGE/MTVA gibi zorla taramaya dahil edilen sembollerin gerçekten veri döndürüp döndürmediğini ve max getirilerini gösterir.")
+                        st.dataframe(smoke_df.head(100), use_container_width=True)
+
+                    if top_observed is not None and not top_observed.empty:
+                        st.markdown("### Top observed gainers in scanned universe")
+                        st.caption("Threshold üstü olay çıkmasa bile taranan evrende görülen en yüksek close/high getirilerini gösterir. Boş collector teşhisi için en önemli tablodur.")
+                        st.dataframe(top_observed.head(50), use_container_width=True)
+
+                    now = datetime.now().strftime("%Y%m%d_%H%M%S")
                     if extreme.empty:
-                        st.warning("Bu evren/aralık/eşikle threshold üstü runner bulunamadı veya veri kaynağı boş döndü. Diagnostics'te Events_DebugPlus ve Max_Observed_Return_% değerlerine bak.")
+                        st.warning("Bu evren/aralık/eşikle threshold üstü runner bulunamadı. Artık Top Observed ve Smoke diagnostics tablolarına bak: veri mi yok, close yerine high mı kaçırıyor, sample mı runnerları kaçırıyor?")
                     else:
                         st.success(f"Extreme runner olayı bulundu: {len(extreme)}")
                         st.markdown("### Günlük 50–99 / 100+ özeti")
@@ -9274,15 +9394,24 @@ def render_v24_runner_dna_lab_tab():
                         st.dataframe(dna.head(100), use_container_width=True)
                         st.markdown("### Bir gün önceki feature kalibrasyon özeti")
                         st.dataframe(feature_summary, use_container_width=True)
-                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
                         st.download_button("⬇️ v24 extreme events CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"v24_extreme_events_{now}.csv", "text/csv", key="v24_dl_extreme")
                         st.download_button("⬇️ v24 daily summary CSV", daily_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_daily_summary_{now}.csv", "text/csv", key="v24_dl_daily")
                         st.download_button("⬇️ v24 runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"v24_runner_dna_{now}.csv", "text/csv", key="v24_dl_dna")
                         st.download_button("⬇️ v24 feature summary CSV", feature_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_feature_summary_{now}.csv", "text/csv", key="v24_dl_feat_summary")
+                    if top_observed is not None and not top_observed.empty:
+                        st.download_button("⬇️ v24 top observed gainers CSV", top_observed.to_csv(index=False).encode("utf-8-sig"), f"v24_top_observed_{now}.csv", "text/csv", key="v24_dl_top_observed")
+                    if smoke_df is not None and not smoke_df.empty:
+                        st.download_button("⬇️ v24 smoke diagnostics CSV", smoke_df.to_csv(index=False).encode("utf-8-sig"), f"v24_smoke_diagnostics_{now}.csv", "text/csv", key="v24_dl_smoke")
                     with st.expander("Collector errors / skipped tickers + diagnostics"):
                         if diagnostics is not None and not diagnostics.empty:
                             st.markdown("#### Diagnostics")
                             st.dataframe(diagnostics, use_container_width=True)
+                        if top_observed is not None and not top_observed.empty:
+                            st.markdown("#### Top observed")
+                            st.dataframe(top_observed.head(200), use_container_width=True)
+                        if smoke_df is not None and not smoke_df.empty:
+                            st.markdown("#### Smoke diagnostics")
+                            st.dataframe(smoke_df.head(200), use_container_width=True)
                         if errors is not None and not errors.empty:
                             st.markdown("#### Errors / skipped")
                             st.dataframe(errors.head(500), use_container_width=True)
