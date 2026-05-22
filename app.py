@@ -19,8 +19,8 @@ from streamlit_autorefresh import st_autorefresh
 # SAYFA AYARLARI
 # ============================================================
 st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v24.3 (Collector Sort Guard + Forced Smoke Diagnostics)")
-st.sidebar.success("v24.3 build aktif — Forced Smoke + High Return Collector aktif")
+st.title("🎯 NextDay Scanner Pro v24.5 (Full-Market Truth Collector + Runner DNA Lab)")
+st.sidebar.success("v24.5 build aktif — Full-market truth collector + Runner DNA Lab aktif")
 
 DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
 
@@ -8732,6 +8732,224 @@ def v24_yf_download_history_cached(tickers_tuple: tuple[str, ...], start_date: s
     return out
 
 
+
+
+def v24_yahoo_chart_history(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict]:
+    """Yahoo chart endpoint fallback. yfinance bazı microcaplerde boş dönerse ham chart endpoint denenir."""
+    diag = {"Yahoo_Chart_OK": False, "Yahoo_Chart_Rows": 0, "Yahoo_Chart_Error": ""}
+    sym = v24_symbol_clean(symbol)
+    if not sym:
+        diag["Yahoo_Chart_Error"] = "empty_symbol"
+        return pd.DataFrame(), diag
+    try:
+        start_ts = int(pd.Timestamp(start_date).timestamp())
+        end_ts = int((pd.Timestamp(end_date) + pd.Timedelta(days=1)).timestamp())
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {
+            "period1": start_ts,
+            "period2": end_ts,
+            "interval": "1d",
+            "events": "history",
+            "includeAdjustedClose": "true",
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        if resp.status_code != 200:
+            diag["Yahoo_Chart_Error"] = f"http_{resp.status_code}"
+            return pd.DataFrame(), diag
+        payload = resp.json()
+        result = (((payload or {}).get("chart") or {}).get("result") or [])
+        if not result:
+            diag["Yahoo_Chart_Error"] = "empty_result"
+            return pd.DataFrame(), diag
+        r0 = result[0]
+        ts = r0.get("timestamp") or []
+        quote = (((r0.get("indicators") or {}).get("quote") or [{}])[0])
+        if not ts or not quote:
+            diag["Yahoo_Chart_Error"] = "missing_quote"
+            return pd.DataFrame(), diag
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(ts, unit="s"),
+            "Open": quote.get("open"),
+            "High": quote.get("high"),
+            "Low": quote.get("low"),
+            "Close": quote.get("close"),
+            "Volume": quote.get("volume"),
+        })
+        df = df.dropna(subset=["Close"]).set_index("Date").sort_index()
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]]
+        diag["Yahoo_Chart_OK"] = not df.empty
+        diag["Yahoo_Chart_Rows"] = int(len(df))
+        return df, diag
+    except Exception as exc:
+        diag["Yahoo_Chart_Error"] = str(exc)[:160]
+        return pd.DataFrame(), diag
+
+
+def v24_yahoo_individual_history(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict]:
+    """Tek sembol için yfinance download + Ticker.history + chart endpoint fallback."""
+    sym = v24_symbol_clean(symbol)
+    diag = {
+        "Yahoo_Individual_OK": False,
+        "Yahoo_Individual_Rows": 0,
+        "Yahoo_Individual_Method": "",
+        "Yahoo_Individual_Error": "",
+        "Yahoo_Chart_OK": False,
+        "Yahoo_Chart_Rows": 0,
+        "Yahoo_Chart_Error": "",
+    }
+    if not sym:
+        diag["Yahoo_Individual_Error"] = "empty_symbol"
+        return pd.DataFrame(), diag
+    try:
+        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = yf.download(
+            tickers=sym,
+            start=start_date,
+            end=end_plus,
+            interval="1d",
+            auto_adjust=False,
+            prepost=False,
+            progress=False,
+            threads=False,
+        )
+        df = v24_normalize_downloaded_df(raw, sym)
+        if not df.empty:
+            diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(df)), "Yahoo_Individual_Method": "yf.download_single"})
+            return df, diag
+    except Exception as exc:
+        diag["Yahoo_Individual_Error"] = f"download:{str(exc)[:120]}"
+    try:
+        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = yf.Ticker(sym).history(start=start_date, end=end_plus, interval="1d", auto_adjust=False, actions=False)
+        df = v24_normalize_downloaded_df(raw, sym)
+        if not df.empty:
+            diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(df)), "Yahoo_Individual_Method": "ticker.history"})
+            return df, diag
+    except Exception as exc:
+        err = diag.get("Yahoo_Individual_Error") or ""
+        diag["Yahoo_Individual_Error"] = (err + " | history:" + str(exc)[:120]).strip(" |")
+    chart_df, chart_diag = v24_yahoo_chart_history(sym, start_date, end_date)
+    diag.update(chart_diag)
+    if not chart_df.empty:
+        diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(chart_df)), "Yahoo_Individual_Method": "query1_chart"})
+        return chart_df, diag
+    return pd.DataFrame(), diag
+
+
+def v24_alpaca_daily_range(symbol: str, start_date: str, end_date: str, api_key_value: str = "", secret_key_value: str = "", feed: str = "iex") -> tuple[pd.DataFrame, dict]:
+    """Alpaca daily bars fallback. Feed IEX/SIP ayrı loglanır; SIP erişimi yoksa hata diagnostikte görünür."""
+    sym = v24_symbol_clean(symbol)
+    diag = {"Alpaca_OK": False, "Alpaca_Rows": 0, "Alpaca_Feed": feed or "iex", "Alpaca_Error": ""}
+    if not sym:
+        diag["Alpaca_Error"] = "empty_symbol"
+        return pd.DataFrame(), diag
+    if not api_key_value or not secret_key_value:
+        diag["Alpaca_Error"] = "missing_api_keys"
+        return pd.DataFrame(), diag
+    try:
+        start_ts = pd.to_datetime(start_date).strftime("%Y-%m-%dT00:00:00Z")
+        end_ts = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        url = f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+        params = {
+            "timeframe": "1Day",
+            "start": start_ts,
+            "end": end_ts,
+            "adjustment": "all",
+            "limit": 10000,
+            "feed": feed or "iex",
+        }
+        resp = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params=params, timeout=15)
+        if resp.status_code != 200:
+            diag["Alpaca_Error"] = f"http_{resp.status_code}:{resp.text[:120]}"
+            return pd.DataFrame(), diag
+        payload = resp.json()
+        bars = payload.get("bars", [])
+        if not bars:
+            diag["Alpaca_Error"] = "empty_bars"
+            return pd.DataFrame(), diag
+        rows = []
+        for b in bars:
+            rows.append({
+                "Date": pd.to_datetime(b.get("t"), utc=True).tz_localize(None),
+                "Open": safe_float(b.get("o"), np.nan),
+                "High": safe_float(b.get("h"), np.nan),
+                "Low": safe_float(b.get("l"), np.nan),
+                "Close": safe_float(b.get("c"), np.nan),
+                "Volume": safe_float(b.get("v"), np.nan),
+            })
+        df = pd.DataFrame(rows).dropna(subset=["Close"]).set_index("Date").sort_index()
+        if df.empty:
+            diag["Alpaca_Error"] = "empty_after_parse"
+            return df, diag
+        diag.update({"Alpaca_OK": True, "Alpaca_Rows": int(len(df))})
+        return df[["Open", "High", "Low", "Close", "Volume"]], diag
+    except Exception as exc:
+        diag["Alpaca_Error"] = str(exc)[:160]
+        return pd.DataFrame(), diag
+
+
+def v24_deep_fetch_history(symbol: str, start_date: str, end_date: str, api_key_value: str = "", secret_key_value: str = "", alpaca_feed: str = "iex") -> tuple[pd.DataFrame, str, dict]:
+    """Manual smoke / küçük evren için çok katmanlı veri sağlayıcı fallback.
+
+    Sıra:
+    1) Alpaca selected feed
+    2) Alpaca IEX/SIP alternatif feed denemesi
+    3) Yahoo individual download / Ticker.history / chart endpoint
+    """
+    diag = {
+        "Provider_Source": "",
+        "Provider_Attempts": [],
+        "Rows_Returned": 0,
+        "First_Date": "",
+        "Last_Date": "",
+        "Alpaca_OK": False,
+        "Alpaca_Rows": 0,
+        "Alpaca_Error": "",
+        "Yahoo_Individual_OK": False,
+        "Yahoo_Individual_Rows": 0,
+        "Yahoo_Individual_Method": "",
+        "Yahoo_Individual_Error": "",
+        "Yahoo_Chart_OK": False,
+        "Yahoo_Chart_Rows": 0,
+        "Yahoo_Chart_Error": "",
+    }
+    feeds = []
+    if alpaca_feed:
+        feeds.append(alpaca_feed)
+    for f in ["iex", "sip"]:
+        if f not in feeds:
+            feeds.append(f)
+    for f in feeds:
+        df, a_diag = v24_alpaca_daily_range(symbol, start_date, end_date, api_key_value, secret_key_value, f)
+        diag["Provider_Attempts"].append(f"Alpaca_{f}")
+        # Son Alpaca hata bilgisi kalsın; başarılı olursa zaten döner.
+        diag.update({k: v for k, v in a_diag.items() if k in diag or k.startswith("Alpaca")})
+        if not df.empty:
+            diag["Provider_Source"] = f"Alpaca_{f}"
+            diag["Alpaca_OK"] = True
+            diag["Alpaca_Rows"] = int(len(df))
+            diag["Rows_Returned"] = int(len(df))
+            diag["First_Date"] = df.index.min().strftime("%Y-%m-%d")
+            diag["Last_Date"] = df.index.max().strftime("%Y-%m-%d")
+            return df, diag["Provider_Source"], diag
+    ydf, ydiag = v24_yahoo_individual_history(symbol, start_date, end_date)
+    diag["Provider_Attempts"].append("Yahoo_Individual")
+    diag.update(ydiag)
+    if not ydf.empty:
+        diag["Provider_Source"] = "Yahoo_Individual_" + (ydiag.get("Yahoo_Individual_Method") or "unknown")
+        diag["Rows_Returned"] = int(len(ydf))
+        diag["First_Date"] = ydf.index.min().strftime("%Y-%m-%d")
+        diag["Last_Date"] = ydf.index.max().strftime("%Y-%m-%d")
+        return ydf, diag["Provider_Source"], diag
+    diag["Provider_Source"] = "NO_DATA_ALL_PROVIDERS"
+    diag["Provider_Attempts"] = ",".join(diag["Provider_Attempts"])
+    return pd.DataFrame(), diag["Provider_Source"], diag
+
 def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     """Runner günü ve bir gün öncesi için temel OHLCV feature seti.
 
@@ -8862,6 +9080,340 @@ def v24_iso_date_query_preview(min_pct: float, date_s: str) -> str:
     )
 
 
+
+# v24.5 FULL-MARKET TRUTH COLLECTOR
+# ------------------------------------------------------------
+# AI Invest denetiminden çıkan mimari ayrım:
+# 1) Truth Collector: full-market FinScreener event query ile gerçek %50+/%100+ olayları toplar.
+#    Bu aşamada ticker universe, daily_shuffle, Alpaca/Yahoo, price/mcap/tradeability filtresi kullanılmaz.
+# 2) Feature Enricher: truth events bulunduktan sonra Alpaca/Yahoo barları ile önceki gün feature'larını çıkarır.
+# 3) Signal Joiner: model sinyalleri ile truth events eşleştirilir.
+
+def v24_truth_safe_float_value(x):
+    if x is None:
+        return None
+    try:
+        if isinstance(x, str):
+            x = x.replace("%", "").replace("$", "").replace(",", "").strip()
+            if x == "" or x.lower() in ["nan", "none", "null", "n/a", "-"]:
+                return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def v24_truth_clean_plain_symbol(symbol):
+    sym = v24_symbol_clean(symbol)
+    if not sym:
+        return None
+    # FinScreener/AInvest bazen AKTX.O gibi suffix döndürebilir.
+    if "." in sym:
+        sym = sym.split(".")[0]
+    return sym
+
+
+def v24_get_finscreener_callable():
+    """Ortamda FinScreener varsa döndürür; yoksa None.
+
+    Not: Standart Render/Streamlit ortamında FinScreener fonksiyonu bulunmayabilir.
+    Bu durumda kullanıcı AInvest/FinScreener CSV'sini 'Uploaded Extreme CSV' sekmesine yükleyebilir.
+    """
+    fs = globals().get("FinScreener")
+    if callable(fs):
+        return fs, "globals.FinScreener"
+    # Bazı kullanıcı ortamlarında farklı paket isimleri olabilir; hata üretmeden deneriz.
+    import_attempts = [
+        ("ainvest", "FinScreener"),
+        ("aiinvest", "FinScreener"),
+        ("fin_screener", "FinScreener"),
+        ("finscreener", "FinScreener"),
+    ]
+    for mod_name, attr in import_attempts:
+        try:
+            mod = __import__(mod_name, fromlist=[attr])
+            fn = getattr(mod, attr, None)
+            if callable(fn):
+                return fn, f"{mod_name}.{attr}"
+        except Exception:
+            continue
+    return None, "NOT_AVAILABLE"
+
+
+def v24_pick_symbol_column(df: pd.DataFrame):
+    candidates = ["code", "stock code", "symbol", "Symbol", "ticker", "Ticker"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "symbol" in col_str or "ticker" in col_str or "code" in col_str:
+            return col
+    return None
+
+
+def v24_pick_name_column(df: pd.DataFrame):
+    candidates = ["name", "stock name", "Name", "company", "Company", "description", "Description"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "name" in col_str or "company" in col_str or "description" in col_str:
+            return col
+    return None
+
+
+def v24_pick_percentage_change_column(df: pd.DataFrame, ymd: str):
+    for col in df.columns:
+        col_str = str(col)
+        if "Percentage Change[" in col_str and ymd in col_str:
+            return col
+    for col in df.columns:
+        col_str = str(col)
+        if "Percentage Change[" in col_str:
+            return col
+    for col in df.columns:
+        col_str = str(col)
+        if "Last Percentage Change" in col_str or ("Last Change" in col_str and "%" in col_str):
+            return col
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "change" in col_str and ("%" in col_str or "pct" in col_str or "percentage" in col_str):
+            return col
+    return None
+
+
+def v24_pick_last_price_column(df: pd.DataFrame):
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "last price" in col_str or "last sale" in col_str:
+            return col
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "closing price" in col_str or col_str in ["price", "last"]:
+            return col
+    return None
+
+
+def v24_pick_volume_column(df: pd.DataFrame):
+    for col in df.columns:
+        col_str = str(col).lower()
+        if "trading volume" in col_str:
+            return col
+    for col in df.columns:
+        col_str = str(col).lower()
+        if col_str == "volume" or "volume" in col_str:
+            return col
+    return None
+
+
+def v24_pick_market_cap_column(df: pd.DataFrame):
+    for col in df.columns:
+        if "market cap" in str(col).lower():
+            return col
+    return None
+
+
+def v24_collect_extreme_events_truth_finscreener(start_date, end_date, min_pct: float = 50.0):
+    """Full-market truth collector.
+
+    Verilen tarih aralığında ABD piyasasında günlük Percentage Change >= min_pct olan gerçek runner
+    olaylarını doğrudan FinScreener event query ile toplar. Bu aşamada ticker universe, max scan,
+    daily_shuffle, manual smoke, Alpaca/Yahoo veya tradeability filtresi kullanılmaz.
+    """
+    fs, fs_source = v24_get_finscreener_callable()
+    start_s = v24_parse_date_any(start_date)
+    end_s = v24_parse_date_any(end_date)
+    rows = []
+    logs = []
+
+    if fs is None:
+        return pd.DataFrame(), pd.DataFrame([{
+            "date": "",
+            "status": "finscreener_not_available",
+            "query": "",
+            "raw_rows": 0,
+            "kept_rows": 0,
+            "finscreener_source": fs_source,
+            "message": "FinScreener callable not found in this Streamlit environment. Use Uploaded Extreme CSV or install/provide FinScreener."
+        }])
+
+    cur = pd.to_datetime(start_s).date()
+    end_d = pd.to_datetime(end_s).date()
+    while cur <= end_d:
+        iso = cur.strftime("%Y-%m-%d")
+        ymd = cur.strftime("%Y%m%d")
+        if cur.weekday() >= 5:
+            logs.append({
+                "date": iso,
+                "status": "skipped_weekend",
+                "query": "",
+                "raw_rows": 0,
+                "kept_rows": 0,
+                "finscreener_source": fs_source,
+                "message": "Weekend skipped"
+            })
+            cur += pd.Timedelta(days=1).date() if False else __import__('datetime').timedelta(days=1)
+            continue
+
+        query = v24_iso_date_query_preview(float(min_pct), iso)
+        try:
+            df = fs(query)
+        except Exception as e:
+            logs.append({
+                "date": iso,
+                "status": "error",
+                "query": query,
+                "raw_rows": 0,
+                "kept_rows": 0,
+                "finscreener_source": fs_source,
+                "message": str(e)
+            })
+            cur += __import__('datetime').timedelta(days=1)
+            continue
+
+        if df is None or getattr(df, "empty", True):
+            logs.append({
+                "date": iso,
+                "status": "empty",
+                "query": query,
+                "raw_rows": 0,
+                "kept_rows": 0,
+                "finscreener_source": fs_source,
+                "message": "FinScreener returned no rows"
+            })
+            cur += __import__('datetime').timedelta(days=1)
+            continue
+
+        symbol_col = v24_pick_symbol_column(df)
+        name_col = v24_pick_name_column(df)
+        pct_col = v24_pick_percentage_change_column(df, ymd)
+        price_col = v24_pick_last_price_column(df)
+        volume_col = v24_pick_volume_column(df)
+        mcap_col = v24_pick_market_cap_column(df)
+        if symbol_col is None or pct_col is None:
+            logs.append({
+                "date": iso,
+                "status": "missing_required_columns",
+                "query": query,
+                "raw_rows": len(df),
+                "kept_rows": 0,
+                "finscreener_source": fs_source,
+                "message": f"Columns returned: {list(df.columns)}"
+            })
+            cur += __import__('datetime').timedelta(days=1)
+            continue
+
+        kept = 0
+        for _, r in df.iterrows():
+            sym = v24_truth_clean_plain_symbol(r.get(symbol_col))
+            pct_val = v24_truth_safe_float_value(r.get(pct_col))
+            if not sym or pct_val is None or pct_val < float(min_pct):
+                continue
+            bucket = "100_PLUS" if pct_val >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
+            rows.append({
+                "date": iso,
+                "Symbol": sym,
+                "Name": r.get(name_col) if name_col else None,
+                "Actual_Change_%": round(float(pct_val), 4),
+                "pct_change_on_day": round(float(pct_val), 4),
+                "Bucket": bucket,
+                "bucket": bucket,
+                "Last_Price": r.get(price_col) if price_col else None,
+                "Volume": r.get(volume_col) if volume_col else None,
+                "MarketCap": r.get(mcap_col) if mcap_col else None,
+                "Truth_Source": "FinScreener_FullMarket_Event_Query",
+                "pct_col_used": pct_col,
+                "source_query": query,
+            })
+            kept += 1
+
+        logs.append({
+            "date": iso,
+            "status": "ok" if kept > 0 else "raw_rows_but_no_kept_rows",
+            "query": query,
+            "raw_rows": len(df),
+            "kept_rows": kept,
+            "finscreener_source": fs_source,
+            "message": f"Raw rows: {len(df)}, kept rows: {kept}"
+        })
+        cur += __import__('datetime').timedelta(days=1)
+
+    events_df = pd.DataFrame(rows)
+    log_df = pd.DataFrame(logs)
+    if not events_df.empty:
+        events_df = events_df.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).reset_index(drop=True)
+    return events_df, log_df
+
+
+def v24_truth_collector_diagnostics(events_df: pd.DataFrame, log_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df is None or events_df.empty:
+        event_rows = unique_symbols = plus_50_99 = plus_100 = 0
+    else:
+        event_rows = len(events_df)
+        unique_symbols = events_df["Symbol"].nunique() if "Symbol" in events_df.columns else 0
+        plus_100 = int((pd.to_numeric(events_df.get("Actual_Change_%"), errors="coerce") >= V24_BIG_RUNNER_GAIN_PCT).sum())
+        plus_50_99 = int(event_rows - plus_100)
+    if log_df is None or log_df.empty or "status" not in log_df.columns:
+        statuses = {}
+    else:
+        statuses = log_df["status"].value_counts().to_dict()
+    return pd.DataFrame([{
+        "Collector_Mode": "FULL_MARKET_TRUTH_COLLECTOR",
+        "event_rows": int(event_rows),
+        "unique_symbols": int(unique_symbols),
+        "50_99_events": int(plus_50_99),
+        "100_PLUS_events": int(plus_100),
+        "ok_days": int(statuses.get("ok", 0)),
+        "empty_days": int(statuses.get("empty", 0)),
+        "error_days": int(statuses.get("error", 0)),
+        "weekend_skipped": int(statuses.get("skipped_weekend", 0)),
+        "missing_column_days": int(statuses.get("missing_required_columns", 0)),
+        "finscreener_not_available": int(statuses.get("finscreener_not_available", 0)),
+    }])
+
+
+def v24_try_enrich_truth_events_with_prior_features(events_df: pd.DataFrame, max_events: int = 200) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Truth events bulunduktan sonra opsiyonel olarak önceki gün daily feature ekler.
+
+    Bu, truth collector'ın parçası değildir; Alpaca/Yahoo hatası truth event listesini silemez.
+    """
+    if events_df is None or events_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    rows = []
+    logs = []
+    work = events_df.head(int(max_events)).copy()
+    for _, ev in work.iterrows():
+        sym = v24_symbol_clean(ev.get("Symbol"))
+        date_s = v24_parse_date_any(ev.get("date"))
+        if not sym or not date_s:
+            continue
+        # Önceki özellikler için yaklaşık 80 gün geriye bakılır.
+        start_s = (pd.to_datetime(date_s) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        end_s = date_s
+        try:
+            df, provider, diag = v24_deep_fetch_history(sym, start_s, end_s, api_key_value=api_key, secret_key_value=secret_key, alpaca_feed=os.getenv("ALPACA_FEED", "iex"))
+            if df is None or df.empty or len(df) < 2:
+                logs.append({"Symbol": sym, "date": date_s, "status": "no_feature_data", "provider": provider, **(diag or {})})
+                base = ev.to_dict()
+                base.update({"Feature_Enrichment_Status": "NO_DATA", "Feature_Provider": provider})
+                rows.append(base)
+                continue
+            feat = v24_compute_daily_features(df)
+            prior = v24_prior_feature_row(sym, feat, date_s)
+            base = ev.to_dict()
+            base.update(prior)
+            base.update({"Feature_Enrichment_Status": "OK", "Feature_Provider": provider})
+            rows.append(base)
+            logs.append({"Symbol": sym, "date": date_s, "status": "ok", "provider": provider, "rows": len(df)})
+        except Exception as e:
+            logs.append({"Symbol": sym, "date": date_s, "status": "error", "message": str(e)})
+            base = ev.to_dict()
+            base.update({"Feature_Enrichment_Status": "ERROR", "Feature_Error": str(e)})
+            rows.append(base)
+    return pd.DataFrame(rows), pd.DataFrame(logs)
+
+
 def v24_collect_extreme_gainers_from_history(
     tickers: list[str],
     start_date: str,
@@ -8871,13 +9423,17 @@ def v24_collect_extreme_gainers_from_history(
     sample_mode: str = "daily_shuffle",
     debug_pct: float = V24_DEBUG_GAIN_PCT,
     manual_symbols: list[str] | None = None,
+    api_key_value: str = "",
+    secret_key_value: str = "",
+    alpaca_feed: str = "iex",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar.
 
-    v24.3 patch:
+    v24.4 patch:
     - Manual smoke semboller örneklemeden bağımsız şekilde ZORLA taramaya eklenir.
     - Event tespiti sadece close-to-close değil, max(close return, intraday high return) ile yapılır.
-    - Collector boş dönse bile Top Observed Gainers ve Smoke Symbol diagnostics üretir.
+    - Yahoo bulk boş dönerse manual smoke semboller için Alpaca + Yahoo individual + Yahoo chart fallback denenir.
+    - Provider-level diagnostics üretir: Alpaca/Yahoo OK, rows, first/last date, hata kaynağı.
     """
     start_iso = v24_parse_date_any(start_date) or str(start_date)
     end_iso = v24_parse_date_any(end_date) or str(end_date)
@@ -8887,7 +9443,7 @@ def v24_collect_extreme_gainers_from_history(
     manual_clean = list(dict.fromkeys(manual_clean))
 
     diagnostics = {
-        "Collector_Version": "v24.3_SORT_GUARD_FORCED_SMOKE",
+        "Collector_Version": "v24.4_PROVIDER_FALLBACK_DEEP_SMOKE",
         "Locale_Safe_Date_Mode": "YYYY-MM-DD",
         "Return_Mode": "MAX_OF_CLOSE_RETURN_AND_INTRADAY_HIGH_RETURN",
         "Start_Date_ISO": start_iso,
@@ -8938,23 +9494,80 @@ def v24_collect_extreme_gainers_from_history(
     max_close_observed = np.nan
     max_high_observed = np.nan
 
+    provider_source_counts: dict[str, int] = {}
+    deep_fetch_used = 0
+
     for sym in selected:
         is_manual = sym in set(manual_clean)
         raw = hist_dict.get(sym, pd.DataFrame())
+        provider_source = "Yahoo_Bulk" if raw is not None and not raw.empty else ""
+        provider_diag = {
+            "Provider_Source": provider_source,
+            "Provider_Attempts": "Yahoo_Bulk",
+            "Rows_Returned": int(len(raw)) if raw is not None and not raw.empty else 0,
+            "First_Date": raw.index.min().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
+            "Last_Date": raw.index.max().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
+        }
+
+        # v24.4: Bulk Yahoo no_data ise manual smoke sembollerde derin provider debug yap.
+        # Küçük evrenlerde tüm sembollere de denenebilir; büyük 900+ evrende hız için manual ile sınırlı tutulur.
+        if (raw is None or raw.empty) and (is_manual or len(selected) <= 120):
+            deep_fetch_used += 1
+            raw, provider_source, provider_diag = v24_deep_fetch_history(
+                sym,
+                start_buffer,
+                end_iso,
+                api_key_value=api_key_value,
+                secret_key_value=secret_key_value,
+                alpaca_feed=alpaca_feed,
+            )
+
+        provider_source_counts[provider_source or "NO_DATA"] = provider_source_counts.get(provider_source or "NO_DATA", 0) + 1
+
         if raw is None or raw.empty:
             insufficient += 1
-            err = {"Symbol": sym, "Error": "no_data", "Rows": 0, "Manual_Smoke": is_manual}
+            err = {
+                "Symbol": sym,
+                "Error": "no_data",
+                "Rows": 0,
+                "Manual_Smoke": is_manual,
+                **provider_diag,
+            }
             errors.append(err)
             if is_manual:
-                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": False, "Error": "no_data"})
+                smoke_rows.append({
+                    "Symbol": sym,
+                    "Manual_Smoke": True,
+                    "Data_OK": False,
+                    "Error": "no_data",
+                    **provider_diag,
+                })
             continue
-        if len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES:
+
+        # v24.4: Runner event tespiti için 2 günlük bar yeterli.
+        # 25 bar altı feature kalitesi zayıf olur; ama veri var/yok ve high-return smoke test için elenmez.
+        low_history_warning = len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES
+        if len(raw) < 2:
             insufficient += 1
-            err = {"Symbol": sym, "Error": "insufficient_history", "Rows": int(len(raw)), "Manual_Smoke": is_manual}
+            err = {
+                "Symbol": sym,
+                "Error": "insufficient_history_lt2",
+                "Rows": int(len(raw)),
+                "Manual_Smoke": is_manual,
+                **provider_diag,
+            }
             errors.append(err)
             if is_manual:
-                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": False, "Rows": int(len(raw)), "Error": "insufficient_history"})
+                smoke_rows.append({
+                    "Symbol": sym,
+                    "Manual_Smoke": True,
+                    "Data_OK": False,
+                    "Rows": int(len(raw)),
+                    "Error": "insufficient_history_lt2",
+                    **provider_diag,
+                })
             continue
+
         data_ok += 1
         feat = v24_compute_daily_features(raw)
         if feat.empty or "Collector_Return_%" not in feat.columns:
@@ -8997,6 +9610,10 @@ def v24_collect_extreme_gainers_from_history(
                 "Prev_Close": round(safe_float(max_row.get("Prev_Close"), np.nan), 4),
                 "Volume": round(safe_float(max_row.get("Volume"), np.nan), 0),
                 "Rows": int(len(raw)),
+                "Provider_Source": provider_source,
+                "Low_History_Warning": bool(low_history_warning),
+                "First_Date": raw.index.min().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
+                "Last_Date": raw.index.max().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
             }
             top_rows.append(top_row)
             if is_manual:
@@ -9031,6 +9648,8 @@ def v24_collect_extreme_gainers_from_history(
             if row:
                 row["Collector_Date_Query_Format"] = "YYYY-MM-DD"
                 row["Manual_Smoke"] = is_manual
+                row["Provider_Source"] = provider_source
+                row["Low_History_Warning"] = bool(low_history_warning)
                 rows.append(row)
 
     extreme = pd.DataFrame(rows)
@@ -9047,9 +9666,9 @@ def v24_collect_extreme_gainers_from_history(
     top_observed_cols = [
         "Symbol", "Manual_Smoke", "Date_of_Max_Return", "Max_Observed_Return_%",
         "Max_Close_Return_%", "Max_High_Return_%", "Close", "High",
-        "Prev_Close", "Volume", "Rows",
+        "Prev_Close", "Volume", "Rows", "Provider_Source", "Low_History_Warning", "First_Date", "Last_Date",
     ]
-    smoke_cols = top_observed_cols + ["Data_OK", "Error"]
+    smoke_cols = top_observed_cols + ["Data_OK", "Error", "Provider_Attempts", "Alpaca_OK", "Alpaca_Rows", "Alpaca_Error", "Yahoo_Individual_OK", "Yahoo_Individual_Rows", "Yahoo_Individual_Method", "Yahoo_Individual_Error", "Yahoo_Chart_OK", "Yahoo_Chart_Rows", "Yahoo_Chart_Error", "Rows_Returned"]
 
     top_observed_df = pd.DataFrame(top_rows)
     if top_observed_df.empty:
@@ -9094,8 +9713,10 @@ def v24_collect_extreme_gainers_from_history(
         "Max_High_Return_%": round(float(max_high_observed), 2) if pd.notna(max_high_observed) else np.nan,
         "Top_Observed_Rows": int(len(top_observed_df)),
         "Manual_Smoke_Data_OK": int(smoke_df.get("Data_OK", pd.Series(dtype=bool)).fillna(False).sum()) if not smoke_df.empty else 0,
-        "Data_Source": "Yahoo_Daily_OHLCV_HighOrClose",
-        "Diagnostic_Note": "v24.3 safely sorts diagnostics, forces manual smoke symbols and uses max(Close_Return, High_Return) for runner detection. If smoke max returns stay low, provider data may be stale/missing or dates may not include runner day.",
+        "Deep_Fetch_Used_Count": int(deep_fetch_used),
+        "Provider_Source_Counts": str(provider_source_counts),
+        "Data_Source": "Yahoo_Bulk + Alpaca/Yahoo_Individual/Yahoo_Chart fallback for smoke",
+        "Diagnostic_Note": "v24.4 adds provider-level fallback and deep smoke diagnostics. If manual smoke remains no_data, check Alpaca/Yahoo individual/chart errors and first/last date columns.",
     })
     diag_df = pd.DataFrame([diagnostics])
     return extreme, summary, errors_df, diag_df, top_observed_df, smoke_df
@@ -9327,139 +9948,214 @@ def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.D
 
 
 def render_v24_runner_dna_lab_tab():
-    st.subheader("📊 v24.3 Historical Runner DNA Lab — Forced Smoke + High Return Collector")
+    st.subheader("📊 v24.5 Historical Runner DNA Lab — Full-Market Truth Collector")
     st.caption(
-        "Amaç: Son 90 gündeki %50+/%100+ runner hisseleri toplayıp bir gün önceki feature'larla ve model sinyalleriyle eşleştirmek. v24.3 forced smoke + high-return diagnostics patch içerir. "
-        "Bu sekme alım sinyali üretmez; v23/v22 skorlarını veriyle kalibre eder."
+        "Amaç: Son 90 gündeki gerçek %50+/%100+ runner olaylarını önce full-market FinScreener event query ile toplamak; "
+        "sonra bu truth table'ı Alpaca/Yahoo ile feature enrichment ve model signal join aşamalarında kullanmak. "
+        "Bu sekme alım sinyali üretmez; v23/v22 skorlarını gerçek outcome datasıyla kalibre eder."
     )
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         end_date = st.date_input("Bitiş tarihi", value=datetime.now(ZoneInfo("America/New_York")).date(), key="v24_end_date")
     with col2:
-        lookback_days = st.number_input("Geriye dönük gün", min_value=10, max_value=365, value=90, step=10, key="v24_lookback")
+        lookback_days = st.number_input("Geriye dönük gün", min_value=1, max_value=365, value=90, step=1, key="v24_lookback")
     with col3:
         min_gain = st.slider("Extreme gain eşiği %", 20.0, 150.0, 50.0, 5.0, key="v24_min_gain")
     with col4:
-        max_tickers = st.number_input("Max ticker tarama", min_value=50, max_value=6000, value=900, step=50, key="v24_max_tickers")
+        max_tickers = st.number_input("Max ticker tarama — sadece Legacy Bar Scanner için", min_value=50, max_value=6000, value=900, step=50, key="v24_max_tickers")
 
     start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
     end_date_s = pd.to_datetime(end_date).strftime("%Y-%m-%d")
 
     st.info(
-        f"Tarih aralığı: {start_date} → {end_date_s}. Tam evren taraması veri kaynağı/rate-limit nedeniyle yavaş olabilir. "
-        "İlk testte 500–1000 sembol yeterli; sonra repo CSV / uploaded CSV ile genişlet."
+        f"Tarih aralığı: {start_date} → {end_date_s}. v24.5'te önerilen ilk adım Full-Market Truth Collector'dır: "
+        "ticker universe, daily_shuffle, Alpaca/Yahoo ve trade filtreleri truth aşamasında kullanılmaz."
     )
 
-    tab_collect, tab_upload, tab_join = st.tabs(["1️⃣ Extreme Collector", "2️⃣ Uploaded Extreme CSV", "3️⃣ Model Signal Join"])
+    tab_collect, tab_upload, tab_join = st.tabs(["1️⃣ Truth Collector", "2️⃣ Uploaded Extreme CSV", "3️⃣ Model Signal Join"])
 
     with tab_collect:
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            ticker_csv = st.file_uploader("Ticker evren CSV yükle (opsiyonel)", type=["csv"], key="v24_ticker_csv")
-            ticker_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v24_ticker_col")
-            manual_symbols_raw = st.text_area(
-                "Manual smoke sembolleri (opsiyonel, virgülle)",
-                value="HCWB,SLXN,VIDA,GCL,PHGE,MTVA",
-                key="v24_manual_smoke_symbols",
-                help="Collector boş dönüyorsa önce bilinen runner sembollerle veri kaynağı/evren testi yap.",
-            )
-        with c2:
-            sample_mode = st.selectbox("Örnekleme", ["daily_shuffle", "first_n"], index=0, key="v24_sample_mode")
-            debug_gain = st.slider("Debug gain eşiği %", 10.0, 50.0, 20.0, 5.0, key="v24_debug_gain")
-            st.caption("daily_shuffle üretim için; first_n yalnız diagnostik. Tarih sorguları ISO YYYY-MM-DD; ay adı/locale yok.")
-
+        mode = st.radio(
+            "Collector modu",
+            [
+                "Full-Market FinScreener Truth Collector — önerilen",
+                "Legacy sampled bar scanner / provider debug — sadece veri teşhisi",
+            ],
+            index=0,
+            key="v24_collector_mode",
+            help="AI Invest önerisi: önce full-market event truth table topla; Alpaca/Yahoo ve sampled scanner sadece enrichment/debug için kullanılmalı.",
+        )
         st.caption(f"ISO sorgu önizleme: `{v24_iso_date_query_preview(float(min_gain), end_date_s)}`")
 
-        if st.button("📊 Son dönem %50+ runner listesini oluştur", key="v24_collect_run"):
-            try:
-                if ticker_csv is not None:
-                    tickers = load_tickers_from_uploaded_csv(ticker_csv, ticker_col.strip() or None)
-                    source = "Uploaded CSV"
-                else:
-                    tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", ticker_col.strip() or None)
-                    source = "Repo nasdaq_nyse_tickers.csv"
-                manual_symbols = [v24_symbol_clean(x) for x in re.split(r"[,\s]+", manual_symbols_raw or "") if v24_symbol_clean(x)]
-                if manual_symbols:
-                    tickers = list(dict.fromkeys(manual_symbols + list(tickers)))
-                    source += " + Manual smoke symbols"
-                if not tickers:
-                    st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
-                else:
-                    with st.spinner(f"v24.3 extreme collector çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
-                        extreme, daily_summary, errors, diagnostics, top_observed, smoke_df = v24_collect_extreme_gainers_from_history(
-                            tickers=tickers,
+        with st.expander("Direct FinScreener sanity test — tek gün hızlı kontrol", expanded=False):
+            sanity_date = st.date_input("Sanity test tarihi", value=pd.to_datetime(end_date).date(), key="v24_sanity_date")
+            if st.button("🔎 Direct FinScreener sanity test çalıştır", key="v24_direct_fs_test"):
+                try:
+                    fs, fs_source = v24_get_finscreener_callable()
+                    q = v24_iso_date_query_preview(float(min_gain), pd.to_datetime(sanity_date).strftime("%Y-%m-%d"))
+                    st.write("FinScreener source:", fs_source)
+                    st.code(q)
+                    if fs is None:
+                        st.error("Bu Streamlit ortamında FinScreener fonksiyonu bulunamadı. Full-market truth collector için FinScreener erişimi gerekir; alternatif olarak Uploaded Extreme CSV sekmesini kullanın.")
+                    else:
+                        test_df = fs(q)
+                        if test_df is None or getattr(test_df, "empty", True):
+                            st.error("Direct FinScreener sanity test boş döndü.")
+                        else:
+                            st.success(f"Direct FinScreener sanity test satır sayısı: {len(test_df)}")
+                            st.write("Returned columns:")
+                            st.write(list(test_df.columns))
+                            st.dataframe(test_df, use_container_width=True)
+                except Exception as exc:
+                    st.error(f"Direct FinScreener sanity test hata verdi: {exc}")
+                    if DEBUG_MODE:
+                        st.code(traceback.format_exc())
+
+        if mode.startswith("Full-Market"):
+            st.markdown("### Full-Market Truth Collector")
+            st.caption(
+                "Bu buton ticker CSV, max ticker, daily_shuffle, manual smoke, Alpaca/Yahoo kullanmadan doğrudan FinScreener event query ile gerçek %50+/%100+ olayları toplar. "
+                "Trade edilebilirlik filtreleri bu aşamada uygulanmaz; nanocap/sub-$1/China riskleri sonradan kolon olarak etiketlenmelidir."
+            )
+            enrich_after_truth = st.checkbox("Truth events bulunduktan sonra önceki gün feature enrichment dene", value=False, key="v24_truth_enrich")
+            max_enrich = st.number_input("Enrichment max event", min_value=10, max_value=1000, value=200, step=10, key="v24_truth_enrich_max")
+            if st.button("📊 Full-market %50+/%100+ truth table oluştur", key="v24_truth_collect_run"):
+                try:
+                    with st.spinner("Full-market FinScreener truth collector çalışıyor..."):
+                        events_df, log_df = v24_collect_extreme_events_truth_finscreener(
                             start_date=start_date,
                             end_date=end_date_s,
                             min_pct=float(min_gain),
-                            max_tickers=int(max_tickers),
-                            sample_mode=sample_mode,
-                            debug_pct=float(debug_gain),
-                            manual_symbols=manual_symbols,
                         )
-                    st.session_state["v24_extreme_df"] = extreme
-                    st.session_state["v24_daily_summary_df"] = daily_summary
-                    st.session_state["v24_errors_df"] = errors
-                    st.session_state["v24_diagnostics_df"] = diagnostics
-                    st.session_state["v24_top_observed_df"] = top_observed
-                    st.session_state["v24_smoke_df"] = smoke_df
-                    st.markdown("### Collector diagnostics")
-                    st.dataframe(diagnostics, use_container_width=True)
-
-                    if smoke_df is not None and not smoke_df.empty:
-                        st.markdown("### Manual smoke symbol diagnostics")
-                        st.caption("Bu tablo HCWB/SLXN/VIDA/GCL/PHGE/MTVA gibi zorla taramaya dahil edilen sembollerin gerçekten veri döndürüp döndürmediğini ve max getirilerini gösterir.")
-                        st.dataframe(smoke_df.head(100), use_container_width=True)
-
-                    if top_observed is not None and not top_observed.empty:
-                        st.markdown("### Top observed gainers in scanned universe")
-                        st.caption("Threshold üstü olay çıkmasa bile taranan evrende görülen en yüksek close/high getirilerini gösterir. Boş collector teşhisi için en önemli tablodur.")
-                        st.dataframe(top_observed.head(50), use_container_width=True)
-
+                    diag = v24_truth_collector_diagnostics(events_df, log_df)
+                    st.session_state["v24_extreme_df"] = events_df
+                    st.session_state["v24_truth_log_df"] = log_df
+                    st.session_state["v24_diagnostics_df"] = diag
+                    st.markdown("### Truth collector diagnostics")
+                    st.dataframe(diag, use_container_width=True)
+                    st.markdown("### Truth collector log")
+                    st.dataframe(log_df, use_container_width=True)
                     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    if extreme.empty:
-                        st.warning("Bu evren/aralık/eşikle threshold üstü runner bulunamadı. Artık Top Observed ve Smoke diagnostics tablolarına bak: veri mi yok, close yerine high mı kaçırıyor, sample mı runnerları kaçırıyor?")
+                    if events_df is None or events_df.empty:
+                        st.warning(
+                            "Full-market event collector bu tarih aralığında threshold üstü olay bulamadı. "
+                            "Log'da finscreener_not_available / empty / error / missing_required_columns ayrımına bakın. "
+                            "Eğer FinScreener bu ortamda yoksa AInvest/FinScreener çıktısını Uploaded Extreme CSV sekmesine yükleyin."
+                        )
                     else:
-                        st.success(f"Extreme runner olayı bulundu: {len(extreme)}")
+                        st.success(f"{len(events_df)} adet %{float(min_gain):g}+ runner olayı bulundu. Benzersiz ticker: {events_df['Symbol'].nunique()}.")
+                        daily_summary = v24_extreme_daily_summary(events_df)
+                        dna = v24_runner_dna_summary(events_df)
+                        st.session_state["v24_daily_summary_df"] = daily_summary
+                        st.markdown("### Extreme runner truth events")
+                        st.dataframe(events_df.head(500), use_container_width=True)
                         st.markdown("### Günlük 50–99 / 100+ özeti")
                         st.dataframe(daily_summary, use_container_width=True)
-                        st.markdown("### Extreme runner olayları + bir gün önceki feature snapshot")
-                        st.dataframe(extreme.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).head(300), use_container_width=True)
-                        dna = v24_runner_dna_summary(extreme)
-                        feature_summary = v24_calibration_feature_summary(extreme)
                         st.markdown("### Runner DNA — tekrar eden runner listesi")
-                        st.dataframe(dna.head(100), use_container_width=True)
-                        st.markdown("### Bir gün önceki feature kalibrasyon özeti")
-                        st.dataframe(feature_summary, use_container_width=True)
-                        st.download_button("⬇️ v24 extreme events CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"v24_extreme_events_{now}.csv", "text/csv", key="v24_dl_extreme")
-                        st.download_button("⬇️ v24 daily summary CSV", daily_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_daily_summary_{now}.csv", "text/csv", key="v24_dl_daily")
-                        st.download_button("⬇️ v24 runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"v24_runner_dna_{now}.csv", "text/csv", key="v24_dl_dna")
-                        st.download_button("⬇️ v24 feature summary CSV", feature_summary.to_csv(index=False).encode("utf-8-sig"), f"v24_feature_summary_{now}.csv", "text/csv", key="v24_dl_feat_summary")
-                    if top_observed is not None and not top_observed.empty:
-                        st.download_button("⬇️ v24 top observed gainers CSV", top_observed.to_csv(index=False).encode("utf-8-sig"), f"v24_top_observed_{now}.csv", "text/csv", key="v24_dl_top_observed")
-                    if smoke_df is not None and not smoke_df.empty:
-                        st.download_button("⬇️ v24 smoke diagnostics CSV", smoke_df.to_csv(index=False).encode("utf-8-sig"), f"v24_smoke_diagnostics_{now}.csv", "text/csv", key="v24_dl_smoke")
-                    with st.expander("Collector errors / skipped tickers + diagnostics"):
-                        if diagnostics is not None and not diagnostics.empty:
-                            st.markdown("#### Diagnostics")
-                            st.dataframe(diagnostics, use_container_width=True)
-                        if top_observed is not None and not top_observed.empty:
-                            st.markdown("#### Top observed")
-                            st.dataframe(top_observed.head(200), use_container_width=True)
+                        st.dataframe(dna.head(150), use_container_width=True)
+                        st.download_button("⬇️ Truth extreme runner events CSV", events_df.to_csv(index=False).encode("utf-8-sig"), f"truth_extreme_runner_events_{start_date}_{end_date_s}_{now}.csv", "text/csv", key="v24_dl_truth_events")
+                        st.download_button("⬇️ Truth collector log CSV", log_df.to_csv(index=False).encode("utf-8-sig"), f"truth_collector_log_{start_date}_{end_date_s}_{now}.csv", "text/csv", key="v24_dl_truth_log")
+                        st.download_button("⬇️ Runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"truth_runner_dna_{now}.csv", "text/csv", key="v24_dl_truth_dna")
+                        if enrich_after_truth:
+                            with st.spinner("Truth events için önceki gün feature enrichment deneniyor..."):
+                                enriched, enrich_log = v24_try_enrich_truth_events_with_prior_features(events_df, max_events=int(max_enrich))
+                            if enriched is not None and not enriched.empty:
+                                st.session_state["v24_extreme_df"] = enriched
+                                st.markdown("### Enriched truth events + prior-day features")
+                                st.dataframe(enriched.head(500), use_container_width=True)
+                                feat_summary = v24_calibration_feature_summary(enriched)
+                                st.markdown("### Bir gün önceki feature kalibrasyon özeti")
+                                st.dataframe(feat_summary, use_container_width=True)
+                                st.download_button("⬇️ Enriched truth events CSV", enriched.to_csv(index=False).encode("utf-8-sig"), f"enriched_truth_events_{now}.csv", "text/csv", key="v24_dl_truth_enriched")
+                            st.markdown("### Enrichment log")
+                            st.dataframe(enrich_log, use_container_width=True)
+                except Exception as exc:
+                    st.error(f"v24 truth collector hata: {exc}")
+                    if DEBUG_MODE:
+                        st.code(traceback.format_exc())
+        else:
+            st.markdown("### Legacy sampled bar scanner / provider debug")
+            st.warning(
+                "Bu mod truth collector değildir. Sadece seçilen/sampled ticker evreninde Alpaca/Yahoo bar verisiyle high/close return tarar. "
+                "Sıfır dönmesi tüm piyasada runner yok anlamına gelmez."
+            )
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                ticker_csv = st.file_uploader("Ticker evren CSV yükle (opsiyonel)", type=["csv"], key="v24_ticker_csv")
+                ticker_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v24_ticker_col")
+                manual_symbols_raw = st.text_area(
+                    "Manual smoke sembolleri (opsiyonel, virgülle)",
+                    value="AKTX,PCLA,RYOJ,QTEX,BIYA,LFS,VCIG",
+                    key="v24_manual_smoke_symbols",
+                    help="2026-05-22 sanity test için AI Invest'in bildirdiği runner sembolleriyle deneyebilirsiniz.",
+                )
+            with c2:
+                sample_mode = st.selectbox("Örnekleme", ["daily_shuffle", "first_n"], index=0, key="v24_sample_mode")
+                debug_gain = st.slider("Debug gain eşiği %", 10.0, 50.0, 20.0, 5.0, key="v24_debug_gain")
+
+            if st.button("📊 Legacy sampled bar scan çalıştır", key="v24_collect_run"):
+                try:
+                    if ticker_csv is not None:
+                        tickers = load_tickers_from_uploaded_csv(ticker_csv, ticker_col.strip() or None)
+                        source = "Uploaded CSV"
+                    else:
+                        tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", ticker_col.strip() or None)
+                        source = "Repo nasdaq_nyse_tickers.csv"
+                    manual_symbols = [v24_symbol_clean(x) for x in re.split(r"[,\s]+", manual_symbols_raw or "") if v24_symbol_clean(x)]
+                    if manual_symbols:
+                        tickers = list(dict.fromkeys(manual_symbols + list(tickers)))
+                        source += " + Manual smoke symbols"
+                    if not tickers:
+                        st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
+                    else:
+                        with st.spinner(f"Legacy sampled bar scanner çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
+                            extreme, daily_summary, errors, diagnostics, top_observed, smoke_df = v24_collect_extreme_gainers_from_history(
+                                tickers=tickers,
+                                start_date=start_date,
+                                end_date=end_date_s,
+                                min_pct=float(min_gain),
+                                max_tickers=int(max_tickers),
+                                sample_mode=sample_mode,
+                                debug_pct=float(debug_gain),
+                                manual_symbols=manual_symbols,
+                                api_key_value=api_key,
+                                secret_key_value=secret_key,
+                                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
+                            )
+                        st.session_state["v24_extreme_df"] = extreme
+                        st.session_state["v24_daily_summary_df"] = daily_summary
+                        st.session_state["v24_errors_df"] = errors
+                        st.session_state["v24_diagnostics_df"] = diagnostics
+                        st.session_state["v24_top_observed_df"] = top_observed
+                        st.session_state["v24_smoke_df"] = smoke_df
+                        st.markdown("### Legacy bar scanner diagnostics")
+                        st.dataframe(diagnostics, use_container_width=True)
                         if smoke_df is not None and not smoke_df.empty:
-                            st.markdown("#### Smoke diagnostics")
-                            st.dataframe(smoke_df.head(200), use_container_width=True)
-                        if errors is not None and not errors.empty:
-                            st.markdown("#### Errors / skipped")
-                            st.dataframe(errors.head(500), use_container_width=True)
+                            st.markdown("### Manual smoke symbol diagnostics")
+                            st.dataframe(smoke_df.head(100), use_container_width=True)
+                        if top_observed is not None and not top_observed.empty:
+                            st.markdown("### Top observed gainers in sampled universe")
+                            st.dataframe(top_observed.head(50), use_container_width=True)
+                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        if extreme.empty:
+                            st.warning("Seçilen sınırlı ticker örnekleminde threshold üstü olay bulunamadı. Bu sonuç tüm piyasada runner yok anlamına gelmez.")
                         else:
-                            st.write("Hata yok veya kayıt tutulmadı.")
-            except Exception as exc:
-                st.error(f"v24 collector hata: {exc}")
-                if DEBUG_MODE:
-                    st.code(traceback.format_exc())
+                            st.success(f"Sampled evrende extreme runner olayı bulundu: {len(extreme)}")
+                            st.dataframe(extreme.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).head(300), use_container_width=True)
+                            st.download_button("⬇️ sampled extreme events CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"sampled_extreme_events_{now}.csv", "text/csv", key="v24_dl_extreme")
+                        with st.expander("Legacy collector errors / skipped tickers + diagnostics"):
+                            if errors is not None and not errors.empty:
+                                st.dataframe(errors.head(500), use_container_width=True)
+                            else:
+                                st.write("Hata yok veya kayıt tutulmadı.")
+                except Exception as exc:
+                    st.error(f"v24 legacy scanner hata: {exc}")
+                    if DEBUG_MODE:
+                        st.code(traceback.format_exc())
 
     with tab_upload:
+        st.caption("FinScreener/AInvest full-market event collector uygulama ortamında çalışmıyorsa, dışarıda üretilen truth event CSV'sini buraya yükleyin.")
         extreme_upload = st.file_uploader("AInvest/FinScreener extreme gainer CSV yükle", type=["csv"], key="v24_extreme_upload")
         news_upload = st.file_uploader("Opsiyonel haber/event CSV yükle (Symbol, Date, Headline)", type=["csv"], key="v24_news_upload")
         if st.button("📥 Uploaded extreme CSV analiz et", key="v24_upload_analyze"):
@@ -9491,13 +10187,13 @@ def render_v24_runner_dna_lab_tab():
                     st.code(traceback.format_exc())
 
     with tab_join:
-        st.caption("Geçmiş NextDay/Night/Supernova/v23 CSV dosyalarını yükle; v24 extreme runner tablosuyla D+1/D+2 eşleştirir.")
+        st.caption("Geçmiş NextDay/Night/Supernova/v23 CSV dosyalarını yükle; v24 extreme runner truth table ile D+1/D+2 eşleştirir.")
         signal_files = st.file_uploader("Model sinyal CSV'leri", type=["csv"], accept_multiple_files=True, key="v24_signal_files")
         if st.button("🔗 Model sinyallerini extreme runner outcome ile eşleştir", key="v24_join_run"):
             try:
                 extreme = st.session_state.get("v24_extreme_df", pd.DataFrame())
                 if extreme is None or extreme.empty:
-                    st.warning("Önce Collector veya Uploaded CSV sekmesinden v24 extreme runner tablosu oluşturun.")
+                    st.warning("Önce Collector veya Uploaded CSV sekmesinden v24 extreme runner truth table oluşturun.")
                 else:
                     signals = v24_load_signal_csvs(signal_files)
                     if signals.empty:
