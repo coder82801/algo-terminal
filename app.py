@@ -1,1015 +1,367 @@
 import os
-import gc
-import time
-import math
-import traceback
-import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import requests
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
-from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
-# SAYFA AYARLARI
+# APP CONFIG
 # ============================================================
-st.set_page_config(page_title="NextDay Scanner Pro", layout="wide")
-st.title("🎯 NextDay Scanner Pro v24.5 (Full-Market Truth Collector + Runner DNA Lab)")
-st.sidebar.success("v24.5 build aktif — Full-market truth collector + Runner DNA Lab aktif")
+st.set_page_config(page_title="Algo Terminal Final Production", layout="wide")
+st.title("🎯 Algo Terminal — Final Production")
+st.caption(
+    "Nihai üretim sürümü: Continuation Engine + Supernova Engine + Radar + Risk Monitor. "
+    "Bu sürüm bilerek production-focus tasarlanmıştır; lab/research katmanları çıkarılmıştır."
+)
 
-DEBUG_MODE = st.sidebar.checkbox("Debug Mode", value=False)
+NY_TZ = ZoneInfo("America/New_York")
+UTC_TZ = ZoneInfo("UTC")
 
-env_api_key = os.getenv("ALPACA_API_KEY", "")
-env_secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+DEFAULT_CONTINUATION_SYMBOLS = [
+    "ROLR", "OGN", "RBBN", "LWLG", "AAOI", "TTMI", "ALAB",
+    "CUE", "RAYA", "SQFT", "SIDU", "FUSE", "TPST", "IPST"
+]
 
-st.sidebar.header("Alpaca API (Paper)")
-api_key = st.sidebar.text_input("API Key ID", value=env_api_key, type="password")
-secret_key = st.sidebar.text_input("Secret Key", value=env_secret_key, type="password")
+DEFAULT_SUPERNOVA_SYMBOLS = [
+    "RMSG", "STI", "TNON", "SOPA", "CTMX", "RR", "SIDU",
+    "MAXN", "CREG", "SKYQ", "SQFT", "FUSE", "GN", "CUE"
+]
 
-st.sidebar.caption("Günlük veri kaynağı: Önce Alpaca historical bars, eksik kalırsa Yahoo fallback.")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_FEED = (os.getenv("ALPACA_FEED", "iex") or "iex").lower()
 
-st.sidebar.divider()
-st.sidebar.header("Son Filtre")
-REJECT_EXTENDED = st.sidebar.checkbox("EXTENDED adayları ele", value=True)
-MIN_FINAL_CONFIDENCE = st.sidebar.slider("Min nihai confidence", min_value=0, max_value=100, value=60, step=5)
+MIN_PRICE = 0.10
+MAX_PRICE_CONTINUATION = 50.0
+MAX_PRICE_SUPERNOVA = 5.0
 
-# Core guardrails
-MAX_EXTENSION_ABOVE_BREAKOUT_PCT = 0.08   # %8 üstü: breakout değil, extended kabul et
-MAX_CONTINUATION_EXTENSION_PCT = 0.06     # continuation için daha sıkı üst sınır
+# Production-side defaults
+DEFAULT_CONT_SCORE_AL = 62
+DEFAULT_CONT_SCORE_STRONG = 78
+DEFAULT_SUPER_PATTERN_AL = 60
+DEFAULT_SUPER_PATTERN_STRONG = 72
+DEFAULT_MIN_PRE_DOLLAR_VOL = 75000
+DEFAULT_MAX_EXTENSION = 0.08
 
-# Overnight Profit Engine v11 ana kuralı:
-# %15 modellenmiş hedef potansiyeli yoksa hiçbir aday gerçek AL / YES_NOW sinyali üretemez.
-MIN_REQUIRED_PROFIT_PCT = 15.0
-MAX_PRICE_FOR_REAL_NIGHT_BUY = 20.0       # %15 gece hedefi için ana evren
-MAX_PRICE_FOR_WATCH_ONLY = 50.0           # 20-50$ watchlist olabilir; 50$ üstü gerçek gece sinyali yok
-MIN_15_TARGET_SCORE = 75.0
-MIN_REAL_SIGNAL_SCORE = 75.0
-MIN_REAL_FINAL_SCORE = 80.0
-MAX_REAL_FAKEOUT_RISK = 45.0
-
-# v14 D+1 %15 Profit Engine: ertesi gün +%15 hedef için ayrı ve daha sert kapı.
-MIN_D1_15_TARGET_SCORE = 78.0
-MIN_D1_DEMAND_PRESSURE = 75.0
-MIN_D1_AH_STRENGTH = 60.0
-MIN_D1_RUNNER_SQUEEZE = 65.0
-MIN_D1_LIQUIDITY_SCORE = 50.0
-MIN_D1_DAILY_MOMENTUM = 60.0
-MAX_D1_FAKEOUT_RISK = 45.0
-
-# v18 Microcap Trap Guard / CLIK Hard Reject
-# Amaç: CLIK tipi düşük piyasa değerli, Çin/HK/Cayman riskli, high'dan sert çöken
-# micro/nanocap runner hisseleri alım sinyali üretmeden elemek.
-MICROCAP_HARD_REJECT_MARKET_CAP = 50_000_000       # <50M$: nanocap hard reject
-MICROCAP_LAB_ONLY_MARKET_CAP = 100_000_000         # 50-100M$: lab/paper only
-MICROCAP_STRICT_REVIEW_MARKET_CAP = 300_000_000    # 100-300M$: sıkı teyit/paper review
-CHINA_HK_MICROCAP_REJECT_CAP = 100_000_000         # Çin/HK/Cayman + <100M$: hard reject
-FAILED_RUNNER_HARD_DROP_PCT = -35.0                # high'dan -35% ve fazlası: hard reject
-FAILED_RUNNER_VWAP_DROP_PCT = -25.0                # high'dan -25% + VWAP altı: hard reject
-PENNY_MICROCAP_REJECT_PRICE = 1.0                  # <$1 + microcap: hard reject
-
-# v19 Entry Confirmation + TP0 + Weak Trigger Guard
-# Amaç: AVPT gibi entry sonrası devam edenleri BW/AIRJ gibi zayıf iğne tetiklerinden ayırmak.
-ENTRY_CONFIRM_MIN_HOLD_MINUTES = 5
-ENTRY_CONFIRM_PREFERRED_HOLD_MINUTES = 15
-ENTRY_READY_MAX_DISTANCE_FROM_HIGH_PCT = -2.5     # current, active high'dan en fazla -%2.5 geride olsun
-ENTRY_READY_MIN_RANGE_POSITION = 0.55             # aktif seans range'inin üst yarısında kalsın
-ENTRY_READY_MIN_BUY_PRESSURE = 0.52
-WEAK_TRIGGER_HIGH_DROP_PCT = -4.0                 # high'dan -%4+ kopma: zayıf tetik riski
-HIGH_FADE_CAUTION_PCT = -12.0                     # high'dan -%12+ kopma: fade riski
-TP0_MIN_QUICK_PROFIT_PCT = 3.0                    # TP0 için min hızlı kâr çıpası
-
-# v22.3 Actionable Target Floor + Too-Tight Stop Guard
-# Amaç: 7.11 -> 7.13 gibi piyasa gürültüsü/spread seviyesindeki "hedefleri" ana hedef gibi göstermemek.
-NEXTDAY_MIN_STOP_DISTANCE_PCT = 2.0       # stop çok dar ise gürültü/spread stopu sayılır; hedef/R hesabı için en az %2 risk tabanı
-NEXTDAY_TOO_TIGHT_STOP_WARN_PCT = 1.0     # bilgilendirici uyarı eşiği
-NEXTDAY_MIN_ACTIONABLE_MOVE_PCT = 3.0     # ana TP0 en az +%3 hareket istemeli
-NEXTDAY_MIN_ACTIONABLE_SCORE = 65.0       # RVOL/VWAP/EMA/RS/OBV gibi matematiksel devam skoru
+SYMBOL_FLAGS = {
+    "RMSG": {"recent_reverse_split": False, "recent_deficiency": True, "otc_risk": False, "catalyst_fresh": True},
+    "STI": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": True},
+    "SOPA": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": False},
+    "TNON": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": False},
+}
 
 
 # ============================================================
-# YARDIMCI FONKSİYONLAR
+# HELPERS
 # ============================================================
-def log_debug(msg: str):
-    if DEBUG_MODE:
-        st.sidebar.write(msg)
-
-
-def safe_float(x, default=np.nan):
+def safe_float(v, default=np.nan):
     try:
-        return float(x)
+        return float(v)
     except Exception:
         return default
 
 
-def safe_int(x, default=0):
+def safe_int(v, default=0):
     try:
-        return int(float(x))
+        return int(float(v))
     except Exception:
         return default
 
 
-def format_price(x: float) -> str:
-    if pd.isna(x):
-        return "-"
-    if x < 1:
-        return f"{x:.4f}"
-    if x < 10:
-        return f"{x:.3f}"
-    return f"{x:.2f}"
+def clamp(x, low, high):
+    return max(low, min(high, x))
 
 
-def detect_china_hk_microcap_risk(symbol: str = "", description: str = "") -> bool:
-    """Çin/HK/Cayman/offshore microcap riskini basit metin/proxy ile yakalar.
-    Bu tek başına yatırım yasağı değildir; piyasa değeri/fade ile birleşince hard reject olur.
-    """
-    text = f"{symbol or ''} {description or ''}".upper()
-    keywords = [
-        " CHINA", "CHINESE", "PRC", "MAINLAND", "HONG KONG", " HK ",
-        "CAYMAN", "CAYMAN ISLAND", "BVI", "BRITISH VIRGIN",
-        "HOLDINGS LIMITED", "HOLDING LIMITED", "LIMITED ADR",
-        "SHENZHEN", "SHANGHAI", "BEIJING", "GUANGZHOU", "HANGZHOU",
-    ]
-    return any(k in text for k in keywords)
+def avg(arr):
+    vals = [safe_float(x, np.nan) for x in arr]
+    vals = [x for x in vals if pd.notna(x)]
+    return float(np.mean(vals)) if vals else np.nan
 
 
-def market_cap_bucket(market_cap: float) -> str:
-    if pd.isna(market_cap) or market_cap <= 0:
-        return "UNKNOWN"
-    if market_cap < MICROCAP_HARD_REJECT_MARKET_CAP:
-        return "NANOCAP_<50M"
-    if market_cap < MICROCAP_LAB_ONLY_MARKET_CAP:
-        return "MICROCAP_50_100M"
-    if market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
-        return "MICROCAP_100_300M"
-    if market_cap < 1_000_000_000:
-        return "SMALLCAP_300M_1B"
-    return "NORMAL_1B_PLUS"
+def median(arr):
+    vals = [safe_float(x, np.nan) for x in arr]
+    vals = [x for x in vals if pd.notna(x)]
+    return float(np.median(vals)) if vals else np.nan
 
 
-def microcap_trap_guard(
-    symbol: str = "",
-    description: str = "",
-    market_cap: float = np.nan,
-    price: float = np.nan,
-    price_to_high_pct: float = np.nan,
-    below_vwap: bool = False,
-    return1d_pct: float = np.nan,
-    change_pct: float = np.nan,
-) -> dict:
-    """CLIK tipi runner/fade tuzaklarını alım sinyalinden çıkarır.
-
-    Karar seviyeleri:
-    - HARD_REJECT: hiçbir modülde alım/paper ana trade sinyali üretme.
-    - LAB_ONLY: yalnızca gözlem/lab; alım sinyali üretme.
-    - STRICT_REVIEW: çok sıkı teyit/paper review; otomatik alım sinyali üretme.
-    - PASS: mikrocap tuzak filtresinden geçer; diğer strateji filtreleri karar verir.
-    """
-    market_cap = safe_float(market_cap, np.nan)
-    price = safe_float(price, np.nan)
-    price_to_high_pct = safe_float(price_to_high_pct, np.nan)
-    return1d_pct = safe_float(return1d_pct, np.nan)
-    change_pct = safe_float(change_pct, np.nan)
-
-    china_hk_risk = detect_china_hk_microcap_risk(symbol, description)
-    bucket = market_cap_bucket(market_cap)
-    reasons = []
-    hard = False
-    lab_only = False
-    strict_review = False
-
-    if pd.notna(market_cap) and market_cap > 0:
-        if market_cap < MICROCAP_HARD_REJECT_MARKET_CAP:
-            hard = True
-            reasons.append("MarketCap <50M nanocap hard reject")
-        elif market_cap < MICROCAP_LAB_ONLY_MARKET_CAP:
-            lab_only = True
-            reasons.append("MarketCap 50-100M: lab/paper only")
-        elif market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
-            strict_review = True
-            reasons.append("MarketCap 100-300M: strict review only")
-
-        if china_hk_risk and market_cap < CHINA_HK_MICROCAP_REJECT_CAP:
-            hard = True
-            reasons.append("China/HK/Cayman microcap <100M hard reject")
-
-        if pd.notna(price) and price < PENNY_MICROCAP_REJECT_PRICE and market_cap < MICROCAP_STRICT_REVIEW_MARKET_CAP:
-            hard = True
-            reasons.append("<$1 + microcap/nanocap hard reject")
-    else:
-        reasons.append("MarketCap unknown: size risk not verified")
-
-    if pd.notna(price_to_high_pct):
-        if price_to_high_pct <= FAILED_RUNNER_HARD_DROP_PCT:
-            hard = True
-            reasons.append("High'dan -35%+ fade: failed runner hard reject")
-        elif price_to_high_pct <= FAILED_RUNNER_VWAP_DROP_PCT and below_vwap:
-            hard = True
-            reasons.append("High'dan -25%+ ve VWAP altı: failed runner")
-        elif price_to_high_pct <= FAILED_RUNNER_VWAP_DROP_PCT:
-            lab_only = True
-            reasons.append("High'dan -25%+ fade: no chase/lab only")
-
-    if pd.notna(return1d_pct) and return1d_pct >= 100 and pd.notna(price_to_high_pct) and price_to_high_pct <= -20:
-        hard = True
-        reasons.append("+100% spike sonrası sert fade: trap runner")
-
-    if pd.notna(change_pct) and change_pct >= 100 and pd.notna(price_to_high_pct) and price_to_high_pct <= -20:
-        hard = True
-        reasons.append("Canlı +100% spike sonrası high'dan kopma")
-
-    if hard:
-        decision = "HARD_REJECT"
-    elif lab_only:
-        decision = "LAB_ONLY"
-    elif strict_review:
-        decision = "STRICT_REVIEW"
-    else:
-        decision = "PASS"
-
-    return {
-        "decision": decision,
-        "hard_reject": decision == "HARD_REJECT",
-        "trade_allowed": decision == "PASS",
-        "reasons": reasons,
-        "reason_text": "; ".join(reasons) if reasons else "PASS",
-        "market_cap_bucket": bucket,
-        "china_hk_risk": bool(china_hk_risk),
-    }
-
-
-# ============================================================
-# v22 RISK ENGINE + PERFORMANCE TRACKER + REAL-MONEY READINESS
-# ============================================================
-V22_MAX_SPREAD_PCT = 1.50
-V22_MAX_MICROCAP_SPREAD_PCT = 1.00
-V22_MIN_DOLLAR_VOLUME_NEXTDAY = 3_000_000
-V22_MIN_DOLLAR_VOLUME_SUPERNOVA = 3_000_000
-V22_IDEAL_DOLLAR_VOLUME_SUPERNOVA = 5_000_000
-V22_MIN_TP15_R_MULTIPLE = 1.50
-V22_MAX_STOP_DISTANCE_PCT = 8.0
-V22_FULL_REAL_MONEY_SIGNAL_COUNT = 100
-V22_MICRO_REAL_TEST_SIGNAL_COUNT = 30
-V22_SLIPPAGE_WARN_PCT = 1.50
-
-
-def v22_price_round(price: float) -> int:
-    price = safe_float(price, np.nan)
-    if pd.isna(price):
-        return 4
-    if price < 1:
-        return 4
-    if price < 10:
-        return 3
-    return 2
-
-
-def v22_pick_first(row: pd.Series | dict, keys: list[str], default=np.nan):
-    for k in keys:
-        try:
-            v = row.get(k, default) if hasattr(row, 'get') else default
-        except Exception:
-            v = default
-        if isinstance(v, str) and v.strip() == "":
-            continue
-        if pd.notna(v):
-            return v
-    return default
-
-
-def v22_normalize_signal_row(row: pd.Series | dict) -> dict:
-    """Farklı modüllerin CSV kolonlarını tek planned_entry/stop yapısına indirger.
-
-    v22.2 notları:
-    - Change_% canlı/gerçekleşmiş değişimdir; Expected_Target_% fallback değildir.
-    - MarketCap ve MarketCap_M kaynakları karıştırılmaz; kaynak kolon ayrıca tutulur.
-    - Unknown MarketCap/Float gerçek para kapısını kapatan risk kabul edilir.
-    """
-    symbol = str(v22_pick_first(row, ["Symbol", "symbol", "Ticker", "ticker", "Hisse"], "")).upper().strip()
-    price = safe_float(v22_pick_first(row, ["Price", "Live_Price", "Close", "Current_Price", "Tarama_Fiyatı"], np.nan), np.nan)
-    planned_entry = safe_float(v22_pick_first(row, ["Planned_Entry", "Trigger_Price", "Entry_Idea", "Entry", "Entry_Low", "entry", "Model_Entry"], price), np.nan)
-    stop = safe_float(v22_pick_first(row, ["Stop_Price", "Stop", "Kill_Level", "Emergency_Stop", "Model_Stop"], np.nan), np.nan)
-    if pd.notna(planned_entry) and pd.isna(stop):
-        stop = planned_entry * 0.93
-    if pd.notna(planned_entry) and pd.notna(stop) and stop >= planned_entry:
-        stop = planned_entry * 0.95
-
-    # Market cap normalize: absolute MarketCap varsa onu kullan; yoksa MarketCap_M milyon kabul edilir.
-    market_cap_source = "UNKNOWN"
-    market_cap = safe_float(v22_pick_first(row, ["MarketCap", "market_cap"], np.nan), np.nan)
-    if pd.notna(market_cap):
-        market_cap_source = "MarketCap"
-    else:
-        market_cap_m = safe_float(v22_pick_first(row, ["MarketCap_M"], np.nan), np.nan)
-        if pd.notna(market_cap_m):
-            market_cap = market_cap_m * 1_000_000
-            market_cap_source = "MarketCap_M"
-
-    float_source = "UNKNOWN"
-    float_shares = safe_float(v22_pick_first(row, ["Float", "float_shares"], np.nan), np.nan)
-    if pd.notna(float_shares):
-        float_source = "Float"
-    else:
-        float_m = safe_float(v22_pick_first(row, ["Float_M"], np.nan), np.nan)
-        if pd.notna(float_m):
-            float_shares = float_m * 1_000_000
-            float_source = "Float_M"
-
-    volume = safe_float(v22_pick_first(row, ["Live_Volume", "Volume", "volume", "Last_Volume"], np.nan), np.nan)
-    dollar_volume_m = safe_float(v22_pick_first(row, ["Dollar_Volume_M", "DollarVolume_M"], np.nan), np.nan)
-    if pd.notna(dollar_volume_m):
-        dollar_volume = dollar_volume_m * 1_000_000
-    elif pd.notna(volume) and pd.notna(price):
-        dollar_volume = volume * price
-    else:
-        dollar_volume = np.nan
-
-    # SEMANTIC FIX: Expected_Target_% canlı değişim değildir; fallback listesinden bilerek çıkarıldı.
-    change_pct = safe_float(v22_pick_first(row, ["Change_%", "Live_Change_%", "change_pct", "Regular_Change_%", "Premarket_Change_%", "AfterHours_Change_%"], np.nan), np.nan)
-    expected_target_pct = safe_float(v22_pick_first(row, ["Expected_Target_%", "Expected_Target_Pct"], np.nan), np.nan)
-    high_drop = safe_float(v22_pick_first(row, ["High_to_Current_Drop_%", "High_to_Current_Drop", "Price_to_High_%"], np.nan), np.nan)
-    range_position = safe_float(v22_pick_first(row, ["Range_Position", "active_range_position"], np.nan), np.nan)
-    above_vwap_val = v22_pick_first(row, ["Above_VWAP", "Above_Active_VWAP", "above_vwap"], np.nan)
-    if isinstance(above_vwap_val, str):
-        above_vwap = above_vwap_val.strip().lower() in ["true", "1", "yes", "evet"]
-    elif pd.isna(above_vwap_val):
-        above_vwap = False
-    else:
-        above_vwap = bool(above_vwap_val)
-    active_vwap = safe_float(v22_pick_first(row, ["Active_VWAP", "VWAP_Regular", "VWAP"], np.nan), np.nan)
-    tape_proxy = safe_float(v22_pick_first(row, ["Tape_Burst_Proxy", "Whale_Footprint_Score", "Whale_Proxy", "Momentum_Uptick_Pressure"], np.nan), np.nan)
-    rvol = safe_float(v22_pick_first(row, ["RVOL", "tv_rvol", "TV_RVOL", "Session_RVOL"], np.nan), np.nan)
-    signal = str(v22_pick_first(row, ["Signal", "Trade_Readiness", "Night_Entry_Signal", "Category"], "UNKNOWN"))
-    return {
-        "Symbol": symbol,
-        "Company": str(v22_pick_first(row, ["Company", "Description", "description"], "")),
-        "Signal_Type": signal,
-        "Current_Price": price,
-        "Planned_Entry": planned_entry,
-        "Stop": stop,
-        "MarketCap": market_cap,
-        "MarketCap_Source": market_cap_source,
-        "Float": float_shares,
-        "Float_Source": float_source,
-        "Volume": volume,
-        "Dollar_Volume": dollar_volume,
-        "Change_%": change_pct,
-        "Expected_Target_%": expected_target_pct,
-        "High_to_Current_Drop_%": high_drop,
-        "Range_Position": range_position,
-        "Above_VWAP": above_vwap,
-        "Active_VWAP": active_vwap,
-        "Tape_Burst_Proxy": tape_proxy,
-        "RVOL": rvol,
-    }
-
-
-def v22_standard_targets(planned_entry: float, stop: float) -> dict:
-    planned_entry = safe_float(planned_entry, np.nan)
-    stop = safe_float(stop, np.nan)
-    if pd.isna(planned_entry) or planned_entry <= 0 or pd.isna(stop) or stop <= 0 or stop >= planned_entry:
-        return {"R": np.nan, "Stop_Distance_%": np.nan, "TP0": np.nan, "TP1": np.nan, "TP15": np.nan, "Runner_TP20": np.nan, "Runner_TP30": np.nan, "TP15_R_Multiple": np.nan}
-    r = planned_entry - stop
-    rnd = v22_price_round(planned_entry)
-    tp0 = max(planned_entry + 0.5 * r, planned_entry * 1.03)
-    tp1 = planned_entry + 1.0 * r
-    tp15 = planned_entry * 1.15
-    runner20 = planned_entry * 1.20
-    runner30 = planned_entry * 1.30
-    return {
-        "R": round(r, rnd),
-        "Stop_Distance_%": round((r / planned_entry) * 100, 2),
-        "TP0": round(tp0, rnd),
-        "TP1": round(tp1, rnd),
-        "TP15": round(tp15, rnd),
-        "Runner_TP20": round(runner20, rnd),
-        "Runner_TP30": round(runner30, rnd),
-        "TP15_R_Multiple": round((tp15 - planned_entry) / r, 2) if r > 0 else np.nan,
-    }
-
-
-
-def v22_3_min_actionable_move_abs(entry: float) -> float:
-    """Fiyat seviyesine göre en küçük anlamlı mutlak hareket.
-    Bu değer hedef zorlamaz; sadece gürültü/spread kadar küçük hedeflerin ana hedef gibi görünmesini engeller.
-    """
-    entry = safe_float(entry, np.nan)
-    if pd.isna(entry) or entry <= 0:
+def round_smart(v):
+    if pd.isna(v):
         return np.nan
-    if entry < 1:
-        return max(0.03, entry * 0.05)
-    if entry < 10:
-        return 0.15
-    if entry < 25:
-        return 0.25
-    if entry < 100:
-        return 0.50
-    return 1.00
+    v = float(v)
+    if abs(v) < 1:
+        return round(v, 4)
+    if abs(v) < 10:
+        return round(v, 3)
+    return round(v, 2)
 
 
-def v22_3_actionable_target_floor(entry: float, raw_05r: float, raw_3pct: float) -> dict:
-    """Ana işlem hedefi için minimum anlamlı fiyat hareketini uygular.
-    0.5R seviyesi çok yakınsa yalnızca teknik follow-through metriği olarak kalır; ana TP0 olmaz.
-    """
-    entry = safe_float(entry, np.nan)
-    raw_05r = safe_float(raw_05r, np.nan)
-    raw_3pct = safe_float(raw_3pct, np.nan)
-    if pd.isna(entry) or entry <= 0:
-        return {"Actionable_TP0": np.nan, "Actionable_Move_$": np.nan, "Actionable_Move_%": np.nan,
-                "Min_Actionable_Move_$": np.nan, "Min_Actionable_Move_%": np.nan, "Actionable_Target_OK": False,
-                "Actionable_Target_Reason": "Entry geçersiz"}
-    floor_abs = v22_3_min_actionable_move_abs(entry)
-    floor_pct_price = entry * (1 + NEXTDAY_MIN_ACTIONABLE_MOVE_PCT / 100.0)
-    floor_abs_price = entry + floor_abs
-    candidates = [x for x in [raw_05r, raw_3pct, floor_pct_price, floor_abs_price] if pd.notna(x) and x > entry]
-    target = max(candidates) if candidates else np.nan
-    move_abs = target - entry if pd.notna(target) else np.nan
-    move_pct = (move_abs / entry * 100.0) if pd.notna(move_abs) else np.nan
-    ok = bool(pd.notna(move_abs) and move_abs >= floor_abs and pd.notna(move_pct) and move_pct >= NEXTDAY_MIN_ACTIONABLE_MOVE_PCT)
-    reason = "OK: TP0 anlamlı hareket tabanını geçiyor" if ok else "NO_ACTIONABLE_TARGET: hedef gürültü/spread kadar küçük"
-    return {"Actionable_TP0": round(target, v22_price_round(entry)) if pd.notna(target) else np.nan,
-            "Actionable_Move_$": round(move_abs, 4) if pd.notna(move_abs) else np.nan,
-            "Actionable_Move_%": round(move_pct, 2) if pd.notna(move_pct) else np.nan,
-            "Min_Actionable_Move_$": round(floor_abs, 4) if pd.notna(floor_abs) else np.nan,
-            "Min_Actionable_Move_%": NEXTDAY_MIN_ACTIONABLE_MOVE_PCT,
-            "Actionable_Target_OK": ok,
-            "Actionable_Target_Reason": reason}
+def format_price(v):
+    if pd.isna(v):
+        return "-"
+    v = float(v)
+    if v < 1:
+        return f"{v:.4f}"
+    if v < 10:
+        return f"{v:.3f}"
+    return f"{v:.2f}"
 
 
-def v22_3_noise_adjust_stop(entry: float, stop: float) -> dict:
-    """Stop mesafesi aşırı darsa onu piyasa gürültüsü/spread riski kabul eder.
-    Hedef/R hesabı için en az %2 risk tabanı kullanılır; kullanıcıya stopun noise-adjusted olduğu açıkça gösterilir.
-    """
-    entry = safe_float(entry, np.nan)
-    stop = safe_float(stop, np.nan)
-    if pd.isna(entry) or entry <= 0 or pd.isna(stop) or stop <= 0 or stop >= entry:
-        return {"Adjusted_Stop": stop, "Original_Stop_Distance_%": np.nan, "Stop_Adjusted_For_Noise": False,
-                "Too_Tight_Stop_Noise": True, "Stop_Noise_Reason": "Stop geçersiz veya entry üstünde"}
-    dist_pct = (entry - stop) / entry * 100.0
-    too_tight = dist_pct < NEXTDAY_TOO_TIGHT_STOP_WARN_PCT
-    adjusted = stop
-    adjusted_flag = False
-    reason = "OK"
-    if dist_pct < NEXTDAY_MIN_STOP_DISTANCE_PCT:
-        adjusted = entry * (1 - NEXTDAY_MIN_STOP_DISTANCE_PCT / 100.0)
-        adjusted_flag = True
-        reason = f"Stop {dist_pct:.2f}%: hedef/R hesabı için %{NEXTDAY_MIN_STOP_DISTANCE_PCT:.1f} noise tabanına genişletildi"
-    elif too_tight:
-        reason = f"Stop {dist_pct:.2f}%: çok dar, noise/spread riski yüksek"
-    return {"Adjusted_Stop": round(adjusted, v22_price_round(entry)),
-            "Original_Stop_Distance_%": round(dist_pct, 2),
-            "Stop_Adjusted_For_Noise": adjusted_flag,
-            "Too_Tight_Stop_Noise": bool(too_tight),
-            "Stop_Noise_Reason": reason}
-
-def v22_late_entry_guard(current_price: float, trigger_price: float, tp0: float = np.nan) -> dict:
-    current_price = safe_float(current_price, np.nan)
-    trigger_price = safe_float(trigger_price, np.nan)
-    tp0 = safe_float(tp0, np.nan)
-    if pd.isna(current_price) or pd.isna(trigger_price) or trigger_price <= 0:
-        return {"Late_Entry_%": np.nan, "Late_Entry_Decision": "UNKNOWN", "Late_Entry_Reason": "price/trigger unknown"}
-    late_pct = (current_price - trigger_price) / trigger_price * 100.0
-    tp0_hit = pd.notna(tp0) and current_price >= tp0
-    # v22.1 ortak geç giriş politikası:
-    # 0-3 fresh, 3-5 soft penalty, 5-8 pullback-only, 8%+ veya TP0 görülmüşse no fresh buy.
-    if late_pct >= 8 or tp0_hit:
-        decision = "NO_FRESH_BUY"
-        reason = ">=8% late or TP0 already reached; wait pullback/reclaim"
-    elif late_pct >= 5:
-        decision = "PULLBACK_ONLY"
-        reason = ">=5% late; no market chase"
-    elif late_pct >= 3:
-        decision = "SOFT_PENALTY"
-        reason = "3-5% late; smaller risk / hold confirmation required"
-    else:
-        decision = "FRESH_ENTRY_OK"
-        reason = "near trigger"
-    return {"Late_Entry_%": round(late_pct, 2), "Late_Entry_Decision": decision, "Late_Entry_Reason": reason}
+def parse_symbols(text):
+    parts = [x.strip().upper() for x in str(text or "").split(",")]
+    return list(dict.fromkeys([x for x in parts if x]))
 
 
-def v22_fetch_latest_quote(symbol: str, api_key_value: str = "", secret_key_value: str = "") -> dict:
-    """Alpaca latest quote. Quote yoksa gerçek para iznini kapatmak için UNKNOWN döndürür."""
-    symbol = str(symbol or "").upper().strip()
-    if not symbol or not api_key_value or not secret_key_value:
-        return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": "QUOTE_UNKNOWN"}
-    try:
-        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest"
-        resp = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params={"feed": os.getenv("ALPACA_FEED", "iex")}, timeout=6)
-        if resp.status_code != 200:
-            return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": f"QUOTE_ERROR_{resp.status_code}"}
-        q = resp.json().get("quote", {})
-        bid = safe_float(q.get("bp"), np.nan)
-        ask = safe_float(q.get("ap"), np.nan)
-        if pd.notna(bid) and pd.notna(ask) and ask > 0:
-            spread_pct = (ask - bid) / ask * 100.0
-            return {"Bid": bid, "Ask": ask, "Spread_%": round(spread_pct, 3), "Quote_Status": "QUOTE_OK"}
-        return {"Bid": bid, "Ask": ask, "Spread_%": np.nan, "Quote_Status": "QUOTE_EMPTY"}
-    except Exception as exc:
-        return {"Bid": np.nan, "Ask": np.nan, "Spread_%": np.nan, "Quote_Status": f"QUOTE_EXCEPTION: {str(exc)[:40]}"}
-
-
-def v22_factor_score(norm: dict, quote: dict | None = None) -> dict:
-    quote = quote or {"Spread_%": np.nan, "Quote_Status": "QUOTE_UNKNOWN"}
-    price = norm["Current_Price"] if pd.notna(norm["Current_Price"]) else norm["Planned_Entry"]
-    guard = microcap_trap_guard(
-        symbol=norm["Symbol"],
-        description=norm.get("Company", ""),
-        market_cap=norm["MarketCap"],
-        price=price,
-        price_to_high_pct=norm["High_to_Current_Drop_%"],
-        below_vwap=not bool(norm["Above_VWAP"]),
-        change_pct=norm["Change_%"],
-    )
-    targets = v22_standard_targets(norm["Planned_Entry"], norm["Stop"])
-    late = v22_late_entry_guard(norm["Current_Price"], norm["Planned_Entry"], targets.get("TP0", np.nan))
-
-    dollar_volume = norm["Dollar_Volume"]
-    rvol = norm["RVOL"]
-    tape = norm["Tape_Burst_Proxy"]
-    range_pos = norm["Range_Position"]
-    high_drop = norm["High_to_Current_Drop_%"]
-    spread_pct = safe_float(quote.get("Spread_%"), np.nan)
-    quote_status = quote.get("Quote_Status", "QUOTE_UNKNOWN")
-
-    trend = 0.35
-    if norm["Above_VWAP"]:
-        trend += 0.30
-    if pd.notna(range_pos):
-        trend += max(0, min(0.25, range_pos * 0.25))
-    if pd.notna(tape):
-        trend += max(0, min(0.10, tape / 100 * 0.10))
-    trend = min(1.0, trend)
-
-    liquidity = 0.15
-    if pd.notna(dollar_volume):
-        if dollar_volume >= 10_000_000: liquidity = 1.0
-        elif dollar_volume >= 5_000_000: liquidity = 0.80
-        elif dollar_volume >= 3_000_000: liquidity = 0.62
-        elif dollar_volume >= 1_000_000: liquidity = 0.35
-        else: liquidity = 0.12
-    if pd.notna(rvol):
-        liquidity = max(liquidity, min(1.0, rvol / 6.0))
-
-    vwap_quality = 1.0 if norm["Above_VWAP"] else 0.25
-    if pd.notna(norm["Active_VWAP"]) and pd.notna(price) and norm["Active_VWAP"] > 0:
-        dist_vwap = (price - norm["Active_VWAP"]) / norm["Active_VWAP"] * 100.0
-        if dist_vwap > 15: vwap_quality *= 0.35
-        elif dist_vwap > 10: vwap_quality *= 0.55
-        elif dist_vwap > 5: vwap_quality *= 0.78
-
-    extension = 1.0
-    if pd.notna(norm["Change_%"]):
-        chg = norm["Change_%"]
-        if chg >= 150: extension *= 0.05
-        elif chg >= 100: extension *= 0.15
-        elif chg >= 95: extension *= 0.30
-        elif chg >= 60: extension *= 0.60
-    if pd.notna(high_drop):
-        if high_drop <= -25: extension *= 0.10
-        elif high_drop <= -10: extension *= 0.45
-        elif high_drop <= -5: extension *= 0.70
-
-    trap = 1.0
-    if guard["decision"] == "HARD_REJECT": trap = 0.0
-    elif guard["decision"] == "LAB_ONLY": trap = 0.35
-    elif guard["decision"] == "STRICT_REVIEW": trap = 0.60
-    if pd.isna(norm["MarketCap"]):
-        trap *= 0.60
-
-    execution = 0.55
-    if quote_status == "QUOTE_OK" and pd.notna(spread_pct):
-        execution = 1.0
-        max_spread = V22_MAX_MICROCAP_SPREAD_PCT if guard["decision"] in ["LAB_ONLY", "STRICT_REVIEW"] else V22_MAX_SPREAD_PCT
-        if spread_pct > max_spread:
-            execution = 0.0
-        elif spread_pct > max_spread * 0.65:
-            execution = 0.55
-    # quote bilinmiyorsa paper olabilir ama gerçek para kapalı kalır.
-
-    if late["Late_Entry_Decision"] == "NO_FRESH_BUY": execution *= 0.10
-    elif late["Late_Entry_Decision"] == "PULLBACK_ONLY": execution *= 0.45
-    elif late["Late_Entry_Decision"] == "SOFT_PENALTY": execution *= 0.75
-
-    final_score = round(float(100 * trend * liquidity * vwap_quality * extension * trap * execution), 1)
-
-    blocks = []
-    if guard["decision"] == "HARD_REJECT": blocks.append("Microcap/Trap hard reject")
-    if quote_status != "QUOTE_OK": blocks.append("Bid/Ask bilinmiyor: gerçek para kapalı")
-    if quote_status == "QUOTE_OK" and pd.notna(spread_pct) and spread_pct > V22_MAX_SPREAD_PCT: blocks.append("Spread geniş")
-    if pd.notna(targets.get("Stop_Distance_%")) and targets["Stop_Distance_%"] > V22_MAX_STOP_DISTANCE_PCT: blocks.append("Stop distance >8%")
-    if pd.notna(targets.get("TP15_R_Multiple")) and targets["TP15_R_Multiple"] < V22_MIN_TP15_R_MULTIPLE: blocks.append("TP15_R <1.5")
-    if late["Late_Entry_Decision"] in ["NO_FRESH_BUY", "PULLBACK_ONLY"]: blocks.append(late["Late_Entry_Decision"])
-    if pd.notna(dollar_volume) and dollar_volume < 1_000_000: blocks.append("Dollar volume çok zayıf")
-    if pd.isna(norm["MarketCap"]): blocks.append("MarketCap bilinmiyor")
-
-    if guard["decision"] == "HARD_REJECT" or "Spread geniş" in blocks or "Stop distance >8%" in blocks:
-        decision = "NO_TRADE"
-    elif final_score >= 45 and late["Late_Entry_Decision"] == "FRESH_ENTRY_OK" and guard["decision"] == "PASS":
-        decision = "PAPER_READY_RISK_CHECKED"
-    elif final_score >= 25:
-        decision = "WATCH_OR_PULLBACK_ONLY"
-    else:
-        decision = "NO_TRADE_OR_LOW_QUALITY"
-
-    real_ready = False
-    if decision == "PAPER_READY_RISK_CHECKED" and quote_status == "QUOTE_OK" and not blocks:
-        real_label = "PAPER_ONLY_UNTIL_TRACKER_PROVES"
-    else:
-        real_label = "REAL_MONEY_NOT_ALLOWED"
-
-    # v22.2: teknik sinyal ayrı, execution kalitesi ayrı okunur.
-    if quote_status != "QUOTE_OK":
-        execution_risk_label = "EXECUTION_RISK_UNKNOWN_QUOTE"
-    elif pd.notna(spread_pct) and spread_pct > V22_MAX_SPREAD_PCT:
-        execution_risk_label = "EXECUTION_RISK_SPREAD_TOO_WIDE"
-    elif pd.notna(spread_pct) and spread_pct >= V22_SLIPPAGE_WARN_PCT:
-        execution_risk_label = "PAPER_READY_BUT_EXECUTION_RISK"
-    elif pd.notna(spread_pct) and spread_pct >= 0.75:
-        execution_risk_label = "EXECUTION_RISK_ELEVATED"
-    else:
-        execution_risk_label = "EXECUTION_RISK_OK"
-
+def get_flags(symbol):
     return {
-        **norm,
-        **targets,
-        **late,
-        "Bid": quote.get("Bid", np.nan),
-        "Ask": quote.get("Ask", np.nan),
-        "Spread_%": spread_pct,
-        "Quote_Status": quote_status,
-        "Microcap_Guard": guard["decision"],
-        "Microcap_Reasons": guard["reason_text"],
-        "Trend_Factor": round(trend, 3),
-        "Liquidity_Factor": round(liquidity, 3),
-        "VWAP_Quality_Factor": round(vwap_quality, 3),
-        "Extension_Risk_Factor": round(extension, 3),
-        "Trap_Risk_Factor": round(trap, 3),
-        "Execution_Factor": round(execution, 3),
-        "Factor_Final_Score": final_score,
-        "Risk_Engine_Decision": decision,
-        "Real_Money_Readiness": real_label,
-        "Real_Money_Allowed": bool(real_ready),
-        "Execution_Risk_Adjusted_Readiness": execution_risk_label,
-        "Risk_Blocks": "; ".join(blocks) if blocks else "Paper-ready; tracker sonucu beklenir",
-        "Proxy_Disclaimer": "Whale/Tape/Absorption alanları gerçek order-flow değil; OHLCV tabanlı Momentum_Uptick/Tape proxy'sidir.",
+        "recent_reverse_split": False,
+        "recent_deficiency": False,
+        "otc_risk": False,
+        "catalyst_fresh": False,
+        **SYMBOL_FLAGS.get(str(symbol).upper(), {}),
     }
 
 
-def v22_apply_risk_engine(df: pd.DataFrame, quote_check: bool = False, max_quote_rows: int = 20, api_key_value: str = "", secret_key_value: str = "") -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = []
-    for i, (_, r) in enumerate(df.iterrows()):
-        norm = v22_normalize_signal_row(r)
-        quote = None
-        if quote_check and i < int(max_quote_rows) and norm["Symbol"]:
-            quote = v22_fetch_latest_quote(norm["Symbol"], api_key_value, secret_key_value)
-        out.append(v22_factor_score(norm, quote=quote))
-    res = pd.DataFrame(out)
-    if not res.empty and "Factor_Final_Score" in res.columns:
-        decision_rank = {
-            "PAPER_READY_RISK_CHECKED": 0,
-            "WATCH_OR_PULLBACK_ONLY": 1,
-            "NO_TRADE_OR_LOW_QUALITY": 2,
-            "NO_TRADE": 3,
-        }
-        res["_decision_rank"] = res.get("Risk_Engine_Decision", pd.Series(index=res.index, dtype=object)).map(decision_rank).fillna(9)
-        res = res.sort_values(["_decision_rank", "Factor_Final_Score"], ascending=[True, False]).drop(columns=["_decision_rank"], errors="ignore").reset_index(drop=True)
-    return res
+def now_ny():
+    return datetime.now(NY_TZ)
 
 
-def v22_paper_template() -> pd.DataFrame:
-    return pd.DataFrame(columns=[
-        "Signal_ID", "Model_Version", "Signal_Date", "Symbol", "Signal_Type", "Session",
-        "Planned_Entry", "Actual_Entry", "Stop", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30",
-        "Max_High_After_Entry", "Min_Low_After_Entry", "Exit_Price", "Exit_Reason",
-        "Estimated_Slippage_%", "Entry_Slippage_%", "Exit_Slippage_%", "Total_Slippage_Cost_%",
-        "Time_To_TP0_Min", "Time_To_TP15_Min", "Time_To_Stop_Min", "Notes",
-    ])
+def ny_date_str(dt=None):
+    dt = dt or now_ny()
+    return dt.astimezone(NY_TZ).strftime("%Y-%m-%d")
 
 
-def v22_evaluate_paper_log(log_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Paper log outcome evaluator.
-
-    v22.2 notları:
-    - Daily/high-low veride aynı trade içinde hem TP hem stop görülürse sıra bilinmez; defansif olarak stop önce varsayılır.
-    - Gross_Outcome_R ile Net_Outcome_R_After_Slippage ayrılır.
-    - Estimated_Slippage_% tek kolon verildiyse toplam round-trip maliyet kabul edilir.
-      Entry_Slippage_% ve Exit_Slippage_% ayrı verilirse toplam bunlardan hesaplanır.
-    - Real-money readiness sadece net/slippage-adjusted metriklere göre okunur.
-    """
-    if log_df is None or log_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    df = log_df.copy()
-
-    def get_series(name, fallback=np.nan):
-        if name in df.columns:
-            return df[name]
-        if isinstance(fallback, pd.Series):
-            return fallback
-        return pd.Series([fallback] * len(df), index=df.index)
-
-    planned_entry = pd.to_numeric(get_series("Planned_Entry"), errors="coerce")
-    actual_entry = pd.to_numeric(get_series("Actual_Entry", planned_entry), errors="coerce")
-    entry = actual_entry.combine_first(planned_entry)
-    stop = pd.to_numeric(get_series("Stop"), errors="coerce")
-    high = pd.to_numeric(get_series("Max_High_After_Entry"), errors="coerce")
-    low = pd.to_numeric(get_series("Min_Low_After_Entry"), errors="coerce")
-    exit_price = pd.to_numeric(get_series("Exit_Price", np.nan), errors="coerce")
-    tp0 = pd.to_numeric(get_series("TP0", np.nan), errors="coerce")
-    tp1 = pd.to_numeric(get_series("TP1", np.nan), errors="coerce")
-    tp15 = pd.to_numeric(get_series("TP15", np.nan), errors="coerce")
-
-    risk = (entry - stop).replace(0, np.nan)
-    stop_distance_pct = (risk / entry * 100).replace([np.inf, -np.inf], np.nan)
-
-    df["MFE_%"] = ((high - entry) / entry * 100).round(2)
-    df["MAE_%"] = ((low - entry) / entry * 100).round(2)
-    df["TP0_Hit"] = high >= tp0
-    df["TP1_Hit"] = high >= tp1
-    df["TP15_Hit"] = high >= tp15
-    df["Stop_Hit"] = low <= stop
-
-    no_exit = exit_price.isna()
-    gross_outcome = ((exit_price.fillna(entry) - entry) / risk).replace([np.inf, -np.inf], np.nan)
-
-    # Önce TP'leri yaz; en son stop override yapılır. Böylece günlük OHLC belirsizliğinde stop-first defansif yaklaşım uygulanır.
-    gross_outcome.loc[df["TP0_Hit"] & no_exit] = ((tp0 - entry) / risk).round(3)
-    gross_outcome.loc[df["TP1_Hit"] & no_exit] = ((tp1 - entry) / risk).round(3)
-    gross_outcome.loc[df["TP15_Hit"] & no_exit] = ((tp15 - entry) / risk).round(3)
-
-    df["Ambiguous_TP_Stop_Same_Bar"] = no_exit & df["Stop_Hit"] & (df["TP0_Hit"] | df["TP1_Hit"] | df["TP15_Hit"])
-    gross_outcome.loc[df["Stop_Hit"] & no_exit] = -1.0
-    gross_outcome.loc[no_exit & ~(df["TP0_Hit"] | df["TP1_Hit"] | df["TP15_Hit"] | df["Stop_Hit"])] = 0.0
-
-    df["Gross_Outcome_R"] = gross_outcome.round(3)
-
-    # Slippage / spread maliyeti. Estimated_Slippage_% tek başına verilirse toplam round-trip maliyet sayılır.
-    total_slip_direct = pd.to_numeric(get_series("Total_Slippage_Cost_%", np.nan), errors="coerce")
-    estimated_slip = pd.to_numeric(get_series("Estimated_Slippage_%", 0.0), errors="coerce").fillna(0.0)
-    entry_slip = pd.to_numeric(get_series("Entry_Slippage_%", np.nan), errors="coerce")
-    exit_slip = pd.to_numeric(get_series("Exit_Slippage_%", np.nan), errors="coerce")
-
-    has_split_slip = entry_slip.notna() | exit_slip.notna()
-    split_total = entry_slip.fillna(0.0) + exit_slip.fillna(0.0)
-    total_slip_pct = total_slip_direct.where(total_slip_direct.notna(), split_total.where(has_split_slip, estimated_slip))
-    total_slip_pct = pd.to_numeric(total_slip_pct, errors="coerce").fillna(0.0).clip(lower=0.0)
-
-    df["Total_Slippage_Cost_%"] = total_slip_pct.round(3)
-    df["Entry_Slippage_Cost_$"] = (entry * (total_slip_pct / 2.0) / 100.0).round(4)
-    df["Exit_Slippage_Cost_$"] = (entry * (total_slip_pct / 2.0) / 100.0).round(4)
-    df["Total_Slippage_Cost_$"] = (entry * total_slip_pct / 100.0).round(4)
-    df["Slippage_R_Cost"] = (total_slip_pct / stop_distance_pct).replace([np.inf, -np.inf], np.nan).fillna(0.0).round(3)
-    df["Net_Outcome_R_After_Slippage"] = (df["Gross_Outcome_R"] - df["Slippage_R_Cost"]).round(3)
-    # Backward-compatible ama defansif: ana Outcome_R artık net outcome'dur.
-    df["Outcome_R"] = df["Net_Outcome_R_After_Slippage"]
-
-    df["Execution_Risk_Adjusted_Readiness"] = np.where(
-        df["Total_Slippage_Cost_%"] >= V22_SLIPPAGE_WARN_PCT,
-        "PAPER_READY_BUT_EXECUTION_RISK",
-        "EXECUTION_COST_OK",
-    )
-
-    valid = df[pd.notna(entry) & pd.notna(risk) & (risk > 0)].copy()
-    n = len(valid)
-    if n == 0:
-        summary = pd.DataFrame([{"Metric": "Valid Trades", "Value": 0}])
-        return df, summary
-
-    def _profit_factor(series: pd.Series):
-        gp = series[series > 0].sum()
-        gl = series[series < 0].sum()
-        return gp / abs(gl) if gl < 0 else np.inf
-
-    gross_pf = _profit_factor(valid["Gross_Outcome_R"].fillna(0))
-    net_pf = _profit_factor(valid["Net_Outcome_R_After_Slippage"].fillna(0))
-    equity_net = valid["Net_Outcome_R_After_Slippage"].fillna(0).cumsum()
-    roll_max_net = equity_net.cummax()
-    dd_net = equity_net - roll_max_net
-    max_dd_net = dd_net.min() if not dd_net.empty else 0
-
-    ambiguous_count = int(valid["Ambiguous_TP_Stop_Same_Bar"].sum())
-    ambiguous_rate = round(ambiguous_count / n * 100, 2) if n else 0.0
-
-    summary_rows = [
-        {"Metric": "Valid Trades", "Value": n},
-        {"Metric": "TP0 Hit Rate", "Value": round(valid["TP0_Hit"].mean() * 100, 2)},
-        {"Metric": "TP1 Hit Rate", "Value": round(valid["TP1_Hit"].mean() * 100, 2)},
-        {"Metric": "TP15 Hit Rate", "Value": round(valid["TP15_Hit"].mean() * 100, 2)},
-        {"Metric": "Stop Hit Rate", "Value": round(valid["Stop_Hit"].mean() * 100, 2)},
-        {"Metric": "Ambiguous Bars (Assumed Loss)", "Value": ambiguous_count},
-        {"Metric": "Ambiguous Rate_%", "Value": ambiguous_rate},
-        {"Metric": "Average MFE_%", "Value": round(valid["MFE_%"].mean(), 2)},
-        {"Metric": "Average MAE_%", "Value": round(valid["MAE_%"].mean(), 2)},
-        {"Metric": "Average Slippage Cost_%", "Value": round(valid["Total_Slippage_Cost_%"].mean(), 3)},
-        {"Metric": "Gross Expectancy_R", "Value": round(valid["Gross_Outcome_R"].mean(), 3)},
-        {"Metric": "Net Expectancy_R After Slippage", "Value": round(valid["Net_Outcome_R_After_Slippage"].mean(), 3)},
-        {"Metric": "Gross Profit Factor", "Value": round(gross_pf, 3) if np.isfinite(gross_pf) else "inf"},
-        {"Metric": "Net Profit Factor After Slippage", "Value": round(net_pf, 3) if np.isfinite(net_pf) else "inf"},
-        {"Metric": "Max Drawdown_R Net", "Value": round(max_dd_net, 3)},
-    ]
-
-    ready = bool(
-        n >= V22_MICRO_REAL_TEST_SIGNAL_COUNT
-        and valid["Net_Outcome_R_After_Slippage"].mean() > 0.20
-        and (net_pf > 1.3 or np.isinf(net_pf))
-        and max_dd_net > -8
-        and ambiguous_rate <= 20
-    )
-    summary_rows.append({"Metric": "Micro Real Test Readiness", "Value": "YES_TINY_TEST" if ready else "NO_CONTINUE_PAPER"})
-    summary_rows.append({"Metric": "Readiness Basis", "Value": "NET_SLIPPAGE_ADJUSTED_STOP_FIRST"})
-    return df, pd.DataFrame(summary_rows)
+def ny_time_str(dt=None):
+    dt = dt or now_ny()
+    return dt.astimezone(NY_TZ).strftime("%H:%M:%S")
 
 
-def render_v22_risk_tracker_tab():
-    st.subheader("🛡️ v22.2 Risk Engine + Slippage-Adjusted Performance Tracker + Real-Money Readiness Gate")
-    st.warning(
-        "Bu sekme alım motoru değildir. Next Day / Night / Supernova çıktısını gerçek para öncesi risk, execution ve performans açısından denetler. "
-        "Bid/Ask bilinmiyorsa gerçek para izni kapalı kalır. Whale/Tape/Absorption alanları OHLCV proxy'sidir."
-    )
+def get_session_label(dt=None):
+    dt = dt or now_ny()
+    t = dt.astimezone(NY_TZ).time()
+    wd = dt.astimezone(NY_TZ).weekday()
 
-    st.markdown("### 1) Tarama CSV'sini v22 Risk Engine ile denetle")
-    scan_file = st.file_uploader("NextDay / Night / Supernova CSV yükle", type=["csv"], key="v22_scan_upload")
-    col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        quote_check = st.checkbox("İlk satırlar için Alpaca bid/ask spread kontrolü yap", value=False, key="v22_quote_check")
-    with col_q2:
-        max_quote_rows = st.slider("Quote kontrol max satır", 5, 50, 20, 5, key="v22_quote_rows")
-
-    if scan_file is not None:
-        try:
-            scan_df = pd.read_csv(scan_file)
-            st.caption(f"Yüklenen satır: {len(scan_df)}")
-            risk_df = v22_apply_risk_engine(scan_df, quote_check=quote_check, max_quote_rows=max_quote_rows, api_key_value=api_key, secret_key_value=secret_key)
-            if risk_df.empty:
-                st.warning("Risk Engine çıktı üretmedi.")
-            else:
-                primary_cols = [
-                    "Symbol", "Signal_Type", "Risk_Engine_Decision", "Real_Money_Readiness", "Factor_Final_Score",
-                    "Current_Price", "Planned_Entry", "Stop", "Stop_Distance_%", "TP0", "TP1", "TP15", "Runner_TP20", "Runner_TP30", "TP15_R_Multiple",
-                    "Late_Entry_%", "Late_Entry_Decision", "Microcap_Guard", "Dollar_Volume", "RVOL", "Spread_%", "Quote_Status", "Execution_Risk_Adjusted_Readiness", "Risk_Blocks",
-                ]
-                show_cols = [c for c in primary_cols if c in risk_df.columns]
-                st.dataframe(risk_df[show_cols], use_container_width=True)
-                st.download_button(
-                    "📥 v22 risk denetimli CSV indir",
-                    data=risk_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"v22_risk_checked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_v22_risk_checked",
-                )
-        except Exception as exc:
-            st.error(f"v22 risk engine CSV okuma/denetim hatası: {exc}")
-
-    st.divider()
-    st.markdown("### 2) Paper Performance Tracker")
-    st.caption("Paper log yükle; MFE, MAE, TP hit rate, stop hit rate, gross/net expectancy_R, slippage-adjusted profit factor, ambiguous bar ve max drawdown hesaplanır.")
-    template = v22_paper_template()
-    st.download_button(
-        "📥 Paper log şablonu indir",
-        data=template.to_csv(index=False).encode("utf-8-sig"),
-        file_name="paper_log_template_v22_2.csv",
-        mime="text/csv",
-        key="download_v22_paper_template",
-    )
-    log_file = st.file_uploader("paper_log.csv yükle", type=["csv"], key="v22_paper_log_upload")
-    if log_file is not None:
-        try:
-            log_df = pd.read_csv(log_file)
-            evaluated, summary = v22_evaluate_paper_log(log_df)
-            st.markdown("#### Performans özeti")
-            st.dataframe(summary, use_container_width=True)
-            st.markdown("#### İşlem bazlı outcome")
-            st.dataframe(evaluated, use_container_width=True)
-            st.download_button(
-                "📥 Değerlendirilmiş paper log indir",
-                data=evaluated.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"paper_log_evaluated_v22_2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_v22_paper_evaluated",
-            )
-        except Exception as exc:
-            st.error(f"Paper log değerlendirme hatası: {exc}")
-
-    st.info(
-        "Gerçek para kapısı: en az 30 geçerli paper fill + pozitif expectancy_R + profit factor >1.3 + kontrollü drawdown olmadan mikro gerçek test yok. "
-        "Tam ölçekli gerçek para için strateji başına 100-200 doğrulanmış fill gerekir."
-    )
+    if wd >= 5:
+        return "weekend"
+    if t >= datetime.strptime("04:00", "%H:%M").time() and t < datetime.strptime("09:30", "%H:%M").time():
+        return "premarket"
+    if t >= datetime.strptime("09:30", "%H:%M").time() and t < datetime.strptime("16:00", "%H:%M").time():
+        return "regular"
+    if t >= datetime.strptime("16:00", "%H:%M").time() and t <= datetime.strptime("20:00", "%H:%M").time():
+        return "afterhours"
+    return "closed"
 
 
-def get_api(api_key_value, secret_key_value):
-    try:
-        import alpaca_trade_api as tradeapi
-    except ImportError as exc:
-        raise RuntimeError("alpaca-trade-api paketi kurulu değil.") from exc
-
-    return tradeapi.REST(
-        key_id=api_key_value,
-        secret_key=secret_key_value,
-        base_url="https://paper-api.alpaca.markets",
-        api_version="v2",
-    )
+def local_date_from_iso(iso_str, tz=NY_TZ):
+    dt = pd.Timestamp(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.tz_localize("UTC")
+    return dt.tz_convert(tz).strftime("%Y-%m-%d")
 
 
-def _normalize_yf_period(period: str) -> str:
-    supported = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
-    if period in supported:
-        return period
-    if isinstance(period, str) and period.endswith("d"):
-        try:
-            days = int(period[:-1])
-            if days >= 200:
-                return "1y"
-            if days >= 120:
-                return "6mo"
-            if days >= 60:
-                return "3mo"
-        except Exception:
-            pass
-    return "1y"
+def local_time_from_iso(iso_str, tz=NY_TZ):
+    dt = pd.Timestamp(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.tz_localize("UTC")
+    return dt.tz_convert(tz).strftime("%H:%M:%S")
 
 
-def _alpaca_headers(api_key_value: str, secret_key_value: str) -> dict:
+def decision_sort_key(decision):
+    return {"GÜÇLÜ AL": 0, "AL": 1, "İZLE": 2, "ALMA": 3}.get(decision, 9)
+
+
+def decision_color(decision):
     return {
-        "APCA-API-KEY-ID": api_key_value,
-        "APCA-API-SECRET-KEY": secret_key_value,
+        "GÜÇLÜ AL": "green",
+        "AL": "blue",
+        "İZLE": "orange",
+        "ALMA": "red"
+    }.get(decision, "gray")
+
+
+def top_cards(df, n=3):
+    return [] if df is None or df.empty else df.head(n).to_dict("records")
+
+
+# ============================================================
+# DATA LAYER
+# ============================================================
+def have_alpaca():
+    return bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
+
+
+def alpaca_headers():
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
     }
 
 
-def fetch_alpaca_daily_single(symbol: str, api_key_value: str, secret_key_value: str, feed: str = "iex") -> pd.DataFrame:
-    if not api_key_value or not secret_key_value:
-        return pd.DataFrame()
+def fetch_alpaca_bars(symbols, timeframe="1Day", start=None, end=None, feed=None, limit=10000):
+    if not have_alpaca():
+        return {}
 
-    start = (datetime.now(ZoneInfo("UTC")) - pd.Timedelta(days=430)).strftime("%Y-%m-%dT00:00:00Z")
-    end = (datetime.now(ZoneInfo("UTC")) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if not symbols:
+        return {}
 
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    url = "https://data.alpaca.markets/v2/stocks/bars"
     params = {
-        "timeframe": "1Day",
+        "symbols": ",".join(symbols),
+        "timeframe": timeframe,
         "start": start,
         "end": end,
-        "adjustment": "all",
-        "limit": 1000,
-        "feed": feed or "iex",
+        "adjustment": "raw",
+        "sort": "asc",
+        "limit": str(limit),
+        "feed": feed or ALPACA_FEED,
     }
 
+    out = {s: [] for s in symbols}
+    page_token = None
+
+    while True:
+        req_params = params.copy()
+        if page_token:
+            req_params["page_token"] = page_token
+
+        r = requests.get(url, headers=alpaca_headers(), params=req_params, timeout=30)
+        if r.status_code != 200:
+            return out
+
+        payload = r.json()
+        bars_map = payload.get("bars", {})
+        for sym, bars in bars_map.items():
+            out.setdefault(sym, [])
+            out[sym].extend(bars)
+
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+
+    for sym in out:
+        out[sym] = sorted(out[sym], key=lambda x: x.get("t", ""))
+
+    return out
+
+
+def fetch_alpaca_latest_quotes(symbols):
+    if not have_alpaca():
+        return {}
+
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if not symbols:
+        return {}
+
+    url = "https://data.alpaca.markets/v2/stocks/quotes/latest"
+    params = {"symbols": ",".join(symbols), "feed": ALPACA_FEED}
     try:
-        res = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params=params, timeout=20)
-        if res.status_code != 200:
-            log_debug(f"Alpaca daily {symbol} -> HTTP {res.status_code}: {res.text[:200]}")
+        r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
+        if r.status_code != 200:
+            return {}
+        payload = r.json()
+        return payload.get("quotes", {})
+    except Exception:
+        return {}
+
+
+def daily_bars_to_df(bars):
+    if not bars:
+        return pd.DataFrame()
+
+    rows = []
+    for b in bars:
+        rows.append({
+            "Date": pd.to_datetime(b["t"], utc=True),
+            "Open": safe_float(b.get("o")),
+            "High": safe_float(b.get("h")),
+            "Low": safe_float(b.get("l")),
+            "Close": safe_float(b.get("c")),
+            "Volume": safe_float(b.get("v")),
+        })
+
+    df = pd.DataFrame(rows).dropna()
+    if df.empty:
+        return df
+    return df.set_index("Date").sort_index()
+
+
+def minute_bars_to_df(bars):
+    if not bars:
+        return pd.DataFrame()
+
+    rows = []
+    for b in bars:
+        rows.append({
+            "Date": pd.to_datetime(b["t"], utc=True),
+            "Open": safe_float(b.get("o")),
+            "High": safe_float(b.get("h")),
+            "Low": safe_float(b.get("l")),
+            "Close": safe_float(b.get("c")),
+            "Volume": safe_float(b.get("v")),
+        })
+
+    df = pd.DataFrame(rows).dropna()
+    if df.empty:
+        return df
+    return df.set_index("Date").sort_index()
+
+
+def fetch_yahoo_daily(symbol, lookback_days=420):
+    try:
+        period = "2y" if lookback_days > 400 else "1y"
+        df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=False)
+        if df is None or df.empty:
             return pd.DataFrame()
-
-        payload = res.json()
-        bars = payload.get("bars", [])
-        if not bars:
-            return pd.DataFrame()
-
-        rows = []
-        for bar in bars:
-            rows.append({
-                "Date": pd.to_datetime(bar.get("t"), utc=True),
-                "Open": safe_float(bar.get("o")),
-                "High": safe_float(bar.get("h")),
-                "Low": safe_float(bar.get("l")),
-                "Close": safe_float(bar.get("c")),
-                "Volume": safe_float(bar.get("v")),
-            })
-
-        df = pd.DataFrame(rows).dropna()
-        if df.empty:
-            return df
-
-        df = df.set_index("Date").sort_index()
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as exc:
-        log_debug(f"Alpaca daily fetch error for {symbol}: {exc}")
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    except Exception:
         return pd.DataFrame()
 
 
-def normalize_symbol_for_yahoo(symbol: str) -> str:
-    if not symbol:
-        return symbol
-    return symbol.replace(".", "-")
+def get_daily_df(symbol, lookback_days=420):
+    if have_alpaca():
+        end_dt = datetime.now(UTC_TZ) + timedelta(days=1)
+        start_dt = end_dt - timedelta(days=lookback_days)
+        bars_map = fetch_alpaca_bars(
+            [symbol],
+            timeframe="1Day",
+            start=start_dt.isoformat().replace("+00:00", "Z"),
+            end=end_dt.isoformat().replace("+00:00", "Z"),
+            feed=ALPACA_FEED,
+            limit=10000,
+        )
+        df = daily_bars_to_df(bars_map.get(symbol, []))
+        if not df.empty:
+            return df
+    return fetch_yahoo_daily(symbol, lookback_days=lookback_days)
 
 
-def is_likely_non_common_stock(symbol: str, description: str = "") -> bool:
-    text = f"{symbol} {description}".upper()
+def fetch_minute_df(symbol, start_dt_utc, end_dt_utc, timeframe="1Min"):
+    if not have_alpaca():
+        return pd.DataFrame()
+    bars_map = fetch_alpaca_bars(
+        [symbol],
+        timeframe=timeframe,
+        start=start_dt_utc.isoformat().replace("+00:00", "Z"),
+        end=end_dt_utc.isoformat().replace("+00:00", "Z"),
+        feed=ALPACA_FEED,
+        limit=10000,
+    )
+    return minute_bars_to_df(bars_map.get(symbol, []))
 
-    bad_keywords = [
-        " ETF", "ETF ", " FUND", " TRUST", " ETN", "NOTE", "INDEX",
-        " ULTRA", " INVERSE", " 2X", " 3X", " LEVERAGED",
-        " PREFERRED", " PREF", " ADR", " SPAC", " WARRANT", " RIGHTS"
-    ]
 
-    return any(k in text for k in bad_keywords)
-
-
-def calc_true_range(df: pd.DataFrame) -> pd.Series:
+# ============================================================
+# INDICATORS / FEATURES
+# ============================================================
+def calc_true_range(df):
     prev_close = df["Close"].shift(1)
     tr1 = df["High"] - df["Low"]
     tr2 = (df["High"] - prev_close).abs()
@@ -1017,10444 +369,1311 @@ def calc_true_range(df: pd.DataFrame) -> pd.Series:
     return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr = calc_true_range(df)
-    return tr.rolling(period).mean()
+def calc_atr(df, period=14):
+    return calc_true_range(df).rolling(period).mean()
 
 
-def calc_closing_strength(last_close: float, last_low: float, last_high: float) -> float:
-    daily_range = last_high - last_low
-    if daily_range <= 0:
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calc_vwap(df):
+    if df is None or df.empty:
         return np.nan
-    return (last_close - last_low) / daily_range
-
-
-def dynamic_stop_limit(stop_price: float) -> float:
-    if stop_price <= 0:
-        return stop_price
-
-    if stop_price < 1:
-        offset = max(0.005, stop_price * 0.01)
-    elif stop_price < 5:
-        offset = max(0.02, stop_price * 0.0075)
-    else:
-        offset = max(0.05, stop_price * 0.005)
-
-    return round(max(0.01, stop_price - offset), 4)
-
-
-def calc_position_size(account_size: float, risk_per_trade_pct: float, entry: float, stop: float) -> dict:
-    if entry <= 0 or stop <= 0 or entry <= stop:
-        return {"shares": 0, "dollar_size": 0, "risk_dollars": 0}
-
-    max_risk_dollars = account_size * risk_per_trade_pct
-    risk_per_share = entry - stop
-    shares = math.floor(max_risk_dollars / risk_per_share) if risk_per_share > 0 else 0
-    dollar_size = shares * entry
-    risk_dollars = shares * risk_per_share
-
-    return {
-        "shares": max(shares, 0),
-        "dollar_size": round(dollar_size, 2),
-        "risk_dollars": round(risk_dollars, 2),
-    }
-
-
-# ============================================================
-# ÇOKLU SEANS VWAP FONKSİYONLARI
-# ============================================================
-def split_sessions(intraday_df: pd.DataFrame):
-    if intraday_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    df = intraday_df.copy()
-    idx = df.index
-    try:
-        et_times = idx.tz_convert("America/New_York")
-    except Exception:
-        try:
-            et_times = idx.tz_localize("America/New_York")
-        except Exception:
-            et_times = idx
-
-    df["et_dt"] = et_times
-    df["et_time"] = et_times.time
-
-    premarket = df[
-        (df["et_time"] >= pd.to_datetime("04:00").time()) &
-        (df["et_time"] < pd.to_datetime("09:30").time())
-    ].copy()
-
-    regular = df[
-        (df["et_time"] >= pd.to_datetime("09:30").time()) &
-        (df["et_time"] < pd.to_datetime("16:00").time())
-    ].copy()
-
-    afterhours = df[
-        (df["et_time"] >= pd.to_datetime("16:00").time()) &
-        (df["et_time"] <= pd.to_datetime("20:00").time())
-    ].copy()
-
-    return premarket, regular, afterhours
-
-
-def calc_session_vwap(df: pd.DataFrame) -> float:
-    if df.empty:
-        return np.nan
-
     temp = df.dropna(subset=["High", "Low", "Close", "Volume"]).copy()
     if temp.empty:
         return np.nan
+    tp = (temp["High"] + temp["Low"] + temp["Close"]) / 3
+    vp = tp * temp["Volume"]
+    vol = temp["Volume"].sum()
+    return np.nan if vol <= 0 else float(vp.sum() / vol)
 
-    temp["Typical_Price"] = (temp["High"] + temp["Low"] + temp["Close"]) / 3
-    temp["VP"] = temp["Typical_Price"] * temp["Volume"]
 
-    vol_sum = temp["Volume"].sum()
-    if vol_sum == 0:
+def closing_strength(close_, low_, high_):
+    if pd.isna(close_) or pd.isna(low_) or pd.isna(high_):
         return np.nan
+    r = high_ - low_
+    if r <= 0:
+        return 0.5
+    return (close_ - low_) / r
 
-    return float(temp["VP"].sum() / vol_sum)
+
+def range_pct(high_, low_, ref):
+    if pd.isna(high_) or pd.isna(low_) or pd.isna(ref) or ref <= 0:
+        return np.nan
+    return ((high_ - low_) / ref) * 100.0
 
 
-def session_summary(df: pd.DataFrame):
-    if df.empty:
+def get_trade_date_context(daily_df, trade_date_str):
+    if daily_df is None or daily_df.empty:
+        return None
+
+    temp = daily_df.copy()
+    temp["NYDate"] = [local_date_from_iso(x) for x in temp.index]
+    prior = temp[temp["NYDate"] < trade_date_str].copy()
+
+    if len(prior) < 25:
+        return None
+
+    last = prior.iloc[-1]
+    prev = prior.iloc[-2]
+    hist10 = prior.iloc[-10:].copy()
+    hist20 = prior.iloc[-20:].copy()
+    hist60 = prior.iloc[-60:].copy() if len(prior) >= 60 else prior.copy()
+    hist90 = prior.iloc[-90:].copy() if len(prior) >= 90 else prior.copy()
+
+    return {
+        "last": last,
+        "prev": prev,
+        "hist10": hist10,
+        "hist20": hist20,
+        "hist60": hist60,
+        "hist90": hist90,
+        "prior_dates": prior["NYDate"].drop_duplicates().tolist()[-10:]
+    }
+
+
+def get_premarket_context(minute_df, trade_date_str, cutoff_time="09:25:00"):
+    if minute_df is None or minute_df.empty:
         return {
+            "source": "NONE",
             "price": np.nan,
-            "vwap": np.nan,
-            "high": np.nan,
-            "low": np.nan,
-            "volume": 0,
+            "pre_high": np.nan,
+            "pre_low": np.nan,
+            "pre_vol": 0,
+            "pre_vwap": np.nan,
+            "hold_quality": np.nan,
+            "pre_range_pct": np.nan,
+            "bars": pd.DataFrame()
         }
+
+    temp = minute_df.copy()
+    temp["NYDate"] = [local_date_from_iso(x) for x in temp.index]
+    temp["NYTime"] = [local_time_from_iso(x) for x in temp.index]
+
+    same_day = temp[
+        (temp["NYDate"] == trade_date_str) &
+        (temp["NYTime"] >= "04:00:00") &
+        (temp["NYTime"] <= cutoff_time)
+    ].copy()
+
+    if same_day.empty:
+        return {
+            "source": "NONE",
+            "price": np.nan,
+            "pre_high": np.nan,
+            "pre_low": np.nan,
+            "pre_vol": 0,
+            "pre_vwap": np.nan,
+            "hold_quality": np.nan,
+            "pre_range_pct": np.nan,
+            "bars": pd.DataFrame()
+        }
+
+    price = safe_float(same_day["Close"].iloc[-1], np.nan)
+    ph = safe_float(same_day["High"].max(), np.nan)
+    pl = safe_float(same_day["Low"].min(), np.nan)
+    pv = safe_float(same_day["Volume"].sum(), 0)
+    vwap = calc_vwap(same_day)
+
+    hold = np.nan
+    if pd.notna(ph) and pd.notna(pl) and ph > pl and pd.notna(price):
+        hold = ((price - pl) / (ph - pl)) * 100.0
 
     return {
-        "price": float(df["Close"].iloc[-1]),
-        "vwap": calc_session_vwap(df),
-        "high": float(df["High"].max()),
-        "low": float(df["Low"].min()),
-        "volume": int(df["Volume"].sum()),
+        "source": "REAL_PREMARKET",
+        "price": price,
+        "pre_high": ph,
+        "pre_low": pl,
+        "pre_vol": pv,
+        "pre_vwap": vwap,
+        "hold_quality": hold,
+        "pre_range_pct": range_pct(ph, pl, price),
+        "bars": same_day
     }
 
 
-def get_active_session_et():
-    now_et = datetime.now(ZoneInfo("America/New_York")).time()
+def premarket_baseline_ratio(minute_df, prior_dates, trade_date_str, cutoff_time="09:25:00"):
+    if minute_df is None or minute_df.empty or not prior_dates:
+        return np.nan, np.nan, 0
 
-    if pd.to_datetime("04:00").time() <= now_et < pd.to_datetime("09:30").time():
-        return "premarket"
-    elif pd.to_datetime("09:30").time() <= now_et < pd.to_datetime("16:00").time():
-        return "regular"
-    elif pd.to_datetime("16:00").time() <= now_et <= pd.to_datetime("20:00").time():
-        return "afterhours"
-    else:
-        return "closed"
+    temp = minute_df.copy()
+    temp["NYDate"] = [local_date_from_iso(x) for x in temp.index]
+    temp["NYTime"] = [local_time_from_iso(x) for x in temp.index]
 
-
-def vwap_decision_engine(price, vwap, high, low, atr14=None, breakout_level=None):
-    if pd.isna(price) or pd.isna(vwap) or pd.isna(high) or pd.isna(low):
-        return {
-            "signal": "NÖTR",
-            "entry": None,
-            "stop": None,
-            "tp1": None,
-            "tp2": None,
-            "comment": "Veri eksik."
-        }
-
-    if vwap <= 0:
-        return {
-            "signal": "NÖTR",
-            "entry": None,
-            "stop": None,
-            "tp1": None,
-            "tp2": None,
-            "comment": "VWAP hesaplanamadı."
-        }
-
-    distance = (price - vwap) / vwap
-
-    if high - low > 0:
-        close_strength = (price - low) / (high - low)
-    else:
-        close_strength = 0.5
-
-    if pd.isna(atr14) or atr14 <= 0:
-        atr14 = max((high - low) * 0.5, price * 0.02)
-
-    if price > vwap and abs(distance) <= 0.01 and close_strength >= 0.6:
-        entry = round(vwap * 1.002, 4)
-        stop = round(max(vwap - 1.1 * atr14, vwap * 0.98), 4)
-        risk = max(entry - stop, 0.01)
-        tp1 = round(entry + risk, 4)
-        tp2 = round(entry + 2 * risk, 4)
-
-        return {
-            "signal": "AL (VWAP DESTEK)",
-            "entry": entry,
-            "stop": stop,
-            "tp1": tp1,
-            "tp2": tp2,
-            "comment": "Fiyat ilgili seansın VWAP üstünde ve VWAP'a yakın. Kontrollü giriş düşünülebilir."
-        }
-
-    if price > vwap and distance > 0.03:
-        entry = round(breakout_level, 4) if breakout_level and breakout_level > 0 else round(vwap * 1.01, 4)
-        stop = round(max(entry - 1.2 * atr14, entry * 0.97), 4)
-        risk = max(entry - stop, 0.01)
-        tp1 = round(entry + risk, 4)
-        tp2 = round(entry + 2 * risk, 4)
-
-        return {
-            "signal": "BEKLE",
-            "entry": entry,
-            "stop": stop,
-            "tp1": tp1,
-            "tp2": tp2,
-            "comment": "Fiyat ilgili seans VWAP'ından fazla uzaklaşmış. Geri çekilme veya retest beklemek daha doğru."
-        }
-
-    if price < vwap:
-        return {
-            "signal": "UZAK DUR",
-            "entry": None,
-            "stop": None,
-            "tp1": None,
-            "tp2": None,
-            "comment": "Fiyat ilgili seans VWAP altında. Yapı zayıf."
-        }
-
-    return {
-        "signal": "NÖTR",
-        "entry": None,
-        "stop": None,
-        "tp1": None,
-        "tp2": None,
-        "comment": "Net sinyal yok. İzlemeye devam."
-    }
-
-
-# ============================================================
-# YENİ: ENTRY TYPE + MOVE TYPE ENGINE
-# ============================================================
-def close_enough(value: float, threshold: float) -> bool:
-    try:
-        return value <= threshold
-    except Exception:
-        return False
-
-
-def classify_entry_type(
-    close_above_vwap: bool,
-    dist_below_breakout: float,
-    extension_above_breakout: float,
-    rvol20: float,
-    gap_pct: float,
-    closing_strength: float,
-    atr5: float,
-    atr20: float,
-):
-    if not close_above_vwap:
-        return "WEAK"
-
-    if extension_above_breakout > MAX_EXTENSION_ABOVE_BREAKOUT_PCT:
-        return "EXTENDED"
-
-    atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.10
-
-    if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03 and rvol20 >= 2.0 and closing_strength >= 0.70:
-        return "BREAKOUT"
-
-    if 0.02 < dist_below_breakout <= 0.05 and extension_above_breakout <= 0.02 and rvol20 >= 1.5 and closing_strength >= 0.60:
-        return "MICRO_PULLBACK"
-
-    if close_above_vwap and extension_above_breakout <= 0.02 and gap_pct >= 0 and closing_strength >= 0.60:
-        return "VWAP_PULLBACK"
-
-    if close_above_vwap and dist_below_breakout <= 0.01 and extension_above_breakout <= 0.03 and rvol20 >= 3 and atr_expanding:
-        return "BREAKOUT"
-
-    return "EXTENDED"
-
-
-def classify_move_type(
-    gap_pct: float,
-    rvol20: float,
-    closing_strength: float,
-    obv_slope_10: float,
-    dist_below_breakout: float,
-    extension_above_breakout: float,
-    atr5: float,
-    atr20: float,
-    last_close: float,
-    sma50: float,
-):
-    atr_expanding = pd.notna(atr5) and pd.notna(atr20) and atr5 > atr20 * 1.15
-    trend_ok = pd.notna(sma50) and last_close > sma50
-
-    if extension_above_breakout > 0.10:
-        return "WEAK_MOVE"
-
-    if gap_pct >= 3.0 and rvol20 >= 2.0 and closing_strength >= 0.75 and obv_slope_10 > 0:
-        return "NEWS_DRIVEN"
-
-    if rvol20 >= 4.0 and atr_expanding and closing_strength >= 0.70 and dist_below_breakout <= 0.03 and extension_above_breakout <= 0.05:
-        return "SHORT_SQUEEZE"
-
-    if close_enough(dist_below_breakout, 0.05) and extension_above_breakout <= 0.05 and rvol20 >= 1.5 and trend_ok and obv_slope_10 > 0:
-        return "TECHNICAL_MOMENTUM"
-
-    return "WEAK_MOVE"
-
-
-def compute_confidence_score(
-    rvol20: float,
-    closing_strength: float,
-    close_above_vwap: bool,
-    rs_positive: bool,
-    dist_below_breakout: float,
-    extension_above_breakout: float,
-    move_type: str,
-    entry_type: str,
-):
-    score = 0
-
-    if pd.notna(rvol20):
-        if rvol20 >= 5:
-            score += 25
-        elif rvol20 >= 3:
-            score += 20
-        elif rvol20 >= 2:
-            score += 14
-        elif rvol20 >= 1.5:
-            score += 8
-
-    if pd.notna(closing_strength):
-        if closing_strength >= 0.9:
-            score += 20
-        elif closing_strength >= 0.75:
-            score += 15
-        elif closing_strength >= 0.60:
-            score += 8
-
-    if close_above_vwap:
-        score += 10
-
-    if rs_positive:
-        score += 10
-
-    if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03:
-        score += 12
-    elif dist_below_breakout <= 0.05 and extension_above_breakout <= 0.05:
-        score += 6
-
-    if extension_above_breakout > 0.08:
-        score -= 12
-    elif extension_above_breakout > 0.05:
-        score -= 6
-
-    if move_type == "NEWS_DRIVEN":
-        score += 12
-    elif move_type == "SHORT_SQUEEZE":
-        score += 10
-    elif move_type == "TECHNICAL_MOMENTUM":
-        score += 8
-
-    if entry_type == "BREAKOUT":
-        score += 10
-    elif entry_type == "MICRO_PULLBACK":
-        score += 7
-    elif entry_type == "VWAP_PULLBACK":
-        score += 5
-    elif entry_type == "EXTENDED":
-        score -= 8
-    elif entry_type == "WEAK":
-        score -= 15
-
-    return max(0, min(100, int(round(score))))
-
-
-# ============================================================
-# TRADINGVIEW SCANNER
-# ============================================================
-TRADINGVIEW_URL = "https://scanner.tradingview.com/america/scan"
-TV_HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-
-def tradingview_scan(
-    base_filters: list,
-    columns: list,
-    sort_field: str,
-    max_records: int = 500,
-    page_size: int = 100,
-) -> list:
-    collected = []
-    start = 0
-
-    while start < max_records:
-        payload = {
-            "filter": base_filters,
-            "options": {"lang": "en"},
-            "markets": ["america"],
-            "symbols": {"query": {"types": ["stock"]}, "tickers": []},
-            "columns": columns,
-            "sort": {"sortBy": sort_field, "sortOrder": "desc"},
-            "range": [start, start + page_size - 1],
-        }
-
-        try:
-            res = requests.post(TRADINGVIEW_URL, json=payload, headers=TV_HEADERS, timeout=20)
-            res.raise_for_status()
-            data = res.json().get("data", [])
-        except Exception as exc:
-            log_debug(f"TradingView scan error [{start}-{start+page_size}]: {exc}")
-            break
-
-        if not data:
-            break
-
-        collected.extend(data)
-
-        if len(data) < page_size:
-            break
-
-        start += page_size
-
-    return collected
-
-
-# ============================================================
-# CANLI GÜN İÇİ RADAR
-# ============================================================
-@st.cache_data(ttl=10)
-def get_intraday_gainers(session: str) -> pd.DataFrame:
-    try:
-        if "Pre-Market" in session:
-            sort_field = "premarket_change"
-            vol_field = "premarket_volume"
-            price_field = "premarket_close"
-            min_vol = 10000
-        elif "After-Hours" in session:
-            sort_field = "postmarket_change"
-            vol_field = "postmarket_volume"
-            price_field = "postmarket_close"
-            min_vol = 10000
-        else:
-            sort_field = "change"
-            vol_field = "volume"
-            price_field = "close"
-            min_vol = 50000
-
-        payload_filters = [
-            {"left": vol_field, "operation": "greater", "right": min_vol},
-            {"left": price_field, "operation": "greater", "right": 0.50},
-            {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
+    vols = []
+    for d in prior_dates:
+        if d == trade_date_str:
+            continue
+        day_df = temp[
+            (temp["NYDate"] == d) &
+            (temp["NYTime"] >= "04:00:00") &
+            (temp["NYTime"] <= cutoff_time)
         ]
+        v = safe_float(day_df["Volume"].sum() if not day_df.empty else 0, 0)
+        if v > 0:
+            vols.append(v)
 
-        items = tradingview_scan(
-            base_filters=payload_filters,
-            columns=["name", "description", price_field, sort_field, vol_field],
-            sort_field=sort_field,
-            max_records=25,
-            page_size=25,
-        )
-
-        results = []
-        for item in items[:15]:
-            try:
-                d = item["d"]
-                symbol = d[0]
-                company = d[1] or ""
-
-                if is_likely_non_common_stock(symbol, company):
-                    continue
-
-                price = safe_float(d[2], 0)
-                price = round(price, 4) if price < 1 else round(price, 2)
-
-                results.append(
-                    {
-                        "Hisse": symbol,
-                        "Şirket": company,
-                        "Fiyat ($)": price,
-                        "Artış (%)": round(safe_float(d[3], 0), 2),
-                        "Hacim": f"{safe_int(d[4], 0):,}",
-                    }
-                )
-            except Exception as exc:
-                log_debug(f"Intraday parse error: {exc}")
-
-        return pd.DataFrame(results)
-
-    except Exception as exc:
-        log_debug(f"get_intraday_gainers error: {exc}")
-        return pd.DataFrame()
+    if not vols:
+        return np.nan, np.nan, 0
+    return median(vols), avg(vols), len(vols)
 
 
 # ============================================================
-# SWING RADAR - AŞAMA 1
+# QUOTE / RISK
 # ============================================================
-@st.cache_data(ttl=600)
-def fetch_tradingview_candidates(algo_choice: str, max_records: int = 500) -> pd.DataFrame:
-    base_filters = [
-        {"left": "close", "operation": "greater", "right": 2.00},
-        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-        {"left": "volume", "operation": "greater", "right": 250000},
-    ]
-
-    if "A)" in algo_choice:
-        algo_filters = [
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 1.5},
-        ]
-        sort_field = "relative_volume_10d_calc"
-    elif "B)" in algo_choice:
-        algo_filters = [
-            {"left": "gap", "operation": "greater", "right": 2.0},
-            {"left": "relative_volume_10d_calc", "operation": "greater", "right": 2.0},
-        ]
-        sort_field = "gap"
-    else:
-        algo_filters = []
-        sort_field = "volume"
-
-    columns = [
-        "name",
-        "description",
-        "close",
-        "volume",
-        "relative_volume_10d_calc",
-        "gap",
-        "market_cap_basic",
-    ]
-
-    raw = tradingview_scan(
-        base_filters=base_filters + algo_filters,
-        columns=columns,
-        sort_field=sort_field,
-        max_records=max_records,
-        page_size=100,
-    )
-
-    rows = []
-    seen = set()
-
-    for item in raw:
-        try:
-            d = item["d"]
-            symbol = d[0]
-            description = d[1] or ""
-
-            if not symbol or symbol in seen:
-                continue
-
-            if is_likely_non_common_stock(symbol, description):
-                continue
-
-            seen.add(symbol)
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
-                    "description": description,
-                    "tv_close": safe_float(d[2], np.nan),
-                    "tv_volume": safe_float(d[3], np.nan) if len(d) > 3 else np.nan,
-                    "tv_rvol": safe_float(d[4], np.nan) if len(d) > 4 else np.nan,
-                    "tv_gap": safe_float(d[5], np.nan) if len(d) > 5 else np.nan,
-                    "tv_market_cap": safe_float(d[6], np.nan) if len(d) > 6 else np.nan,
-                }
-            )
-        except Exception as exc:
-            log_debug(f"Candidate parse error: {exc}")
-
-    return pd.DataFrame(rows)
-
-
-# ============================================================
-# YFINANCE VERİ İNDİRME
-# ============================================================
-@st.cache_data(ttl=300)
-def download_daily_data_chunked(
-    tickers: list[str],
-    period: str = "220d",
-    chunk_size: int = 10,
-    pause: float = 2.0,
-    alpaca_key: str = "",
-    alpaca_secret: str = "",
-    alpaca_feed: str = "iex",
-):
-    if not tickers:
-        return {}
-
-    data_dict = {}
-    yf_period = _normalize_yf_period(period)
-
-    def _single_yf_fetch(ticker: str):
-        try:
-            sub = yf.download(
-                tickers=ticker,
-                period=yf_period,
-                progress=False,
-                threads=False,
-                auto_adjust=False,
-                group_by="ticker",
-            )
-            if sub is not None and not sub.empty:
-                sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if not sub.empty:
-                    return sub
-        except Exception as exc:
-            log_debug(f"Single Yahoo fetch error for {ticker}: {exc}")
-        return pd.DataFrame()
-
-    if alpaca_key and alpaca_secret:
-        for ticker in tickers:
-            sub = fetch_alpaca_daily_single(ticker, alpaca_key, alpaca_secret, alpaca_feed)
-            if not sub.empty:
-                data_dict[ticker] = sub
-            time.sleep(0.15)
-
-    remaining = [ticker for ticker in tickers if ticker not in data_dict]
-    for i in range(0, len(remaining), chunk_size):
-        chunk = remaining[i:i + chunk_size]
-        try:
-            yf_data = yf.download(
-                tickers=chunk,
-                period=yf_period,
-                progress=False,
-                threads=False,
-                auto_adjust=False,
-                group_by="ticker",
-            )
-
-            if isinstance(yf_data.columns, pd.MultiIndex):
-                for ticker in chunk:
-                    try:
-                        sub = pd.DataFrame({
-                            "Open": yf_data[ticker]["Open"],
-                            "High": yf_data[ticker]["High"],
-                            "Low": yf_data[ticker]["Low"],
-                            "Close": yf_data[ticker]["Close"],
-                            "Volume": yf_data[ticker]["Volume"],
-                        }).dropna()
-                        if not sub.empty:
-                            data_dict[ticker] = sub
-                    except Exception:
-                        continue
-            elif len(chunk) == 1 and yf_data is not None and not yf_data.empty:
-                sub = yf_data[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if not sub.empty:
-                    data_dict[chunk[0]] = sub
-        except Exception as exc:
-            log_debug(f"Yahoo chunk download error {chunk[:3]}... -> {exc}")
-
-        missing = [ticker for ticker in chunk if ticker not in data_dict]
-        for ticker in missing:
-            sub = _single_yf_fetch(ticker)
-            if not sub.empty:
-                data_dict[ticker] = sub
-            time.sleep(0.5)
-
-        time.sleep(pause)
-
-    return data_dict
-
-
-def fetch_alpaca_intraday_5m(symbol: str, api_key_value: str, secret_key_value: str, feed: str = "iex") -> pd.DataFrame:
-    if not api_key_value or not secret_key_value:
-        return pd.DataFrame()
-
-    end = datetime.now(ZoneInfo("UTC"))
-    start = end - pd.Timedelta(days=7)
-
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": "5Min",
-        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "adjustment": "all",
-        "limit": 10000,
-        "feed": feed or "iex",
-    }
-
-    try:
-        res = requests.get(
-            url,
-            headers=_alpaca_headers(api_key_value, secret_key_value),
-            params=params,
-            timeout=20,
-        )
-        if res.status_code != 200:
-            log_debug(f"Alpaca intraday {symbol} -> HTTP {res.status_code}: {res.text[:200]}")
-            return pd.DataFrame()
-
-        payload = res.json()
-        bars = payload.get("bars", [])
-        if not bars:
-            return pd.DataFrame()
-
-        rows = []
-        for bar in bars:
-            rows.append({
-                "Date": pd.to_datetime(bar.get("t"), utc=True),
-                "Open": safe_float(bar.get("o")),
-                "High": safe_float(bar.get("h")),
-                "Low": safe_float(bar.get("l")),
-                "Close": safe_float(bar.get("c")),
-                "Volume": safe_float(bar.get("v")),
-            })
-
-        df = pd.DataFrame(rows).dropna()
-        if df.empty:
-            return df
-
-        df = df.set_index("Date").sort_index()
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as exc:
-        log_debug(f"Alpaca intraday fetch error for {symbol}: {exc}")
-        return pd.DataFrame()
-
-
-def _dynamic_min_regular_bars(now_et: datetime | None = None) -> int:
-    """Seansın ne kadar ilerlediğine göre minimum gerekli regular 5m bar sayısı.
-    Günün erken saatlerinde 50 bar beklemek intraday modülü gereksiz yere kilitler.
-    """
-    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
-    session_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    minutes_since_open = max(0, int((now_et - session_open).total_seconds() // 60))
-
-    if minutes_since_open < 20:
-        return 3
-    if minutes_since_open < 45:
-        return 6
-    if minutes_since_open < 90:
-        return 9
-    if minutes_since_open < 150:
-        return 12
-    if minutes_since_open < 240:
-        return 18
-    return 24
-
-
-
-def pick_last_valid_regular_day(intraday_df: pd.DataFrame, min_regular_bars: int | None = None) -> pd.DataFrame:
-    """Regular session barları gerçekten olan en son geçerli günü seçer.
-    Varsayılan eşik seans saatine göre dinamik belirlenir.
-    """
-    if intraday_df is None or intraday_df.empty:
-        return pd.DataFrame()
-
-    if min_regular_bars is None:
-        min_regular_bars = _dynamic_min_regular_bars()
-
-    df = intraday_df.copy()
-    idx = df.index
-    try:
-        et_index = idx.tz_convert("America/New_York")
-    except Exception:
-        try:
-            et_index = idx.tz_localize("America/New_York")
-        except Exception:
-            et_index = idx
-
-    unique_days = sorted(pd.Index(et_index.date).unique(), reverse=True)
-    if len(unique_days) == 0:
-        return pd.DataFrame()
-
-    for day in unique_days:
-        mask = pd.Index(et_index.date) == day
-        sub = df.loc[mask].copy()
-        if sub.empty:
-            continue
-        _, regular_df, _ = split_sessions(sub)
-        reg_vol = regular_df["Volume"].fillna(0).sum() if not regular_df.empty else 0
-        if not regular_df.empty and len(regular_df) >= min_regular_bars and reg_vol > 0:
-            return sub
-
-    return pd.DataFrame()
-
-
-def _extract_last_active_day(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    out = df.copy()
-    idx = out.index
-    try:
-        et_index = idx.tz_convert("America/New_York")
-    except Exception:
-        try:
-            et_index = idx.tz_localize("America/New_York")
-        except Exception:
-            et_index = idx
-
-    out["et_index"] = et_index
-    out["et_date"] = pd.Index(et_index.date)
-
-    valid_dates = list(pd.Series(out["et_date"]).dropna().unique())
-    if not valid_dates:
-        return pd.DataFrame()
-
-    last_day = valid_dates[-1]
-    out = out[out["et_date"] == last_day].copy()
-    out = out.drop(columns=["et_index", "et_date"], errors="ignore")
-    return out
-
-
-@st.cache_data(ttl=120)
-def _fetch_yahoo_intraday_candidates(yahoo_symbol: str) -> dict[str, pd.DataFrame]:
-    out: dict[str, pd.DataFrame] = {}
-    try:
-        stock = yf.Ticker(yahoo_symbol)
-        df_5m = stock.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
-        if df_5m is not None and not df_5m.empty:
-            out["5m_5d"] = df_5m[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
-    except Exception as exc:
-        log_debug(f"Yahoo 5m intraday error for {yahoo_symbol}: {exc}")
-
-    try:
-        stock = yf.Ticker(yahoo_symbol)
-        df_1m = stock.history(period="2d", interval="1m", prepost=True, auto_adjust=False)
-        if df_1m is not None and not df_1m.empty:
-            out["1m_2d"] = df_1m[["Open", "High", "Low", "Close", "Volume"]].dropna(how="all")
-    except Exception as exc:
-        log_debug(f"Yahoo 1m intraday error for {yahoo_symbol}: {exc}")
-
-    return out
-
-
-@st.cache_data(ttl=120)
-def get_intraday_session_data(
-    symbol: str,
-    yahoo_symbol: str,
-    api_key_value: str = "",
-    secret_key_value: str = "",
-    alpaca_feed: str = "iex",
-):
-    min_bars = _dynamic_min_regular_bars()
-
-    intraday = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
-    intraday = pick_last_valid_regular_day(intraday, min_regular_bars=min_bars)
-    if not intraday.empty:
-        return intraday
-
-    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
-    for key in ["5m_5d", "1m_2d"]:
-        cand = yahoo_candidates.get(key, pd.DataFrame())
-        cand = pick_last_valid_regular_day(cand, min_regular_bars=min_bars)
-        if not cand.empty:
-            return cand
-
-    return pd.DataFrame()
-
-
-def get_intraday_session_data_verbose(
-    symbol: str,
-    yahoo_symbol: str,
-    api_key_value: str = "",
-    secret_key_value: str = "",
-    alpaca_feed: str = "iex",
-):
-    min_bars = _dynamic_min_regular_bars()
-
-    alpaca_raw = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
-    if alpaca_raw is not None and not alpaca_raw.empty:
-        picked = pick_last_valid_regular_day(alpaca_raw, min_regular_bars=min_bars)
-        if not picked.empty:
-            return picked, "alpaca_ok"
-        return pd.DataFrame(), f"Alpaca veri var ama geçerli regular session yok (<{min_bars} bar veya hacim yok)"
-
-    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
-    if not yahoo_candidates:
-        return pd.DataFrame(), "Alpaca boş, Yahoo boş"
-
-    for key in ["5m_5d", "1m_2d"]:
-        cand = yahoo_candidates.get(key, pd.DataFrame())
-        if cand is None or cand.empty:
-            continue
-        picked = pick_last_valid_regular_day(cand, min_regular_bars=min_bars)
-        if not picked.empty:
-            return picked, f"yahoo_{key}_ok"
-
-    detail = []
-    if "5m_5d" in yahoo_candidates:
-        detail.append("Yahoo 5m var ama geçerli regular session yok")
-    if "1m_2d" in yahoo_candidates:
-        detail.append("Yahoo 1m var ama geçerli regular session yok")
-    if detail:
-        return pd.DataFrame(), "; ".join(detail) + f" (<{min_bars} bar veya hacim yok)"
-
-    return pd.DataFrame(), "Intraday veri yok"
-
-
-def _get_spy_return_10d(data_dict: dict, alpaca_key: str, alpaca_secret: str, alpaca_feed: str) -> tuple[float, bool]:
-    spy_df = data_dict.get("SPY")
-    if spy_df is not None and not spy_df.empty and len(spy_df) >= 11:
-        ret = (float(spy_df["Close"].iloc[-1]) - float(spy_df["Close"].iloc[-10])) / float(spy_df["Close"].iloc[-10])
-        return ret, True
-
-    log_debug("SPY verisi eksik; tekrar indiriliyor...")
-
-    if alpaca_key and alpaca_secret:
-        spy_df = fetch_alpaca_daily_single("SPY", alpaca_key, alpaca_secret, alpaca_feed)
-        if not spy_df.empty and len(spy_df) >= 11:
-            ret = (float(spy_df["Close"].iloc[-1]) - float(spy_df["Close"].iloc[-10])) / float(spy_df["Close"].iloc[-10])
-            return ret, True
-
-    try:
-        spy = yf.download("SPY", period="1mo", progress=False, threads=False, auto_adjust=False)
-        if spy is not None and not spy.empty:
-            close = spy["Close"].dropna()
-            if len(close) >= 11:
-                ret = (float(close.iloc[-1]) - float(close.iloc[-10])) / float(close.iloc[-10])
-                return ret, True
-    except Exception as exc:
-        log_debug(f"SPY retry failed: {exc}")
-
-    return 0.0, False
-
-
-# ============================================================
-# SWING RADAR - AŞAMA 2
-# ============================================================
-def evaluate_candidates(algo_choice: str, tv_candidates_df: pd.DataFrame, data_dict: dict):
-    final_candidates = []
-    rejected_log = []
-
-    if tv_candidates_df.empty:
-        return final_candidates, rejected_log
-
-    spy_ret_10d, spy_ok = _get_spy_return_10d(
-        data_dict=data_dict,
-        alpaca_key=api_key,
-        alpaca_secret=secret_key,
-        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-    )
-
-    if not spy_ok:
-        log_debug("SPY verisi sağlıklı alınamadı; RS metrikleri temkinli çalışacak.")
-
-    for _, row in tv_candidates_df.iterrows():
-        symbol = row["symbol"]
-        yahoo_symbol = row["yahoo_symbol"]
-        description = row.get("description", "")
-
-        try:
-            df = data_dict.get(yahoo_symbol)
-
-            if df is None or df.empty:
-                rejected_log.append({"Hisse": symbol, "Neden": "Yahoo/Alpaca günlük veri yok"})
-                continue
-
-            if len(df) < 220:
-                rejected_log.append({"Hisse": symbol, "Neden": "Yetersiz günlük veri (<220)"})
-                continue
-
-            last_close = float(df["Close"].iloc[-1])
-            last_open = float(df["Open"].iloc[-1])
-            last_high = float(df["High"].iloc[-1])
-            last_low = float(df["Low"].iloc[-1])
-            last_volume = float(df["Volume"].iloc[-1])
-            last_dollar_volume = last_close * last_volume if pd.notna(last_close) and pd.notna(last_volume) else np.nan
-
-            df = df.copy()
-            df["ATR14"] = calc_atr(df, 14)
-            df["ATR5"] = calc_atr(df, 5)
-            df["ATR20"] = calc_atr(df, 20)
-
-            atr14 = float(df["ATR14"].iloc[-1]) if not pd.isna(df["ATR14"].iloc[-1]) else np.nan
-            atr5 = float(df["ATR5"].iloc[-1]) if not pd.isna(df["ATR5"].iloc[-1]) else np.nan
-            atr20 = float(df["ATR20"].iloc[-1]) if not pd.isna(df["ATR20"].iloc[-1]) else np.nan
-
-            closing_strength = calc_closing_strength(last_close, last_low, last_high)
-
-            stock_ret_10d = (df["Close"].iloc[-1] - df["Close"].iloc[-10]) / df["Close"].iloc[-10]
-            rs_positive = stock_ret_10d > spy_ret_10d if spy_ok else False
-            rs_spread = stock_ret_10d - spy_ret_10d if spy_ok else np.nan
-
-            prior_20d_high = df["High"].shift(1).rolling(20).max().iloc[-1]
-
-            dist_below_breakout = 0.0
-            extension_above_breakout = 0.0
-            if pd.notna(prior_20d_high) and prior_20d_high > 0:
-                if last_close < prior_20d_high:
-                    dist_below_breakout = (prior_20d_high - last_close) / last_close
-                elif last_close > prior_20d_high:
-                    extension_above_breakout = (last_close - prior_20d_high) / prior_20d_high
-
-            sma50 = df["Close"].rolling(50).mean().iloc[-1]
-            sma200 = df["Close"].rolling(200).mean().iloc[-1]
-            ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
-            ema20 = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
-            ema9_above_ema20 = bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20)
-            close_above_ema9 = bool(pd.notna(ema9) and last_close > ema9)
-
-            avg_vol_20 = df["Volume"].rolling(20).mean().iloc[-1]
-            rvol20 = last_volume / avg_vol_20 if avg_vol_20 and avg_vol_20 > 0 else np.nan
-
-            prev_close = df["Close"].iloc[-2]
-            gap_pct = ((last_open - prev_close) / prev_close) * 100 if prev_close > 0 else 0
-
-            up_days = df[df["Close"] > df["Open"]].tail(15)
-            down_days = df[df["Close"] < df["Open"]].tail(15)
-            up_vol = up_days["Volume"].mean() if not up_days.empty else 0
-            down_vol = down_days["Volume"].mean() if not down_days.empty else 0
-
-            close_diff = df["Close"].diff().fillna(0)
-            obv = np.where(close_diff > 0, df["Volume"], np.where(close_diff < 0, -df["Volume"], 0))
-            df["OBV"] = pd.Series(obv, index=df.index).cumsum()
-            obv_slope_10 = df["OBV"].iloc[-1] - df["OBV"].iloc[-10]
-
-            intraday = get_intraday_session_data(
-                symbol=symbol,
-                yahoo_symbol=yahoo_symbol,
-                api_key_value=api_key,
-                secret_key_value=secret_key,
-                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-            )
-
-            if intraday.empty:
-                rejected_log.append({"Hisse": symbol, "Neden": "Intraday veri yok / geçerli regular session bulunamadı"})
-                continue
-
-            _, regular_df, _ = split_sessions(intraday)
-            if regular_df.empty or len(regular_df) < 50:
-                rejected_log.append({"Hisse": symbol, "Neden": "Regular session barları yetersiz"})
-                continue
-
-            regular_vwap = calc_session_vwap(regular_df)
-
-            if pd.isna(regular_vwap) or regular_vwap <= 0:
-                rejected_log.append({"Hisse": symbol, "Neden": "Regular VWAP hesaplanamadı"})
-                continue
-
-            close_above_vwap = last_close > regular_vwap
-
-            # v22: Microcap Trap Guard artık Next Day / Swing tarafında da zorunlu.
-            tv_market_cap = safe_float(row.get("tv_market_cap", np.nan), np.nan)
-            day_high_drop_pct = ((last_close - last_high) / last_high * 100.0) if last_high and last_high > 0 else np.nan
-            swing_micro_guard = microcap_trap_guard(
-                symbol=symbol,
-                description=description,
-                market_cap=tv_market_cap,
-                price=last_close,
-                price_to_high_pct=day_high_drop_pct,
-                below_vwap=not bool(close_above_vwap),
-                change_pct=((last_close - prev_close) / prev_close * 100.0) if prev_close and prev_close > 0 else np.nan,
-            )
-            if swing_micro_guard["decision"] == "HARD_REJECT":
-                rejected_log.append({"Hisse": symbol, "Neden": f"Microcap hard reject: {swing_micro_guard['reason_text']}"})
-                continue
-
-            score = 0
-            notes = []
-
-            if pd.notna(rvol20):
-                if rvol20 >= 5:
-                    score += 30
-                    notes.append("RVOL 5x+")
-                elif rvol20 >= 3:
-                    score += 24
-                    notes.append("RVOL 3x+")
-                elif rvol20 >= 2:
-                    score += 18
-                    notes.append("RVOL 2x+")
-                elif rvol20 >= 1.5:
-                    score += 10
-                    notes.append("RVOL 1.5x+")
-
-            if pd.notna(closing_strength):
-                if closing_strength >= 0.9:
-                    score += 20
-                    notes.append("Tepe kapanış")
-                elif closing_strength >= 0.75:
-                    score += 14
-                    notes.append("Güçlü kapanış")
-                elif closing_strength >= 0.6:
-                    score += 8
-
-            if close_above_vwap:
-                score += 10
-                notes.append("VWAP üstü")
-            else:
-                score -= 6
-
-            if rs_positive:
-                score += 10
-                notes.append("SPY'ye göre güçlü")
-            else:
-                score -= 5
-
-            if pd.notna(sma200) and last_close > sma200:
-                score += 8
-                notes.append("200MA üstü")
-
-            if pd.notna(atr5) and pd.notna(atr20):
-                if atr5 < atr20 * 0.85:
-                    score += 8
-                    notes.append("Sıkışma")
-                elif atr5 > atr20 * 1.15:
-                    score += 4
-                    notes.append("ATR genişliyor")
-
-            if dist_below_breakout <= 0.02 and extension_above_breakout <= 0.03:
-                score += 10
-                notes.append("Kırılıma yakın")
-            elif dist_below_breakout <= 0.05 and extension_above_breakout <= 0.05:
-                score += 4
-            elif extension_above_breakout > 0.08:
-                score -= 10
-                notes.append("Aşırı uzamış")
-
-            if obv_slope_10 > 0:
-                score += 6
-                notes.append("OBV pozitif")
-
-            category = None
-
-            if "A)" in algo_choice:
-                if (
-                    pd.notna(rvol20)
-                    and rvol20 >= 1.5
-                    and pd.notna(closing_strength)
-                    and closing_strength >= 0.75
-                    and close_above_vwap
-                    and rs_positive
-                    and obv_slope_10 > 0
-                    and dist_below_breakout <= 0.02
-                    and extension_above_breakout <= 0.03
-                ):
-                    category = "Breakout"
-
-            elif "B)" in algo_choice:
-                if (
-                    gap_pct >= 2.0
-                    and pd.notna(rvol20)
-                    and rvol20 >= 2.0
-                    and close_above_vwap
-                    and pd.notna(closing_strength)
-                    and closing_strength >= 0.70
-                    and rs_positive
-                    and obv_slope_10 > 0
-                    and extension_above_breakout <= MAX_CONTINUATION_EXTENSION_PCT
-                    and (dist_below_breakout <= 0.03 or extension_above_breakout <= 0.05)
-                ):
-                    category = "Continuation"
-
-            elif "C)" in algo_choice:
-                if (
-                    pd.notna(sma200)
-                    and last_close > sma200
-                    and up_vol > down_vol * 1.2
-                    and pd.notna(atr5)
-                    and pd.notna(atr20)
-                    and atr5 < atr20
-                    and obv_slope_10 > 0
-                ):
-                    category = "Accumulation"
-
-            if category:
-                entry_type = classify_entry_type(
-                    close_above_vwap=close_above_vwap,
-                    dist_below_breakout=dist_below_breakout,
-                    extension_above_breakout=extension_above_breakout,
-                    rvol20=rvol20 if pd.notna(rvol20) else 0,
-                    gap_pct=gap_pct,
-                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
-                    atr5=atr5,
-                    atr20=atr20,
-                )
-
-                move_type = classify_move_type(
-                    gap_pct=gap_pct,
-                    rvol20=rvol20 if pd.notna(rvol20) else 0,
-                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
-                    obv_slope_10=obv_slope_10,
-                    dist_below_breakout=dist_below_breakout,
-                    extension_above_breakout=extension_above_breakout,
-                    atr5=atr5,
-                    atr20=atr20,
-                    last_close=last_close,
-                    sma50=sma50,
-                )
-
-                confidence = compute_confidence_score(
-                    rvol20=rvol20 if pd.notna(rvol20) else 0,
-                    closing_strength=closing_strength if pd.notna(closing_strength) else 0,
-                    close_above_vwap=close_above_vwap,
-                    rs_positive=rs_positive,
-                    dist_below_breakout=dist_below_breakout,
-                    extension_above_breakout=extension_above_breakout,
-                    move_type=move_type,
-                    entry_type=entry_type,
-                )
-
-                if REJECT_EXTENDED and entry_type == "EXTENDED":
-                    rejected_log.append({"Hisse": symbol, "Neden": "Entry_Type=EXTENDED"})
-                    continue
-
-                if confidence < MIN_FINAL_CONFIDENCE:
-                    rejected_log.append({"Hisse": symbol, "Neden": f"Confidence<{MIN_FINAL_CONFIDENCE}"})
-                    continue
-
-                if entry_type == "BREAKOUT":
-                    if pd.notna(prior_20d_high):
-                        if last_close > prior_20d_high:
-                            entry_idea = round(last_close * 1.001, 4)
-                        else:
-                            entry_idea = round(max(last_close, prior_20d_high * 1.002), 4)
-                    else:
-                        entry_idea = round(last_close, 4)
-                elif entry_type == "MICRO_PULLBACK":
-                    entry_idea = round(max(regular_vwap * 1.01, last_close * 0.995), 4)
-                elif entry_type == "VWAP_PULLBACK":
-                    entry_idea = round(regular_vwap * 1.002, 4) if close_above_vwap else round(last_close, 4)
-                elif entry_type == "EXTENDED":
-                    entry_idea = round(last_close, 4)
-                else:
-                    entry_idea = round(last_close, 4)
-
-                if pd.notna(atr14):
-                    stop_price_raw = round(max(entry_idea - 1.2 * atr14, entry_idea * 0.95), 4)
-                else:
-                    stop_price_raw = round(entry_idea * 0.95, 4)
-
-                if stop_price_raw >= entry_idea:
-                    stop_price_raw = round(entry_idea * 0.95, 4)
-
-                # v22.3: Stop aşırı dar ise 0.5R hedefi gürültü/spread seviyesine düşer.
-                # Bu nedenle hedef/R hesabı için en az %2 noise tabanı uygulanır.
-                stop_noise = v22_3_noise_adjust_stop(entry_idea, stop_price_raw)
-                stop_price = stop_noise["Adjusted_Stop"]
-                stop_limit_price = dynamic_stop_limit(stop_price)
-                risk = max(entry_idea - stop_price, 0.01)
-
-                # v22.3 Actionable Target Floor:
-                # 7.11 -> 7.13 gibi anlamsız 0.5R seviyeleri ana hedef gibi gösterilmez.
-                raw_05r_level = round(entry_idea + 0.5 * risk, 4)
-                raw_3pct_level = round(entry_idea * 1.03, 4)
-                actionable = v22_3_actionable_target_floor(entry_idea, raw_05r_level, raw_3pct_level)
-                tp0_quick = actionable["Actionable_TP0"]
-                tp0_05r = raw_05r_level
-                tp0_3pct = raw_3pct_level
-                tp1 = round(max(entry_idea + 1.0 * risk, entry_idea * 1.075), 4)
-                tp15 = round(entry_idea * 1.15, 4)
-                runner_tp20 = round(entry_idea * 1.20, 4)
-                runner_tp30 = round(entry_idea * 1.30, 4)
-
-                # v21.4 VIVO/ATRO Pattern Readiness:
-                # VIVO gibi TP15'e giden adaylarda ortak yapı: yüksek RS, high'a yakın kapanış,
-                # VWAP üstü, yeterli RVOL ve pozitif gap/OBV. BCRX gibi sadece entry görüp
-                # follow-through vermeyen adaylar WAIT_CONFIRM'da kalır.
-                vivo_pattern_score = 0.0
-                if pd.notna(rvol20):
-                    if rvol20 >= 3.0:
-                        vivo_pattern_score += 22
-                    elif rvol20 >= 2.0:
-                        vivo_pattern_score += 17
-                    elif rvol20 >= 1.5:
-                        vivo_pattern_score += 10
-                if pd.notna(closing_strength):
-                    if closing_strength >= 0.88:
-                        vivo_pattern_score += 22
-                    elif closing_strength >= 0.78:
-                        vivo_pattern_score += 18
-                    elif closing_strength >= 0.68:
-                        vivo_pattern_score += 9
-                if close_above_vwap:
-                    vivo_pattern_score += 15
-                dist_to_high_pct_abs = dist_below_breakout * 100.0 if pd.notna(dist_below_breakout) else np.nan
-                if pd.notna(dist_to_high_pct_abs):
-                    if dist_to_high_pct_abs <= 0.75:
-                        vivo_pattern_score += 18
-                    elif dist_to_high_pct_abs <= 1.50:
-                        vivo_pattern_score += 10
-                    elif dist_to_high_pct_abs <= 3.00:
-                        vivo_pattern_score += 5
-                rs_spread_pct_abs = rs_spread * 100.0 if pd.notna(rs_spread) else np.nan
-                if pd.notna(rs_spread_pct_abs):
-                    if rs_spread_pct_abs >= 15:
-                        vivo_pattern_score += 18
-                    elif rs_spread_pct_abs >= 8:
-                        vivo_pattern_score += 12
-                    elif rs_spread_pct_abs >= 3:
-                        vivo_pattern_score += 5
-                if pd.notna(gap_pct) and gap_pct >= 0:
-                    vivo_pattern_score += 5
-                if obv_slope_10 > 0:
-                    vivo_pattern_score += 5
-                vivo_pattern_score = round(float(max(0, min(100, vivo_pattern_score))), 1)
-
-                # v22.3: İşlem yapılabilir hareket skoru. Hedef zorlanmaz; RVOL/VWAP/EMA9-EMA20/RS/OBV gibi
-                # bağımsız metrikler devam ihtimalini matematiksel olarak desteklemiyorsa aday WAIT_CONFIRM'da kalır.
-                actionable_continuation_score = 0.0
-                if pd.notna(rvol20):
-                    if rvol20 >= 5: actionable_continuation_score += 22
-                    elif rvol20 >= 3: actionable_continuation_score += 18
-                    elif rvol20 >= 2: actionable_continuation_score += 12
-                if pd.notna(closing_strength):
-                    if closing_strength >= 0.90: actionable_continuation_score += 18
-                    elif closing_strength >= 0.80: actionable_continuation_score += 13
-                    elif closing_strength >= 0.70: actionable_continuation_score += 8
-                if close_above_vwap: actionable_continuation_score += 14
-                if ema9_above_ema20 and close_above_ema9: actionable_continuation_score += 14
-                elif ema9_above_ema20: actionable_continuation_score += 8
-                if rs_positive: actionable_continuation_score += 10
-                if obv_slope_10 > 0: actionable_continuation_score += 8
-                if move_type in ["SHORT_SQUEEZE", "NEWS_DRIVEN"]: actionable_continuation_score += 8
-                elif move_type == "TECHNICAL_MOMENTUM": actionable_continuation_score += 5
-                actionable_continuation_score = round(float(max(0, min(100, actionable_continuation_score))), 1)
-
-                if vivo_pattern_score >= 85 and confidence >= 75:
-                    trade_readiness = "PAPER_READY_AFTER_5MIN_HOLD"
-                    readiness_reason = "VIVO pattern güçlü: RS + VWAP + high'a yakın kapanış; yine de 5-15dk hold şart"
-                elif vivo_pattern_score >= 70 and confidence >= 75:
-                    trade_readiness = "WAIT_CONFIRM_STRONG"
-                    readiness_reason = "Güçlü aday ama TP0/follow-through teyidi gelmeden işlem yok"
-                else:
-                    trade_readiness = "WAIT_CONFIRM"
-                    readiness_reason = "Entry dokunuşu yeterli değil; anlamlı TP0 + hacim/EMA/VWAP follow-through bekle"
-
-                if not actionable.get("Actionable_Target_OK", False):
-                    trade_readiness = "WAIT_CONFIRM_NO_ACTIONABLE_TARGET"
-                    readiness_reason = actionable.get("Actionable_Target_Reason", "Anlamlı minimum hedef yok")
-                elif stop_noise.get("Too_Tight_Stop_Noise", False):
-                    trade_readiness = "WAIT_CONFIRM_TOO_TIGHT_STOP"
-                    readiness_reason = stop_noise.get("Stop_Noise_Reason", "Stop çok dar; spread/noise riski")
-                elif actionable_continuation_score < NEXTDAY_MIN_ACTIONABLE_SCORE:
-                    trade_readiness = "WAIT_CONFIRM_ACTIONABLE_SCORE_LOW"
-                    readiness_reason = f"Anlamlı hedef var ama hacim/VWAP/EMA/RS matematiği zayıf: {actionable_continuation_score:.1f}"
-
-                if swing_micro_guard["decision"] == "LAB_ONLY":
-                    trade_readiness = "LAB_ONLY_NO_MAIN_TRADE"
-                    readiness_reason = "MarketCap 50-100M / microcap risk: sadece lab-paper; ana trade yok"
-                elif swing_micro_guard["decision"] == "STRICT_REVIEW":
-                    trade_readiness = "STRICT_REVIEW_PAPER_ONLY"
-                    readiness_reason = "MarketCap 100-300M: sıkı teyit ve paper-only"
-
-                final_candidates.append(
-                    {
-                        "Symbol": symbol,
-                        "Yahoo_Symbol": yahoo_symbol,
-                        "Description": description,
-                        "MarketCap_M": round(tv_market_cap / 1_000_000, 2) if pd.notna(tv_market_cap) else np.nan,
-                        "MarketCap_Bucket": swing_micro_guard["market_cap_bucket"],
-                        "Microcap_Guard": swing_micro_guard["decision"],
-                        "Microcap_Reasons": swing_micro_guard["reason_text"],
-                        "Category": category,
-                        "Move_Type": move_type,
-                        "Entry_Type": entry_type,
-                        "Confidence": confidence,
-                        "Close": round(last_close, 4 if last_close < 1 else 2),
-                        "RVOL": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
-                        "Close_Strength": round(closing_strength, 2) if pd.notna(closing_strength) else np.nan,
-                        "Dist_to_High_%": round(dist_below_breakout * 100, 2),
-                        "Extension_Above_High_%": round(extension_above_breakout * 100, 2),
-                        "VWAP_Regular": round(regular_vwap, 4 if regular_vwap < 1 else 2),
-                        "Above_VWAP": bool(close_above_vwap),
-                        "RS_10d_minus_SPY_%": round(rs_spread * 100, 2) if pd.notna(rs_spread) else np.nan,
-                        "ATR14": round(atr14, 4 if pd.notna(atr14) and atr14 < 1 else 2) if pd.notna(atr14) else np.nan,
-                        "Gap_%": round(gap_pct, 2),
-                        "SMA50": round(sma50, 2) if pd.notna(sma50) else np.nan,
-                        "SMA200": round(sma200, 2) if pd.notna(sma200) else np.nan,
-                        "EMA9": round(ema9, 4 if pd.notna(ema9) and ema9 < 1 else 2) if pd.notna(ema9) else np.nan,
-                        "EMA20": round(ema20, 4 if pd.notna(ema20) and ema20 < 1 else 2) if pd.notna(ema20) else np.nan,
-                        "EMA9_Above_EMA20": bool(ema9_above_ema20),
-                        "Close_Above_EMA9": bool(close_above_ema9),
-                        "OBV_Positive": bool(obv_slope_10 > 0),
-                        "Last_Volume": round(last_volume, 0) if pd.notna(last_volume) else np.nan,
-                        "Dollar_Volume_M": round(last_dollar_volume / 1_000_000, 2) if pd.notna(last_dollar_volume) else np.nan,
-                        "Entry_Idea": entry_idea,
-                        "Original_Stop_Price": stop_price_raw,
-                        "Stop_Price": stop_price,
-                        "Original_Stop_Distance_%": stop_noise.get("Original_Stop_Distance_%"),
-                        "Stop_Adjusted_For_Noise": stop_noise.get("Stop_Adjusted_For_Noise"),
-                        "Too_Tight_Stop_Noise": stop_noise.get("Too_Tight_Stop_Noise"),
-                        "Stop_Noise_Reason": stop_noise.get("Stop_Noise_Reason"),
-                        "Stop_Limit_Price": stop_limit_price,
-                        "TP0_Quick": tp0_quick,
-                        "Raw_0_5R_Level": tp0_05r,
-                        "TP0_Quick_3pct": tp0_3pct,
-                        "Actionable_TP0": actionable.get("Actionable_TP0"),
-                        "Actionable_Move_$": actionable.get("Actionable_Move_$"),
-                        "Actionable_Move_%": actionable.get("Actionable_Move_%"),
-                        "Min_Actionable_Move_$": actionable.get("Min_Actionable_Move_$"),
-                        "Actionable_Target_OK": actionable.get("Actionable_Target_OK"),
-                        "Actionable_Target_Reason": actionable.get("Actionable_Target_Reason"),
-                        "Actionable_Continuation_Score": actionable_continuation_score,
-                        "TP1": tp1,
-                        "TP15": tp15,
-                        "Runner_TP20": runner_tp20,
-                        "Runner_TP30": runner_tp30,
-                        "VIVO_Pattern_Score": vivo_pattern_score,
-                        "Trade_Readiness": trade_readiness,
-                        "Trade_Readiness_Reason": readiness_reason,
-                        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + anlamlı TP0 (min +%3 / min $ hareket) + hacim/EMA/VWAP follow-through şart",
-                        "Weak_Trigger_Action": "Entry sadece iğneyle görülür ve anlamlı TP0/hacim devamı gelmezse işlem yok/çık",
-                        "Score": score,
-                        "Notes": ", ".join(notes[:6]),
-                    }
-                )
-            else:
-                rejected_log.append({"Hisse": symbol, "Neden": "İkinci aşama kuralları geçilemedi"})
-
-        except Exception as exc:
-            rejected_log.append({"Hisse": symbol, "Neden": f"Hata: {str(exc)}"})
-            log_debug(f"Evaluate error {symbol}: {exc}")
-
-    final_candidates = sorted(
-        final_candidates,
-        key=lambda x: (x["Confidence"], x["Score"]),
-        reverse=True
-    )
-    return final_candidates, rejected_log
-
-
-# ============================================================
-# TOP 3
-# ============================================================
-def rank_top3(candidates_df: pd.DataFrame) -> pd.DataFrame:
-    if candidates_df.empty:
-        return pd.DataFrame()
-
-    df = candidates_df.copy()
-
-    df["rvol_score"] = np.minimum(df["RVOL"].fillna(0) / 3.0, 1.0)
-    df["close_strength_score"] = df["Close_Strength"].fillna(0).clip(0, 1)
-    df["vwap_score"] = np.where(df["Above_VWAP"] == True, 1.0, 0.0)
-    df["breakout_score"] = 1 - np.minimum(df["Dist_to_High_%"].fillna(999) / 3.0, 1.0)
-    df["extension_penalty"] = np.where(df["Extension_Above_High_%"].fillna(0) > 5, -0.12, 0.0)
-    df["compression_score"] = np.where(df["Dist_to_High_%"].fillna(99) <= 2.0, 0.8, 0.5)
-    df["rs_score"] = np.clip(df["RS_10d_minus_SPY_%"].fillna(0) / 10.0, 0, 1)
-    df["clean_chart"] = np.where(df["Close_Strength"].fillna(0) >= 0.7, 1.0, 0.5)
-
-    entry_bonus_map = {
-        "BREAKOUT": 0.12,
-        "MICRO_PULLBACK": 0.08,
-        "VWAP_PULLBACK": 0.06,
-        "EXTENDED": -0.05,
-        "WEAK": -0.12,
-    }
-    df["entry_bonus"] = df["Entry_Type"].map(entry_bonus_map).fillna(0)
-
-    move_bonus_map = {
-        "NEWS_DRIVEN": 0.10,
-        "SHORT_SQUEEZE": 0.08,
-        "TECHNICAL_MOMENTUM": 0.06,
-        "WEAK_MOVE": -0.04,
-    }
-    df["move_bonus"] = df["Move_Type"].map(move_bonus_map).fillna(0)
-
-    df["confidence_score"] = np.clip(df["Confidence"].fillna(0) / 100.0, 0, 1)
-
-    df["final_score"] = (
-        0.20 * df["rvol_score"] +
-        0.18 * df["close_strength_score"] +
-        0.12 * df["breakout_score"] +
-        0.10 * df["compression_score"] +
-        0.10 * df["vwap_score"] +
-        0.10 * df["rs_score"] +
-        0.08 * df["clean_chart"] +
-        0.07 * df["confidence_score"] +
-        df["entry_bonus"] +
-        df["move_bonus"] +
-        df["extension_penalty"]
-    )
-
-    df = df[
-        (df["RVOL"].fillna(0) >= 1.5) &
-        (df["Close_Strength"].fillna(0) >= 0.6) &
-        (df["Above_VWAP"] == True) &
-        (df["RS_10d_minus_SPY_%"].fillna(-999) > 0) &
-        (df["Extension_Above_High_%"].fillna(999) <= 8.0)
-    ]
-
-    # v22.3: Top 3'e sadece anlamlı hedefi olan ve stopu piyasa gürültüsü kadar dar olmayan adaylar girsin.
-    if "Actionable_Target_OK" in df.columns:
-        df = df[df["Actionable_Target_OK"] == True]
-    if "Too_Tight_Stop_Noise" in df.columns:
-        df = df[df["Too_Tight_Stop_Noise"] != True]
-    if "Actionable_Continuation_Score" in df.columns:
-        df = df[df["Actionable_Continuation_Score"].fillna(0) >= NEXTDAY_MIN_ACTIONABLE_SCORE]
-
-    df["stability_bonus"] = np.where(df["Close"] >= 5, 0.05, 0.0)
-    df["final_score"] = df["final_score"] + df["stability_bonus"]
-
-    df = df.sort_values(["final_score", "Confidence", "Score"], ascending=False)
-    return df.head(3)
-
-
-
-# ============================================================
-# INTRADAY TRADE ENGINE
-# ============================================================
-def calc_ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calc_macd(series: pd.Series):
-    ema12 = calc_ema(series, 12)
-    ema26 = calc_ema(series, 26)
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
-    return macd, signal, hist
-
-
-def calc_intraday_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    temp = df.copy()
-    prev_close = temp['Close'].shift(1)
-    tr = pd.concat([
-        temp['High'] - temp['Low'],
-        (temp['High'] - prev_close).abs(),
-        (temp['Low'] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def detect_intraday_setup(features: dict) -> str:
-    # Önce acımasız kırmızı bayraklar
-    if features.get("vwap_lost_after_open", False):
-        return "NO_SETUP"
-    if features.get("opening_range_fail", False):
-        return "NO_SETUP"
-    if features.get("price_to_premarket_high_pct", np.nan) < -4.0:
-        return "NO_SETUP"
-    if features.get("price_to_day_high_pct", np.nan) < -2.5:
-        return "NO_SETUP"
-    if features.get("session_rvol", np.nan) < 1.2:
-        return "NO_SETUP"
-
-    # 1) Açılış sürüşü: gap + hacim + ORB + VWAP üstü + tepeye yakın kalma
-    if (
-        features["close_above_vwap"]
-        and features["opening_range_break"]
-        and features["ema9_above_ema20"]
-        and features["macd_hist_positive"]
-        and features["gap_pct"] >= 3.0
-        and features["session_rvol"] >= 2.0
-        and features["price_to_day_high_pct"] >= -1.0
-        and features["price_to_premarket_high_pct"] >= -2.0
-    ):
-        return "OPEN_DRIVE_BREAKOUT"
-
-    # 2) İlk pullback: güçlü hisse, VWAP/EMA9 üstünde kontrollü geri çekilme
-    if (
-        features["close_above_vwap"]
-        and features["ema9_above_ema20"]
-        and features["macd_hist_positive"]
-        and features["first_pullback_hold"]
-        and features["session_rvol"] >= 1.5
-        and features["price_to_vwap_pct"] >= -0.2
-        and features["price_to_ema9_pct"] >= -0.4
-        and features["price_to_day_high_pct"] >= -1.5
-        and features["price_to_premarket_high_pct"] >= -3.0
-    ):
-        return "FIRST_PULLBACK"
-
-    # 3) VWAP reclaim: gün içi zayıflamadan sonra reclaim ama yalnızca tekrar güç varsa
-    if (
-        features["close_above_vwap"]
-        and features["macd_hist_positive"]
-        and features["ema9_above_ema20"]
-        and features["vwap_reclaim"]
-        and features["session_rvol"] >= 1.3
-        and features["rsi14"] >= 60
-        and features["price_to_day_high_pct"] >= -2.0
-        and features["price_to_premarket_high_pct"] >= -3.5
-    ):
-        return "VWAP_RECLAIM"
-
-    return "NO_SETUP"
-
-
-def intraday_confidence_score(features: dict, setup_type: str) -> int:
-    score = 0
-
-    srvol = features.get("session_rvol", np.nan)
-    if pd.notna(srvol):
-        if srvol >= 3.0:
-            score += 26
-        elif srvol >= 2.0:
-            score += 20
-        elif srvol >= 1.5:
-            score += 14
-        elif srvol >= 1.2:
-            score += 8
-
-    if features["close_above_vwap"]:
-        score += 14
-    if features["ema9_above_ema20"]:
-        score += 10
-    if features["ema20_above_ema50"]:
-        score += 6
-    if features["macd_hist_positive"]:
-        score += 8
-
-    rsi = features["rsi14"]
-    if pd.notna(rsi):
-        if 60 <= rsi <= 75:
-            score += 10
-        elif 55 <= rsi < 60:
-            score += 5
-        elif rsi > 82:
-            score -= 8
-        elif rsi < 50:
-            score -= 12
-
-    if features["opening_range_break"]:
-        score += 10
-    if features["first_pullback_hold"]:
-        score += 8
-    if features["vwap_reclaim"]:
-        score += 6
-
-    gap_pct = features.get("gap_pct", np.nan)
-    if pd.notna(gap_pct):
-        if gap_pct >= 8:
-            score += 10
-        elif gap_pct >= 3:
-            score += 6
-        elif gap_pct < -5:
-            score -= 6
-
-    rs_intraday = features.get("rs_vs_spy_intraday_pct", 0.0)
-    if rs_intraday >= 5:
-        score += 10
-    elif rs_intraday >= 2:
-        score += 6
-    elif rs_intraday < 0:
-        score -= 8
-
-    pth = features.get("price_to_day_high_pct", np.nan)
-    if pd.notna(pth):
-        if pth >= -0.75:
-            score += 10
-        elif pth >= -1.5:
-            score += 6
-        elif pth < -3.0:
-            score -= 14
-        elif pth < -2.0:
-            score -= 8
-
-    ptph = features.get("price_to_premarket_high_pct", np.nan)
-    if pd.notna(ptph):
-        if ptph >= -1.5:
-            score += 8
-        elif ptph < -4.0:
-            score -= 14
-        elif ptph < -2.5:
-            score -= 6
-
-    ptvwap = features.get("price_to_vwap_pct", np.nan)
-    if pd.notna(ptvwap):
-        if ptvwap >= 0.3:
-            score += 8
-        elif ptvwap < -0.25:
-            score -= 12
-
-    if features.get("vwap_lost_after_open", False):
-        score -= 18
-    if features.get("opening_range_fail", False):
-        score -= 18
-
-    if setup_type == "OPEN_DRIVE_BREAKOUT":
-        score += 12
-    elif setup_type == "FIRST_PULLBACK":
-        score += 8
-    elif setup_type == "VWAP_RECLAIM":
-        score += 6
-    else:
-        score -= 20
-
-    return max(0, min(100, int(round(score))))
-
-
-def compute_intraday_trade_levels(features: dict, setup_type: str) -> dict:
-    price = features['last_price']
-    vwap = features['session_vwap']
-    ema9 = features['ema9']
-    atr5m = features['atr5m']
-    opening_range_high = features['opening_range_high']
-    opening_range_low = features['opening_range_low']
-    intraday_low = features['day_low']
-
-    if pd.isna(atr5m) or atr5m <= 0:
-        atr5m = max(price * 0.01, 0.05)
-
-    if setup_type == 'OPEN_DRIVE_BREAKOUT':
-        trigger = max(x for x in [price, opening_range_high, features['premarket_high']] if pd.notna(x))
-        entry = round(trigger * 1.001, 4)
-        anchor = max(vwap, opening_range_low) if pd.notna(opening_range_low) else vwap
-        stop = round(max(anchor - 0.6 * atr5m, entry * 0.97), 4)
-        rr1, rr2 = 1.2, 2.4
-    elif setup_type == 'FIRST_PULLBACK':
-        anchor_entry = max(x for x in [vwap, ema9, price] if pd.notna(x))
-        entry = round(anchor_entry * 1.001, 4)
-        anchor = max(x for x in [vwap, intraday_low, opening_range_low] if pd.notna(x))
-        stop = round(max(anchor - 0.5 * atr5m, entry * 0.975), 4)
-        rr1, rr2 = 1.0, 2.0
-    elif setup_type == 'VWAP_RECLAIM':
-        entry = round(max(price, vwap) * 1.001, 4)
-        stop = round(max(vwap - 0.7 * atr5m, entry * 0.972), 4)
-        rr1, rr2 = 1.0, 2.0
-    else:
-        return {'entry': None, 'stop': None, 'tp1': None, 'tp2': None}
-
-    if stop >= entry:
-        stop = round(entry * 0.975, 4)
-
-    risk = max(entry - stop, 0.01)
-    tp1 = round(entry + rr1 * risk, 4)
-    tp2 = round(entry + rr2 * risk, 4)
-    return {'entry': entry, 'stop': stop, 'tp1': tp1, 'tp2': tp2}
-
-
-@st.cache_data(ttl=30)
-def fetch_intraday_trade_universe(
-    session_name: str,
-    max_records: int = 30,
-    min_price: float = 1.0,
-    max_price: float = 100.0,
-    exclude_stale_regular: bool = False,
-):
-    active_session = get_active_session_et()
-    session_name = (session_name or 'regular').lower()
-
-    # Fresh Runner Catcher güvenlik kuralı:
-    # ABD regular seansı kapalıyken TradingView 'change/close/volume' kolonları çoğu zaman
-    # bir önceki normal seansın hareketini gösterir. Bu durumda Regular seçimi fresh runner sayılmamalı.
-    if exclude_stale_regular and session_name == 'regular' and active_session != 'regular':
-        return pd.DataFrame()
-
-    if session_name == 'premarket':
-        sort_field = 'premarket_change'
-        vol_field = 'premarket_volume'
-        price_field = 'premarket_close'
-        min_vol = 50000
-        data_status = 'FRESH_PREMARKET' if active_session == 'premarket' else 'PREMARKET_SELECTED_OUTSIDE_SESSION'
-    elif session_name == 'afterhours':
-        sort_field = 'postmarket_change'
-        vol_field = 'postmarket_volume'
-        price_field = 'postmarket_close'
-        min_vol = 50000
-        data_status = 'FRESH_AFTERHOURS' if active_session == 'afterhours' else 'AFTERHOURS_SELECTED_OUTSIDE_SESSION'
-    else:
-        sort_field = 'change'
-        vol_field = 'volume'
-        price_field = 'close'
-        min_vol = 150000
-        data_status = 'FRESH_REGULAR' if active_session == 'regular' else 'PREVIOUS_REGULAR_POSSIBLE_STALE'
-
-    filters = [
-        {'left': price_field, 'operation': 'in_range', 'right': [min_price, max_price]},
-        {'left': vol_field, 'operation': 'greater', 'right': min_vol},
-        {'left': 'exchange', 'operation': 'in_range', 'right': ['NASDAQ', 'NYSE', 'AMEX']},
-    ]
-
-    columns = ['name', 'description', price_field, sort_field, vol_field, 'market_cap_basic']
-    raw = tradingview_scan(filters, columns, sort_field, max_records=max_records, page_size=min(100, max_records))
-
-    rows = []
-    seen = set()
-    for item in raw:
-        try:
-            d = item['d']
-            symbol = d[0]
-            description = d[1] or ''
-            if not symbol or symbol in seen:
-                continue
-            if is_likely_non_common_stock(symbol, description):
-                continue
-            seen.add(symbol)
-            rows.append({
-                'symbol': symbol,
-                'yahoo_symbol': normalize_symbol_for_yahoo(symbol),
-                'description': description,
-                'live_price': safe_float(d[2], np.nan),
-                'live_change_pct': safe_float(d[3], np.nan),
-                'live_volume': safe_float(d[4], np.nan),
-                'market_cap': safe_float(d[5], np.nan) if len(d) > 5 else np.nan,
-                'change_source': session_name.upper(),
-                'data_status': data_status,
-                'active_session_et': active_session,
-            })
-        except Exception as exc:
-            log_debug(f'Intraday universe parse error: {exc}')
-    return pd.DataFrame(rows)
-
-
-def build_intraday_features(
-    symbol: str,
-    yahoo_symbol: str,
-    daily_df: pd.DataFrame,
-    spy_daily_df: pd.DataFrame,
-    intraday_df: pd.DataFrame,
-    spy_intraday_df: pd.DataFrame | None = None,
-) -> dict | None:
-    if daily_df is None or daily_df.empty or intraday_df is None or intraday_df.empty:
-        return None
-
-    premarket_df, regular_df, afterhours_df = split_sessions(intraday_df)
-    min_needed = max(6, _dynamic_min_regular_bars())
-    if regular_df.empty or len(regular_df) < min_needed:
-        return None
-
-    reg = regular_df.copy()
-    reg['EMA9'] = calc_ema(reg['Close'], 9)
-    reg['EMA20'] = calc_ema(reg['Close'], 20)
-    reg['EMA50'] = calc_ema(reg['Close'], 50)
-    macd, macd_signal, macd_hist = calc_macd(reg['Close'])
-    reg['MACD'] = macd
-    reg['MACD_SIGNAL'] = macd_signal
-    reg['MACD_HIST'] = macd_hist
-    reg['RSI14'] = calc_rsi(reg['Close'], 14)
-    reg['ATR5M'] = calc_intraday_atr(reg, 14)
-
-    last = reg.iloc[-1]
-    last_price = float(last['Close'])
-    day_high = float(reg['High'].max())
-    day_low = float(reg['Low'].min())
-    session_vwap = calc_session_vwap(reg)
-    if pd.isna(session_vwap) or session_vwap <= 0:
-        return None
-
-    # İlk 15 dakika opening range
-    first3 = reg.iloc[:3].copy()
-    opening_range_high = float(first3['High'].max()) if not first3.empty else np.nan
-    opening_range_low = float(first3['Low'].min()) if not first3.empty else np.nan
-    opening_range_break = bool(len(reg) > 3 and reg.iloc[3:]['High'].max() > opening_range_high) if pd.notna(opening_range_high) else False
-
-    # Açılış range'i sonra aşağı kırıldı mı? Özellikle long için kötü işaret
-    opening_range_fail = False
-    if len(reg) > 6 and pd.notna(opening_range_low):
-        later_low = float(reg.iloc[3:]['Low'].min())
-        opening_range_fail = later_low < opening_range_low * 0.998
-
-    # İlk kontrollü geri çekilme tuttu mu
-    pullback_window = reg.iloc[3:9].copy()
-    first_pullback_hold = False
-    if not pullback_window.empty and pd.notna(opening_range_low):
-        first_pullback_hold = float(pullback_window['Low'].min()) >= max(opening_range_low, session_vwap) * 0.985
-
-    # VWAP reclaim: önce altına inip sonra üstüne dönme
-    vwap_reclaim = False
-    if len(reg) >= 8:
-        vwap_reclaim = bool((reg['Close'].iloc[:-1] < session_vwap).any() and last_price > session_vwap)
-
-    # Açılıştan sonra VWAP kaybı ve tekrar altında kalma: long için olumsuz
-    vwap_lost_after_open = False
-    if len(reg) >= 6:
-        after_open = reg.iloc[3:].copy()
-        if not after_open.empty:
-            vwap_lost_after_open = bool((after_open['Close'] < session_vwap).tail(3).any() and last_price < session_vwap * 1.002)
-
-    prev_close = float(daily_df['Close'].iloc[-2]) if len(daily_df) >= 2 else np.nan
-    prev_day_high = float(daily_df['High'].iloc[-2]) if len(daily_df) >= 2 else np.nan
-    gap_pct = ((float(reg['Open'].iloc[0]) - prev_close) / prev_close * 100) if prev_close > 0 else np.nan
-
-    avg_vol_20 = daily_df['Volume'].rolling(20).mean().iloc[-1] if len(daily_df) >= 20 else np.nan
-    session_volume = float(reg['Volume'].sum())
-    # Gün ortasında daha anlamlı olsun diye seans hacmini günlük ortalamaya zamansal normalize et
-    bars_so_far = max(len(reg), 1)
-    full_day_equiv_volume = session_volume * (78 / bars_so_far)
-    session_rvol = (full_day_equiv_volume / avg_vol_20) if pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
-
-    # Intraday RS vs SPY: aynı gün regular seans getirisi ile hesapla
-    rs_vs_spy_intraday_pct = 0.0
-    if prev_close > 0:
-        stock_ret = (last_price - prev_close) / prev_close * 100
-        spy_ret = 0.0
-        if spy_intraday_df is not None and not spy_intraday_df.empty:
-            _, spy_reg, _ = split_sessions(spy_intraday_df)
-            if not spy_reg.empty:
-                spy_prev_close = float(spy_daily_df['Close'].iloc[-2]) if spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2 else np.nan
-                spy_last = float(spy_reg['Close'].iloc[-1])
-                if pd.notna(spy_prev_close) and spy_prev_close > 0:
-                    spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100
-        elif spy_daily_df is not None and not spy_daily_df.empty and len(spy_daily_df) >= 2:
-            spy_prev_close = float(spy_daily_df['Close'].iloc[-2])
-            spy_last = float(spy_daily_df['Close'].iloc[-1])
-            if spy_prev_close > 0:
-                spy_ret = (spy_last - spy_prev_close) / spy_prev_close * 100
-        rs_vs_spy_intraday_pct = stock_ret - spy_ret
-
-    price_to_day_high_pct = ((last_price - day_high) / day_high * 100) if day_high > 0 else np.nan
-    price_to_vwap_pct = ((last_price - session_vwap) / session_vwap * 100) if session_vwap > 0 else np.nan
-    ema9 = float(last['EMA9']) if pd.notna(last['EMA9']) else np.nan
-    ema20 = float(last['EMA20']) if pd.notna(last['EMA20']) else np.nan
-    ema50 = float(last['EMA50']) if pd.notna(last['EMA50']) else np.nan
-    price_to_ema9_pct = ((last_price - ema9) / ema9 * 100) if pd.notna(ema9) and ema9 > 0 else np.nan
-
-    premarket_high = float(premarket_df['High'].max()) if not premarket_df.empty else np.nan
-    premarket_low = float(premarket_df['Low'].min()) if not premarket_df.empty else np.nan
-    premarket_volume = float(premarket_df['Volume'].sum()) if not premarket_df.empty else 0.0
-    price_to_premarket_high_pct = ((last_price - premarket_high) / premarket_high * 100) if pd.notna(premarket_high) and premarket_high > 0 else np.nan
-
-    return {
-        'last_price': last_price,
-        'session_vwap': session_vwap,
-        'ema9': ema9,
-        'ema20': ema20,
-        'ema50': ema50,
-        'ema9_above_ema20': bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20),
-        'ema20_above_ema50': bool(pd.notna(ema20) and pd.notna(ema50) and ema20 > ema50),
-        'macd': float(last['MACD']) if pd.notna(last['MACD']) else np.nan,
-        'macd_signal': float(last['MACD_SIGNAL']) if pd.notna(last['MACD_SIGNAL']) else np.nan,
-        'macd_hist': float(last['MACD_HIST']) if pd.notna(last['MACD_HIST']) else np.nan,
-        'macd_hist_positive': bool(pd.notna(last['MACD_HIST']) and last['MACD_HIST'] > 0),
-        'rsi14': float(last['RSI14']) if pd.notna(last['RSI14']) else np.nan,
-        'atr5m': float(last['ATR5M']) if pd.notna(last['ATR5M']) else np.nan,
-        'close_above_vwap': bool(last_price > session_vwap),
-        'opening_range_high': opening_range_high,
-        'opening_range_low': opening_range_low,
-        'opening_range_break': opening_range_break,
-        'opening_range_fail': opening_range_fail,
-        'first_pullback_hold': first_pullback_hold,
-        'vwap_reclaim': vwap_reclaim,
-        'vwap_lost_after_open': vwap_lost_after_open,
-        'day_high': day_high,
-        'day_low': day_low,
-        'premarket_high': premarket_high,
-        'premarket_low': premarket_low,
-        'premarket_volume': premarket_volume,
-        'gap_pct': gap_pct,
-        'session_volume': session_volume,
-        'session_rvol': session_rvol,
-        'price_to_day_high_pct': price_to_day_high_pct,
-        'price_to_premarket_high_pct': price_to_premarket_high_pct,
-        'price_to_vwap_pct': price_to_vwap_pct,
-        'price_to_ema9_pct': price_to_ema9_pct,
-        'prev_day_high': prev_day_high,
-        'rs_vs_spy_intraday_pct': rs_vs_spy_intraday_pct,
-    }
-
-
-def evaluate_intraday_candidates(universe_df: pd.DataFrame, daily_dict: dict, spy_daily_df: pd.DataFrame):
-    final_candidates = []
-    rejected = []
-
-    spy_intraday_df, spy_intraday_reason = get_intraday_session_data_verbose(
-        symbol='SPY',
-        yahoo_symbol='SPY',
-        api_key_value=api_key,
-        secret_key_value=secret_key,
-        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
-    )
-    if spy_intraday_df.empty:
-        log_debug(f"SPY intraday fallback -> {spy_intraday_reason}")
-
-    for _, row in universe_df.iterrows():
-        symbol = row['symbol']
-        yahoo_symbol = row['yahoo_symbol']
-        daily_df = daily_dict.get(yahoo_symbol)
-        if daily_df is None or daily_df.empty or len(daily_df) < 60:
-            rejected.append({'Hisse': symbol, 'Neden': 'Yetersiz günlük veri'})
-            continue
-
-        intraday_df, intraday_reason = get_intraday_session_data_verbose(
-            symbol=symbol,
-            yahoo_symbol=yahoo_symbol,
-            api_key_value=api_key,
-            secret_key_value=secret_key,
-            alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
-        )
-        if intraday_df.empty:
-            rejected.append({'Hisse': symbol, 'Neden': intraday_reason})
-            continue
-
-        feats = build_intraday_features(symbol, yahoo_symbol, daily_df, spy_daily_df, intraday_df, spy_intraday_df=spy_intraday_df)
-        if feats is None:
-            rejected.append({'Hisse': symbol, 'Neden': 'İntraday feature üretilemedi'})
-            continue
-
-        # Global hard reject: yumuşak ve bozulmuş adayları en başta at
-        if pd.isna(feats['session_rvol']) or feats['session_rvol'] < 1.2:
-            rejected.append({'Hisse': symbol, 'Neden': f"Session RVOL düşük ({round(feats['session_rvol'], 2) if pd.notna(feats['session_rvol']) else 'NaN'})"})
-            continue
-        if pd.notna(feats['price_to_day_high_pct']) and feats['price_to_day_high_pct'] < -2.0:
-            rejected.append({'Hisse': symbol, 'Neden': f"Day-highdan fazla uzak ({round(feats['price_to_day_high_pct'], 2)}%)"})
-            continue
-        if pd.notna(feats['rsi14']) and feats['rsi14'] < 55:
-            rejected.append({'Hisse': symbol, 'Neden': f"RSI zayıf ({round(feats['rsi14'], 2)})"})
-            continue
-        if feats.get('opening_range_fail', False):
-            rejected.append({'Hisse': symbol, 'Neden': 'Opening range fail'})
-            continue
-        if feats.get('vwap_lost_after_open', False):
-            rejected.append({'Hisse': symbol, 'Neden': 'VWAP kaybı'})
-            continue
-        if pd.notna(feats.get('price_to_premarket_high_pct', np.nan)) and feats['price_to_premarket_high_pct'] < -4.0:
-            rejected.append({'Hisse': symbol, 'Neden': f"Premarket highdan koptu ({round(feats['price_to_premarket_high_pct'], 2)}%)"})
-            continue
-
-        setup_type = detect_intraday_setup(feats)
-        if setup_type == 'NO_SETUP':
-            rejected.append({'Hisse': symbol, 'Neden': 'Net intraday setup yok'})
-            continue
-
-        confidence = intraday_confidence_score(feats, setup_type)
-        if confidence < 72:
-            rejected.append({'Hisse': symbol, 'Neden': f'Confidence düşük ({confidence})'})
-            continue
-
-        levels = compute_intraday_trade_levels(feats, setup_type)
-        if levels['entry'] is None or levels['stop'] is None:
-            rejected.append({'Hisse': symbol, 'Neden': 'Trade seviyeleri hesaplanamadı'})
-            continue
-
-        risk = max(levels['entry'] - levels['stop'], 0.01)
-        pos = calc_position_size(
-            account_size=2000.0,
-            risk_per_trade_pct=0.02,
-            entry=levels['entry'],
-            stop=levels['stop'],
-        )
-
-        why_parts = []
-        if feats['opening_range_break']:
-            why_parts.append('ORB')
-        if feats['first_pullback_hold']:
-            why_parts.append('İlk pullback tuttu')
-        if feats['close_above_vwap']:
-            why_parts.append('VWAP üstü')
-        if feats['ema9_above_ema20']:
-            why_parts.append('EMA9>EMA20')
-        if feats['macd_hist_positive']:
-            why_parts.append('MACD+')
-        if pd.notna(feats['price_to_premarket_high_pct']) and feats['price_to_premarket_high_pct'] >= -1.5:
-            why_parts.append('PM high yakınında')
-
-        final_candidates.append({
-            'Symbol': symbol,
-            'Setup_Type': setup_type,
-            'Confidence': confidence,
-            'Price': round(feats['last_price'], 4 if feats['last_price'] < 1 else 2),
-            'Gap_%': round(feats['gap_pct'], 2) if pd.notna(feats['gap_pct']) else np.nan,
-            'Session_RVOL': round(feats['session_rvol'], 2) if pd.notna(feats['session_rvol']) else np.nan,
-            'RSI14': round(feats['rsi14'], 2) if pd.notna(feats['rsi14']) else np.nan,
-            'MACD_Hist': round(feats['macd_hist'], 4) if pd.notna(feats['macd_hist']) else np.nan,
-            'VWAP': round(feats['session_vwap'], 4 if feats['session_vwap'] < 1 else 2),
-            'EMA9': round(feats['ema9'], 4 if pd.notna(feats['ema9']) and feats['ema9'] < 1 else 2) if pd.notna(feats['ema9']) else np.nan,
-            'EMA20': round(feats['ema20'], 4 if pd.notna(feats['ema20']) and feats['ema20'] < 1 else 2) if pd.notna(feats['ema20']) else np.nan,
-            'Price_to_DayHigh_%': round(feats['price_to_day_high_pct'], 2) if pd.notna(feats['price_to_day_high_pct']) else np.nan,
-            'Price_to_PMHigh_%': round(feats['price_to_premarket_high_pct'], 2) if pd.notna(feats['price_to_premarket_high_pct']) else np.nan,
-            'Price_to_VWAP_%': round(feats['price_to_vwap_pct'], 2) if pd.notna(feats['price_to_vwap_pct']) else np.nan,
-            'RS_vs_SPY_%': round(feats['rs_vs_spy_intraday_pct'], 2),
-            'Entry': levels['entry'],
-            'Stop': levels['stop'],
-            'TP1': levels['tp1'],
-            'TP2': levels['tp2'],
-            'Risk_per_Share': round(risk, 4),
-            'Model_Why': ', '.join(why_parts[:6]),
-            'Suggested_Shares_2k_2pct': pos['shares'],
-        })
-
-    final_candidates = sorted(
-        final_candidates,
-        key=lambda x: (
-            x['Confidence'],
-            x['Session_RVOL'] if not pd.isna(x['Session_RVOL']) else 0,
-            x['Price_to_DayHigh_%'] if not pd.isna(x['Price_to_DayHigh_%']) else -999,
-        ),
-        reverse=True
-    )
-    return final_candidates, rejected
-
-
-# ============================================================
-# NIGHT BUY / OVERNIGHT PRESSURE ENGINE
-# ============================================================
-def _score_linear(value, low, high, clamp=True):
-    try:
-        if pd.isna(value):
-            return 0.0
-        score = (float(value) - low) / (high - low) * 100.0
-        if clamp:
-            return float(max(0.0, min(100.0, score)))
-        return float(score)
-    except Exception:
-        return 0.0
-
-
-def _rsi_strength_score(rsi: float) -> float:
-    if pd.isna(rsi):
-        return 0.0
-    # Night-buy için ideal bölge: 55-75. 80+ momentum olabilir ama fakeout riski de artar.
-    if 55 <= rsi <= 68:
-        return 100.0
-    if 68 < rsi <= 75:
-        return 85.0
-    if 50 <= rsi < 55:
-        return 55.0
-    if 75 < rsi <= 82:
-        return 55.0
-    if rsi > 82:
-        return 20.0
-    return 10.0
-
-
-def _safe_pct(numerator: float, denominator: float) -> float:
-    try:
-        if pd.isna(numerator) or pd.isna(denominator) or denominator == 0:
-            return np.nan
-        return (numerator - denominator) / denominator * 100.0
-    except Exception:
+def bid_ask_from_quote(quote):
+    if not quote:
+        return np.nan, np.nan
+    bid = safe_float(quote.get("bp"), np.nan)
+    ask = safe_float(quote.get("ap"), np.nan)
+    return bid, ask
+
+
+def spread_pct(bid, ask):
+    if pd.isna(bid) or pd.isna(ask) or bid <= 0 or ask <= 0 or ask < bid:
         return np.nan
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return np.nan
+    return ((ask - bid) / mid) * 100.0
 
 
-def _target_pct_by_price(price: float) -> float:
-    # v11: ana hedef artık normalize edilmiş küçük hedef değil; minimum +%15 hard gate.
-    # Bu fonksiyon TP0/TP1/Runner hedeflerinin makul seviyelerini üretmek için kalır;
-    # gerçek alım izni ayrıca TP15 / Has_15pct_Upside kapısından geçmek zorundadır.
-    if pd.isna(price) or price <= 0:
-        return 0.15
-    if price < 3:
-        return 0.18
-    if price < 10:
-        return 0.15
-    if price <= MAX_PRICE_FOR_REAL_NIGHT_BUY:
-        return 0.15
-    if price <= MAX_PRICE_FOR_WATCH_ONLY:
-        return 0.10
-    return 0.06
+def late_entry_status(price, entry_idea):
+    if pd.isna(price) or pd.isna(entry_idea) or entry_idea <= 0:
+        return "UNKNOWN", np.nan
+    ext = (price - entry_idea) / entry_idea
+    if ext <= 0.03:
+        return "NORMAL", ext * 100
+    if ext <= DEFAULT_MAX_EXTENSION:
+        return "PULLBACK_ONLY", ext * 100
+    return "NO_FRESH_BUY", ext * 100
 
 
-def _score_15pct_target_feasibility(
-    price: float,
-    final_score: float,
-    demand_score: float,
-    technical_score: float,
-    daily_momentum_score: float,
-    squeeze_score: float,
-    ah_strength: float,
-    channel_score: float,
-    liquidity_score: float,
-    fakeout_risk: float,
-    rvol20: float,
-    vol_spike10: float,
-    atr_pct: float,
-    upside_to_fib127_pct: float,
-    ah_change_pct: float,
-) -> float:
-    """+%15 hedefin sadece teorik değil, setup açısından makul olup olmadığını 0-100 skorlar.
+def risk_gate(decision, price, entry_idea, stop, bid, ask, pre_dollar_vol):
+    late_status, ext_pct = late_entry_status(price, entry_idea)
+    spr = spread_pct(bid, ask)
 
-    Bu skor olasılık değildir. Sinyal kapısıdır. Geceden alım için sistemin
-    hedeflediği +%15 hareketi destekleyen talep, teknik, squeeze/runner, AH ve
-    kanal bileşenlerini birlikte arar.
-    """
-    score = (
-        0.14 * max(0, min(100, final_score)) +
-        0.18 * max(0, min(100, demand_score)) +
-        0.12 * max(0, min(100, technical_score)) +
-        0.14 * max(0, min(100, daily_momentum_score)) +
-        0.18 * max(0, min(100, squeeze_score)) +
-        0.10 * max(0, min(100, ah_strength)) +
-        0.08 * max(0, min(100, channel_score)) +
-        0.06 * max(0, min(100, liquidity_score))
-    )
+    risk_tags = []
+    real_money_allowed = True
 
-    # +%15 için hacim/volatilite/kanal alanı bonusları
-    if pd.notna(rvol20):
-        if rvol20 >= 5: score += 8
-        elif rvol20 >= 3: score += 5
-        elif rvol20 >= 2: score += 2
-    if pd.notna(vol_spike10):
-        if vol_spike10 >= 4: score += 6
-        elif vol_spike10 >= 2: score += 3
-    if pd.notna(atr_pct):
-        if 5 <= atr_pct <= 18: score += 6
-        elif atr_pct > 22: score -= 8
-    if pd.notna(upside_to_fib127_pct):
-        if upside_to_fib127_pct >= 15: score += 10
-        elif upside_to_fib127_pct >= 10: score += 4
-        elif upside_to_fib127_pct < 5: score -= 8
-    if pd.notna(ah_change_pct):
-        if 2 <= ah_change_pct <= 18: score += 5
-        elif ah_change_pct > 30: score -= 10
+    if decision not in ["GÜÇLÜ AL", "AL"]:
+        real_money_allowed = False
+        risk_tags.append("decision_not_actionable")
 
-    # Fiyat evreni: %15 gecelik hedef için pahalı hisseler otomatik zayıflar.
-    if pd.notna(price):
-        if price <= 0: score -= 40
-        elif price <= 20: score += 5
-        elif price <= 50: score -= 15
-        elif price <= 100: score -= 30
-        else: score -= 45
+    if late_status == "PULLBACK_ONLY":
+        real_money_allowed = False
+        risk_tags.append("late_entry_pullback_only")
+    elif late_status == "NO_FRESH_BUY":
+        real_money_allowed = False
+        risk_tags.append("too_extended")
 
-    score -= 0.45 * max(0, min(100, fakeout_risk))
-    return float(max(0, min(100, score)))
+    if pd.notna(spr) and spr > 3.5:
+        real_money_allowed = False
+        risk_tags.append("wide_spread")
 
+    if pd.notna(pre_dollar_vol) and pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
+        real_money_allowed = False
+        risk_tags.append("thin_liquidity")
 
-def _price_round(price: float) -> int:
-    if pd.isna(price):
-        return 4
-    return 4 if price < 1 else 3 if price < 10 else 2
+    stop_dist_pct = np.nan
+    if pd.notna(entry_idea) and pd.notna(stop) and entry_idea > 0:
+        stop_dist_pct = ((entry_idea - stop) / entry_idea) * 100.0
+        if stop_dist_pct > 18:
+            real_money_allowed = False
+            risk_tags.append("stop_too_wide")
 
+    if pd.isna(bid) or pd.isna(ask):
+        risk_tags.append("quote_unavailable")
 
-def calc_daily_indicators_for_night(df: pd.DataFrame) -> pd.DataFrame:
-    """Night Buy motoru için günlük momentum, trend, hacim, ATR ve breakout özellikleri.
-
-    Bu fonksiyon önceki temel EMA/MACD/RSI hesaplarını korur; ilave olarak
-    Daily Momentum Quality ve Liquidity Quality skorlarında kullanılacak
-    Return, VolSpike10, DollarVolume, ClosePosition, EMA21/Cross, ATR% ve
-    20 günlük breakout metriklerini üretir.
-    """
-    temp = df.copy()
-
-    # Return / momentum
-    temp["Return_1D"] = temp["Close"].pct_change()
-    temp["Return_3D"] = temp["Close"].pct_change(3)
-    temp["Return_5D"] = temp["Close"].pct_change(5)
-
-    # Volume quality
-    temp["AvgVolume_10"] = temp["Volume"].rolling(window=10, min_periods=10).mean()
-    temp["AvgVolume_20"] = temp["Volume"].rolling(window=20, min_periods=20).mean()
-    temp["VolSpike10"] = temp["Volume"] / temp["AvgVolume_10"]
-    temp["DollarVolume"] = temp["Close"] * temp["Volume"]
-
-    # EMA / trend
-    temp["EMA9"] = calc_ema(temp["Close"], 9)
-    temp["EMA20"] = calc_ema(temp["Close"], 20)
-    temp["EMA21"] = calc_ema(temp["Close"], 21)
-    temp["EMA50"] = calc_ema(temp["Close"], 50)
-    temp["Price_Above_EMA9"] = temp["Close"] > temp["EMA9"]
-    temp["Price_Above_EMA21"] = temp["Close"] > temp["EMA21"]
-    temp["EMA9_Above_EMA21"] = temp["EMA9"] > temp["EMA21"]
-    temp["EMA9_prev"] = temp["EMA9"].shift(1)
-    temp["EMA21_prev"] = temp["EMA21"].shift(1)
-    temp["EMA9_CrossUp_EMA21"] = (temp["EMA9_prev"] < temp["EMA21_prev"]) & (temp["EMA9"] > temp["EMA21"])
-
-    # RSI / MACD / ATR
-    temp["RSI14"] = calc_rsi(temp["Close"], 14)
-    macd, macd_signal, macd_hist = calc_macd(temp["Close"])
-    temp["MACD"] = macd
-    temp["MACD_SIGNAL"] = macd_signal
-    temp["MACD_HIST"] = macd_hist
-    temp["ATR14"] = calc_atr(temp, 14)
-    temp["ATR_pct"] = temp["ATR14"] / temp["Close"]
-
-    # Kapanış gücü
-    intraday_range = (temp["High"] - temp["Low"]).replace(0, np.nan)
-    temp["ClosePosition"] = (temp["Close"] - temp["Low"]) / intraday_range
-
-    # Breakout / gap
-    temp["High_20D_prior"] = temp["High"].rolling(window=20, min_periods=20).max().shift(1)
-    temp["Breakout_Flag"] = temp["Close"] > temp["High_20D_prior"]
-    temp["Breakout_Pct"] = temp["Close"] / temp["High_20D_prior"] - 1
-    temp["PrevClose"] = temp["Close"].shift(1)
-    temp["Gap_pct"] = (temp["Open"] - temp["PrevClose"]) / temp["PrevClose"]
-
-    return temp
-
-
-@st.cache_data(ttl=30)
-def fetch_night_buy_universe(
-    scan_mode: str = "afterhours",
-    max_records: int = 80,
-    min_price: float = 1.0,
-    max_price: float = 80.0,
-    min_volume: int = 100000,
-) -> pd.DataFrame:
-    """TradingView üzerinden night-buy evrenini alır.
-    Bilinçli olarak sadece daha stabil TradingView kolonları kullanıldı; short/float verisi bu sürümde proxy skorla hesaplanır.
-    """
-    if scan_mode == "afterhours":
-        sort_field = "postmarket_change"
-        vol_field = "postmarket_volume"
-        price_field = "postmarket_close"
-        min_live_vol = max(10000, int(min_volume * 0.08))
-    elif scan_mode == "premarket":
-        sort_field = "premarket_change"
-        vol_field = "premarket_volume"
-        price_field = "premarket_close"
-        min_live_vol = max(10000, int(min_volume * 0.08))
+    risk_grade = "LOW"
+    if not real_money_allowed:
+        risk_grade = "BLOCKED"
+    elif decision == "GÜÇLÜ AL" and (pd.isna(spr) or spr <= 1.2):
+        risk_grade = "MEDIUM"
     else:
-        sort_field = "relative_volume_10d_calc"
-        vol_field = "volume"
-        price_field = "close"
-        min_live_vol = min_volume
+        risk_grade = "ELEVATED"
 
-    filters = [
-        {"left": price_field, "operation": "in_range", "right": [min_price, max_price]},
-        {"left": vol_field, "operation": "greater", "right": min_live_vol},
-        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-    ]
-
-    columns = [
-        "name",
-        "description",
-        price_field,
-        sort_field,
-        vol_field,
-        "close",
-        "volume",
-        "relative_volume_10d_calc",
-        "gap",
-        "market_cap_basic",
-    ]
-
-    raw = tradingview_scan(filters, columns, sort_field, max_records=max_records, page_size=min(100, max_records))
-    rows = []
-    seen = set()
-    for item in raw:
-        try:
-            d = item["d"]
-            symbol = d[0]
-            description = d[1] or ""
-            if not symbol or symbol in seen:
-                continue
-            if is_likely_non_common_stock(symbol, description):
-                continue
-            seen.add(symbol)
-            rows.append({
-                "symbol": symbol,
-                "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
-                "description": description,
-                "live_price": safe_float(d[2], np.nan),
-                "live_change_pct": safe_float(d[3], np.nan),
-                "live_volume": safe_float(d[4], np.nan),
-                "regular_close": safe_float(d[5], np.nan),
-                "regular_volume": safe_float(d[6], np.nan),
-                "tv_rvol": safe_float(d[7], np.nan),
-                "tv_gap": safe_float(d[8], np.nan),
-                "market_cap": safe_float(d[9], np.nan),
-            })
-        except Exception as exc:
-            log_debug(f"Night universe parse error: {exc}")
-    return pd.DataFrame(rows)
-
+    return {
+        "Late_Status": late_status,
+        "Extension_%": round_smart(ext_pct),
+        "Bid": round_smart(bid),
+        "Ask": round_smart(ask),
+        "Spread_%": round_smart(spr),
+        "Stop_Dist_%": round_smart(stop_dist_pct),
+        "Risk_Grade": risk_grade,
+        "Real_Money_Allowed": bool(real_money_allowed),
+        "Risk_Tags": " | ".join(risk_tags)
+    }
 
 
 # ============================================================
-# NIGHT BUY v5: CSV DAILY MOMENTUM UNIVERSE / FALLBACK
+# CONTINUATION ENGINE
 # ============================================================
-def _detect_csv_ticker_column(df: pd.DataFrame, preferred: str | None = None) -> str:
-    """CSV içinden sembol kolonunu bulur. Boşsa yaygın kolon adlarını dener; yoksa ilk kolonu alır."""
-    if df is None or df.empty:
-        raise ValueError("CSV boş görünüyor.")
-    if preferred and preferred in df.columns:
-        return preferred
-    candidates = ["Symbol", "symbol", "Ticker", "ticker", "Code", "code", "Sembol", "sembol"]
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return str(df.columns[0])
-
-
-def _clean_ticker_list(raw_values) -> list[str]:
-    out = []
-    seen = set()
-    for val in raw_values:
-        try:
-            ticker = str(val).strip().upper()
-        except Exception:
-            continue
-        if not ticker or ticker in {"NAN", "NONE", "NULL", "-"}:
-            continue
-        # Yahoo formatı: BRK.B -> BRK-B
-        ticker = ticker.replace(".", "-")
-        # Çok bariz uygun olmayan satırları ele.
-        if len(ticker) > 12 or " " in ticker:
-            continue
-        if ticker not in seen:
-            seen.add(ticker)
-            out.append(ticker)
-    return out
-
-
-def load_tickers_from_csv_dataframe(df: pd.DataFrame, column_name: str | None = None) -> list[str]:
-    col = _detect_csv_ticker_column(df, column_name)
-    return _clean_ticker_list(df[col].tolist())
-
-
-def load_tickers_from_uploaded_csv(uploaded_file, column_name: str | None = None) -> list[str]:
-    """Streamlit upload edilen CSV'den ticker listesi okur."""
-    if uploaded_file is None:
-        return []
-    try:
-        df = pd.read_csv(uploaded_file)
-    except UnicodeDecodeError:
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, encoding="latin-1")
-    return load_tickers_from_csv_dataframe(df, column_name)
-
-
-@st.cache_data(ttl=3600)
-def load_tickers_from_repo_csv(csv_path: str = "nasdaq_nyse_tickers.csv", column_name: str | None = None) -> list[str]:
-    """Repo içinde nasdaq_nyse_tickers.csv varsa okur. Yoksa boş liste döner."""
-    try:
-        if not os.path.exists(csv_path):
-            return []
-        df = pd.read_csv(csv_path)
-        return load_tickers_from_csv_dataframe(df, column_name)
-    except Exception:
-        return []
-
-
-def _daily_momentum_row_score(latest: pd.Series, min_volume: int) -> tuple[float, list[str], bool]:
-    """CSV fallback evreni için günlük momentum ön skoru üretir."""
+def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, cont_score_al, cont_score_strong):
     notes = []
-    score = 0.0
+    score = 0
 
-    close = safe_float(latest.get("Close", np.nan), np.nan)
-    volume = safe_float(latest.get("Volume", np.nan), np.nan)
-    dollar_volume = safe_float(latest.get("DollarVolume", np.nan), np.nan)
-    return_1d_pct = safe_float(latest.get("Return_1D", np.nan), np.nan) * 100 if pd.notna(latest.get("Return_1D", np.nan)) else np.nan
-    return_3d_pct = safe_float(latest.get("Return_3D", np.nan), np.nan) * 100 if pd.notna(latest.get("Return_3D", np.nan)) else np.nan
-    vol_spike10 = safe_float(latest.get("VolSpike10", np.nan), np.nan)
-    close_pos = safe_float(latest.get("ClosePosition", np.nan), np.nan)
-    rsi = safe_float(latest.get("RSI14", np.nan), np.nan)
-    breakout_flag = bool(latest.get("Breakout_Flag", False))
-    breakout_pct = safe_float(latest.get("Breakout_Pct", np.nan), np.nan) * 100 if pd.notna(latest.get("Breakout_Pct", np.nan)) else np.nan
-    ema9_gt_ema21 = bool(latest.get("EMA9_Above_EMA21", False))
-    price_above_ema9 = bool(latest.get("Price_Above_EMA9", False))
-    ema_cross = bool(latest.get("EMA9_CrossUp_EMA21", False))
+    prev_close = safe_float(last_bar["Close"], np.nan)
+    prev_prev_close = safe_float(prev_bar["Close"], np.nan)
+    prev_ret = ((prev_close - prev_prev_close) / prev_prev_close * 100.0) if prev_prev_close > 0 else np.nan
+    prev_cs = closing_strength(prev_close, safe_float(last_bar["Low"], np.nan), safe_float(last_bar["High"], np.nan))
 
-    if pd.notna(return_1d_pct):
-        if return_1d_pct >= 10:
-            score += 22
-            notes.append("1D güçlü")
-        elif return_1d_pct >= 5:
-            score += 18
-            notes.append("1D pozitif")
-        elif return_1d_pct >= 2:
-            score += 10
+    avg_vol20 = max(avg(hist20["Volume"].iloc[:-1] if len(hist20) > 1 else hist20["Volume"]), 1)
+    vol_ratio = safe_float(last_bar["Volume"], 0) / avg_vol20
+    dollar_vol = safe_float(last_bar["Volume"], 0) * prev_close
 
-    if pd.notna(return_3d_pct):
-        if return_3d_pct >= 12:
-            score += 12
-            notes.append("3D momentum")
-        elif return_3d_pct > 0:
-            score += 6
+    ema9 = calc_ema(hist20["Close"], 9).iloc[-1] if len(hist20) >= 9 else np.nan
+    ema20 = calc_ema(hist20["Close"], 20).iloc[-1] if len(hist20) >= 20 else np.nan
 
-    if pd.notna(vol_spike10):
-        if vol_spike10 >= 5:
-            score += 22
-            notes.append("VolSpike 5x+")
-        elif vol_spike10 >= 3:
-            score += 17
-            notes.append("VolSpike 3x+")
-        elif vol_spike10 >= 2:
-            score += 12
-            notes.append("VolSpike 2x+")
-        elif vol_spike10 >= 1.4:
-            score += 6
+    if prev_close < MIN_PRICE:
+        notes.append("0.10 altı")
+        return 0, "ALMA", notes, {}
+    if prev_close > MAX_PRICE_CONTINUATION:
+        notes.append("Fiyat çok yüksek")
+        return 0, "ALMA", notes, {}
 
-    if pd.notna(close_pos):
-        if close_pos >= 0.90:
-            score += 18
-            notes.append("Tepe kapanış")
-        elif close_pos >= 0.80:
+    if pd.notna(prev_ret):
+        if 4 <= prev_ret < 12:
             score += 14
-            notes.append("Güçlü kapanış")
-        elif close_pos >= 0.65:
-            score += 6
-
-    if price_above_ema9:
-        score += 8
-    if ema9_gt_ema21:
-        score += 10
-        notes.append("EMA9>EMA21")
-    if ema_cross:
-        score += 8
-        notes.append("EMA cross")
-
-    if breakout_flag:
-        score += 12
-        notes.append("20D breakout")
-    elif pd.notna(breakout_pct) and breakout_pct >= -2:
-        score += 5
-
-    if pd.notna(dollar_volume):
-        if dollar_volume >= 20_000_000:
+        elif 12 <= prev_ret < 35:
+            score += 22
+        elif 35 <= prev_ret < 70:
             score += 10
-        elif dollar_volume >= 5_000_000:
-            score += 6
-        elif dollar_volume >= 2_000_000:
-            score += 3
+        elif prev_ret < 0:
+            score -= 12
 
-    # Aşırı şişme/kalitesiz hareket cezaları.
-    if pd.notna(rsi) and rsi >= 85:
-        score -= 10
-        notes.append("RSI aşırı")
-    if pd.notna(return_1d_pct) and return_1d_pct >= 35:
-        score -= 8
-        notes.append("1D aşırı prim")
-    if pd.notna(volume) and volume < min_volume:
-        score -= 15
-
-    # Ön elemeyi çok sert yapmıyoruz; amaç Night Buy motoruna kaliteli ama geniş aday vermek.
-    eligible = (
-        pd.notna(close)
-        and pd.notna(volume)
-        and pd.notna(dollar_volume)
-        and volume >= min_volume
-        and dollar_volume >= 1_000_000
-        and (
-            (pd.notna(return_1d_pct) and return_1d_pct >= 2 and pd.notna(vol_spike10) and vol_spike10 >= 1.4 and pd.notna(close_pos) and close_pos >= 0.55)
-            or (pd.notna(return_1d_pct) and return_1d_pct >= 5 and pd.notna(close_pos) and close_pos >= 0.50)
-            or (breakout_flag and pd.notna(vol_spike10) and vol_spike10 >= 1.2)
-            or (ema_cross and pd.notna(vol_spike10) and vol_spike10 >= 1.2)
-        )
-    )
-
-    return max(0.0, min(100.0, score)), notes, bool(eligible)
-
-
-@st.cache_data(ttl=1800)
-def build_csv_daily_momentum_universe(
-    tickers_tuple: tuple[str, ...],
-    max_records: int = 150,
-    min_price: float = 1.0,
-    max_price: float = 80.0,
-    min_volume: int = 150_000,
-    max_tickers_to_scan: int = 600,
-) -> tuple[pd.DataFrame, dict, dict]:
-    """CSV ticker evreninden günlük momentum adayları üretir.
-
-    v7 farkı:
-    - Önce STRICT günlük momentum filtresi denenir.
-    - STRICT aday çıkmazsa, tüm valid CSV hisseleri günlük momentum puanına göre sıralanır
-      ve LOOSE Daily Momentum Fallback olarak en iyi adaylar Night Buy skorlamasına gönderilir.
-    - Böylece ekran tamamen boş kalmaz; veri yok / aday yok / filtre çok sert ayrımı diagnostikte görünür.
-    """
-    raw_tickers = list(tickers_tuple or ())
-    clean = _clean_ticker_list(raw_tickers)
-    diagnostics = {
-        "csv_total_tickers": len(clean),
-        "csv_scanned_tickers": 0,
-        "csv_daily_data_ok": 0,
-        "csv_daily_momentum_candidates": 0,
-        "csv_daily_momentum_candidates_strict": 0,
-        "csv_daily_momentum_candidates_loose": 0,
-        "csv_universe_source": "CSV Daily Momentum",
-        "csv_fallback_mode": "-",
-    }
-
-    if not clean:
-        return pd.DataFrame(), {}, diagnostics
-
-    # Alfabetik listenin sadece başını taramak hareketli hisseleri kaçırabilir.
-    # Bu yüzden CSV evrenini gün bazlı deterministik şekilde karıştırıyoruz.
-    try:
-        seed = int(datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d"))
-    except Exception:
-        seed = int(datetime.now().strftime("%Y%m%d"))
-
-    if len(clean) > int(max_tickers_to_scan):
-        scan_tickers = pd.Series(clean).sample(n=int(max_tickers_to_scan), random_state=seed).tolist()
-        diagnostics["csv_sampling"] = f"daily_shuffle_seed_{seed}"
-    else:
-        scan_tickers = clean[: int(max_tickers_to_scan)]
-        diagnostics["csv_sampling"] = "full_or_short_list"
-    diagnostics["csv_scanned_tickers"] = len(scan_tickers)
-
-    # CSV fallback için Yahoo batch daha hızlıdır. Alpaca tek tek çok yavaşlayabilir.
-    daily_dict = download_daily_data_chunked(
-        scan_tickers,
-        period="260d",
-        chunk_size=50,
-        pause=0.8,
-        alpaca_key="",
-        alpaca_secret="",
-        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-    )
-    diagnostics["csv_daily_data_ok"] = len(daily_dict)
-
-    strict_rows = []
-    loose_rows = []
-
-    for yahoo_symbol, df in daily_dict.items():
-        try:
-            if df is None or df.empty or len(df) < 80:
-                continue
-            dfi = calc_daily_indicators_for_night(df).dropna().copy()
-            if dfi.empty:
-                continue
-            latest = dfi.iloc[-1]
-            close = safe_float(latest.get("Close", np.nan), np.nan)
-            if pd.isna(close) or close < min_price or close > max_price:
-                continue
-
-            row_score, notes, eligible = _daily_momentum_row_score(latest, min_volume=int(min_volume))
-
-            volume = safe_float(latest.get("Volume", np.nan), np.nan)
-            dollar_volume = safe_float(latest.get("DollarVolume", np.nan), np.nan)
-            avg_vol_20 = safe_float(latest.get("AvgVolume_20", np.nan), np.nan)
-            rvol20 = volume / avg_vol_20 if pd.notna(volume) and pd.notna(avg_vol_20) and avg_vol_20 > 0 else np.nan
-            prev_close = safe_float(latest.get("PrevClose", np.nan), np.nan)
-            change_pct = (close - prev_close) / prev_close * 100 if pd.notna(prev_close) and prev_close > 0 else np.nan
-            vol_spike10 = safe_float(latest.get("VolSpike10", np.nan), np.nan)
-            close_pos = safe_float(latest.get("ClosePosition", np.nan), np.nan)
-            price_above_ema9 = bool(latest.get("Price_Above_EMA9", False))
-            ema9_gt_ema21 = bool(latest.get("EMA9_Above_EMA21", False))
-            breakout_flag = bool(latest.get("Breakout_Flag", False))
-
-            base_row = {
-                "symbol": yahoo_symbol,
-                "yahoo_symbol": yahoo_symbol,
-                "description": "CSV Daily Momentum Fallback",
-                "live_price": close,
-                "live_change_pct": np.nan,
-                "live_volume": 0,
-                "regular_close": close,
-                "regular_volume": volume,
-                "tv_rvol": rvol20,
-                "tv_gap": safe_float(latest.get("Gap_pct", np.nan), np.nan) * 100 if pd.notna(latest.get("Gap_pct", np.nan)) else np.nan,
-                "market_cap": np.nan,
-                "CSV_Momentum_Score": round(row_score, 1),
-                "CSV_Momentum_Notes": ", ".join(notes[:6]) if notes else "-",
-                "CSV_Return_1D_%": round(change_pct, 2) if pd.notna(change_pct) else np.nan,
-                "CSV_VolSpike10": round(vol_spike10, 2) if pd.notna(vol_spike10) else np.nan,
-                "CSV_ClosePosition": round(close_pos, 2) if pd.notna(close_pos) else np.nan,
-                "CSV_DollarVolume_M": round(dollar_volume / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
-                "Universe_Source": "CSV_DAILY_FALLBACK",
-            }
-
-            if eligible:
-                row = dict(base_row)
-                row["CSV_Fallback_Mode"] = "STRICT"
-                strict_rows.append(row)
-            else:
-                # LOOSE fallback: yalnızca skorlamaya aday üretmek için.
-                # Gerçek işlem kararı hâlâ Night Buy skorları ve risk filtreleriyle verilir.
-                loose_ok = (
-                    pd.notna(volume)
-                    and pd.notna(dollar_volume)
-                    and volume >= max(25_000, int(min_volume * 0.25))
-                    and dollar_volume >= 300_000
-                    and row_score >= 28
-                    and (
-                        (pd.notna(change_pct) and change_pct >= 0.5)
-                        or (pd.notna(vol_spike10) and vol_spike10 >= 1.1)
-                        or (pd.notna(close_pos) and close_pos >= 0.55)
-                        or price_above_ema9
-                        or ema9_gt_ema21
-                        or breakout_flag
-                    )
-                )
-                if loose_ok:
-                    row = dict(base_row)
-                    row["CSV_Fallback_Mode"] = "LOOSE"
-                    loose_rows.append(row)
-        except Exception as exc:
-            log_debug(f"CSV daily momentum parse error {yahoo_symbol}: {exc}")
-            continue
-
-    diagnostics["csv_daily_momentum_candidates_strict"] = len(strict_rows)
-    diagnostics["csv_daily_momentum_candidates_loose"] = len(loose_rows)
-
-    if strict_rows:
-        out = pd.DataFrame(strict_rows)
-        diagnostics["csv_fallback_mode"] = "STRICT"
-        diagnostics["csv_daily_momentum_candidates"] = len(out)
-    elif loose_rows:
-        out = pd.DataFrame(loose_rows)
-        diagnostics["csv_fallback_mode"] = "LOOSE"
-        diagnostics["csv_universe_source"] = "CSV Loose Daily Momentum Fallback"
-        diagnostics["csv_daily_momentum_candidates"] = len(out)
-    else:
-        out = pd.DataFrame()
-        diagnostics["csv_fallback_mode"] = "NO_CANDIDATES"
-        diagnostics["csv_daily_momentum_candidates"] = 0
-
-    if not out.empty:
-        out = out.sort_values(
-            ["CSV_Momentum_Score", "tv_rvol", "regular_volume"],
-            ascending=False,
-        ).head(max_records).reset_index(drop=True)
-
-    return out, daily_dict, diagnostics
-
-def get_recent_intraday_full_data(
-    symbol: str,
-    yahoo_symbol: str,
-    api_key_value: str = "",
-    secret_key_value: str = "",
-    alpaca_feed: str = "iex",
-) -> pd.DataFrame:
-    """After-hours/premarket dahil son aktif günün intraday datası.
-    Mevcut get_intraday_session_data regular session seçmeye odaklandığı için night-buy için ayrı tutuldu.
-    """
-    intraday = fetch_alpaca_intraday_5m(symbol, api_key_value, secret_key_value, alpaca_feed)
-    if intraday is not None and not intraday.empty:
-        picked = _extract_last_active_day(intraday)
-        if picked is not None and not picked.empty:
-            return picked
-
-    yahoo_candidates = _fetch_yahoo_intraday_candidates(yahoo_symbol)
-    for key in ["1m_2d", "5m_5d"]:
-        cand = yahoo_candidates.get(key, pd.DataFrame())
-        if cand is None or cand.empty:
-            continue
-        picked = _extract_last_active_day(cand)
-        if picked is not None and not picked.empty:
-            return picked
-    return pd.DataFrame()
-
-
-def compute_fib_channel_features(df: pd.DataFrame, price: float) -> dict:
-    if df is None or df.empty or len(df) < 40 or pd.isna(price) or price <= 0:
-        return {
-            "swing_low": np.nan,
-            "swing_high": np.nan,
-            "fib_1272": np.nan,
-            "fib_1618": np.nan,
-            "channel_score": 0.0,
-            "upside_to_1272_pct": np.nan,
-        }
-    recent = df.tail(60).copy()
-    swing_low = float(recent["Low"].min())
-    swing_high = float(recent["High"].max())
-    wave = swing_high - swing_low
-    if wave <= 0:
-        return {
-            "swing_low": swing_low,
-            "swing_high": swing_high,
-            "fib_1272": np.nan,
-            "fib_1618": np.nan,
-            "channel_score": 0.0,
-            "upside_to_1272_pct": np.nan,
-        }
-
-    fib_1272 = swing_low + 1.272 * wave
-    fib_1618 = swing_low + 1.618 * wave
-    upside_1272 = (fib_1272 - price) / price * 100 if price > 0 else np.nan
-
-    prior_20h = float(df["High"].shift(1).rolling(20).max().iloc[-1]) if len(df) >= 21 else np.nan
-    prior_60h = float(df["High"].shift(1).rolling(60).max().iloc[-1]) if len(df) >= 61 else np.nan
-
-    score = 0.0
-    if pd.notna(prior_20h):
-        if price >= prior_20h * 0.995:
-            score += 30
-        elif price >= prior_20h * 0.97:
-            score += 18
-    if pd.notna(prior_60h):
-        if price >= prior_60h * 0.98:
+    if pd.notna(prev_cs):
+        if prev_cs >= 0.85:
             score += 20
-        elif price >= prior_60h * 0.94:
-            score += 10
-    if pd.notna(upside_1272):
-        if upside_1272 >= 12:
-            score += 35
-        elif upside_1272 >= 7:
-            score += 25
-        elif upside_1272 >= 3:
+        elif prev_cs >= 0.72:
             score += 12
-        elif upside_1272 < 0:
-            score -= 15
-    # Fiyat son dalganın çok tepesindeyse ama extension alanı kalmadıysa fakeout riski artar.
-    if pd.notna(fib_1618) and price > fib_1618:
-        score -= 18
-
-    return {
-        "swing_low": swing_low,
-        "swing_high": swing_high,
-        "fib_1272": fib_1272,
-        "fib_1618": fib_1618,
-        "channel_score": float(max(0, min(100, score))),
-        "upside_to_1272_pct": upside_1272,
-    }
-
-
-def compute_night_buy_candidate(row: pd.Series, daily_df: pd.DataFrame, intraday_df: pd.DataFrame) -> tuple[dict | None, str | None]:
-    symbol = row["symbol"]
-    yahoo_symbol = row["yahoo_symbol"]
-    if daily_df is None or daily_df.empty or len(daily_df) < 80:
-        return None, "Yetersiz günlük veri"
-
-    dfi = calc_daily_indicators_for_night(daily_df).dropna(subset=["Close", "Volume"]).copy()
-    if dfi.empty or len(dfi) < 60:
-        return None, "İndikatör için yetersiz veri"
-
-    last = dfi.iloc[-1]
-    prev = dfi.iloc[-2]
-
-    last_close = float(last["Close"])
-    last_open = float(last["Open"])
-    last_high = float(last["High"])
-    last_low = float(last["Low"])
-    last_volume = float(last["Volume"])
-
-    live_price = safe_float(row.get("live_price", np.nan), np.nan)
-    if pd.isna(live_price) or live_price <= 0:
-        live_price = last_close
-
-    # ---------------- Günlük özellikler ----------------
-    atr14 = float(last["ATR14"]) if pd.notna(last.get("ATR14", np.nan)) else max(last_close * 0.04, 0.05)
-    atr_pct = float(last["ATR_pct"]) * 100 if pd.notna(last.get("ATR_pct", np.nan)) else np.nan
-
-    avg_vol_20 = float(last.get("AvgVolume_20", np.nan)) if pd.notna(last.get("AvgVolume_20", np.nan)) else float(dfi["Volume"].rolling(20).mean().iloc[-1])
-    avg_vol_10 = float(last.get("AvgVolume_10", np.nan)) if pd.notna(last.get("AvgVolume_10", np.nan)) else float(dfi["Volume"].rolling(10).mean().iloc[-1])
-    rvol20 = last_volume / avg_vol_20 if avg_vol_20 and avg_vol_20 > 0 else np.nan
-    if pd.notna(row.get("tv_rvol", np.nan)) and row.get("tv_rvol", np.nan) > 0:
-        rvol20 = max(rvol20 if pd.notna(rvol20) else 0, float(row["tv_rvol"]))
-
-    vol_spike10 = float(last.get("VolSpike10", np.nan)) if pd.notna(last.get("VolSpike10", np.nan)) else (last_volume / avg_vol_10 if avg_vol_10 and avg_vol_10 > 0 else np.nan)
-    dollar_volume = float(last.get("DollarVolume", np.nan)) if pd.notna(last.get("DollarVolume", np.nan)) else last_close * last_volume
-
-    closing_strength = calc_closing_strength(last_close, last_low, last_high)
-    close_position = float(last.get("ClosePosition", np.nan)) if pd.notna(last.get("ClosePosition", np.nan)) else closing_strength
-
-    prev_day_change_pct = (last_close - float(prev["Close"])) / float(prev["Close"]) * 100 if float(prev["Close"]) > 0 else np.nan
-    return_1d_pct = float(last.get("Return_1D", np.nan)) * 100 if pd.notna(last.get("Return_1D", np.nan)) else prev_day_change_pct
-    return_3d_pct = float(last.get("Return_3D", np.nan)) * 100 if pd.notna(last.get("Return_3D", np.nan)) else np.nan
-    return_5d_pct = float(last.get("Return_5D", np.nan)) * 100 if pd.notna(last.get("Return_5D", np.nan)) else np.nan
-
-    gap_pct_daily = float(last.get("Gap_pct", np.nan)) * 100 if pd.notna(last.get("Gap_pct", np.nan)) else np.nan
-    breakout_flag = bool(last.get("Breakout_Flag", False)) if pd.notna(last.get("Breakout_Flag", np.nan)) else False
-    breakout_pct = float(last.get("Breakout_Pct", np.nan)) * 100 if pd.notna(last.get("Breakout_Pct", np.nan)) else np.nan
-
-    ema9 = float(last["EMA9"]) if pd.notna(last.get("EMA9", np.nan)) else np.nan
-    ema20 = float(last["EMA20"]) if pd.notna(last.get("EMA20", np.nan)) else np.nan
-    ema21 = float(last["EMA21"]) if pd.notna(last.get("EMA21", np.nan)) else np.nan
-    ema50 = float(last["EMA50"]) if pd.notna(last.get("EMA50", np.nan)) else np.nan
-    ema9_slope = float(last["EMA9"] - dfi["EMA9"].iloc[-4]) if len(dfi) >= 4 and pd.notna(dfi["EMA9"].iloc[-4]) else np.nan
-    ema20_slope = float(last["EMA20"] - dfi["EMA20"].iloc[-4]) if len(dfi) >= 4 and pd.notna(dfi["EMA20"].iloc[-4]) else np.nan
-    ema9_crossup_ema21 = bool(last.get("EMA9_CrossUp_EMA21", False))
-
-    rsi14 = float(last["RSI14"]) if pd.notna(last.get("RSI14", np.nan)) else np.nan
-    macd_hist = float(last["MACD_HIST"]) if pd.notna(last.get("MACD_HIST", np.nan)) else np.nan
-    macd_hist_prev = float(dfi["MACD_HIST"].iloc[-2]) if pd.notna(dfi["MACD_HIST"].iloc[-2]) else np.nan
-    macd_rising = pd.notna(macd_hist) and pd.notna(macd_hist_prev) and macd_hist > macd_hist_prev
-
-    # ---------------- Intraday / AH özellikleri ----------------
-    pre_df, reg_df, ah_df = split_sessions(intraday_df) if intraday_df is not None and not intraday_df.empty else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-    reg_vwap = calc_session_vwap(reg_df) if reg_df is not None and not reg_df.empty else np.nan
-    ah_vwap = calc_session_vwap(ah_df) if ah_df is not None and not ah_df.empty else np.nan
-    ah_price = float(ah_df["Close"].iloc[-1]) if ah_df is not None and not ah_df.empty else live_price
-    ah_high = float(ah_df["High"].max()) if ah_df is not None and not ah_df.empty else np.nan
-    ah_low = float(ah_df["Low"].min()) if ah_df is not None and not ah_df.empty else np.nan
-    ah_volume = float(ah_df["Volume"].sum()) if ah_df is not None and not ah_df.empty else safe_float(row.get("live_volume", 0), 0)
-    ah_change_pct = _safe_pct(ah_price, last_close)
-    live_change_pct = safe_float(row.get("live_change_pct", np.nan), np.nan)
-    if pd.isna(ah_change_pct) and pd.notna(live_change_pct):
-        ah_change_pct = live_change_pct
-
-    # v18 Microcap Trap Guard — Night/D+1 alım kapısı
-    market_cap = safe_float(row.get("market_cap", np.nan), np.nan)
-    description = row.get("description", "")
-    ah_price_to_high_pct = (
-        (ah_price - ah_high) / ah_high * 100.0
-        if pd.notna(ah_high) and ah_high > 0 and pd.notna(ah_price)
-        else np.nan
-    )
-    below_vwap_for_guard = bool(
-        (pd.notna(ah_vwap) and ah_price < ah_vwap)
-        or (pd.notna(reg_vwap) and ah_price < reg_vwap)
-    )
-    microcap_guard = microcap_trap_guard(
-        symbol=symbol,
-        description=description,
-        market_cap=market_cap,
-        price=ah_price,
-        price_to_high_pct=ah_price_to_high_pct,
-        below_vwap=below_vwap_for_guard,
-        return1d_pct=return_1d_pct,
-        change_pct=ah_change_pct,
-    )
-
-    price_to_ema9_pct = _safe_pct(ah_price, ema9) if pd.notna(ema9) else np.nan
-
-    # AH hacim oranını ham ve skorlamada kullanılan kapalı değer olarak ayrı tutuyoruz.
-    ah_volume_to_daily_pct = (ah_volume / avg_vol_20 * 100) if avg_vol_20 and avg_vol_20 > 0 else np.nan
-    ah_volume_to_daily_score_pct = min(35.0, ah_volume_to_daily_pct) if pd.notna(ah_volume_to_daily_pct) else np.nan
-
-    # ---------------- Talep / hacim basıncı ----------------
-    demand_parts = []
-    demand_parts.append(_score_linear(rvol20, 1.0, 6.0) * 0.32)
-    demand_parts.append(_score_linear(vol_spike10, 1.0, 5.0) * 0.20)
-    demand_parts.append((close_position if pd.notna(close_position) else 0) * 100 * 0.18)
-    demand_parts.append(_score_linear(ah_volume_to_daily_score_pct, 1.0, 12.0) * 0.14)
-    demand_parts.append(_score_linear(ah_change_pct, 0.0, 8.0) * 0.16)
-    demand_score = float(max(0, min(100, sum(demand_parts))))
-
-    # ---------------- Teknik uyum ----------------
-    technical_score = 0.0
-    if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20:
-        technical_score += 20
-    if pd.notna(ema9) and pd.notna(ema21) and ema9 > ema21:
-        technical_score += 8
-    if pd.notna(ema20) and pd.notna(ema50) and ema20 > ema50:
-        technical_score += 8
-    if pd.notna(ema9) and ah_price > ema9:
-        technical_score += 12
-    if pd.notna(ema21) and ah_price > ema21:
-        technical_score += 6
-    if ema9_crossup_ema21:
-        technical_score += 8
-    if pd.notna(ema9_slope) and ema9_slope > 0:
-        technical_score += 8
-    if pd.notna(ema20_slope) and ema20_slope >= 0:
-        technical_score += 5
-    if pd.notna(macd_hist) and macd_hist > 0:
-        technical_score += 10
-    if macd_rising:
-        technical_score += 8
-    technical_score += _rsi_strength_score(rsi14) * 0.14
-    if pd.notna(reg_vwap) and ah_price > reg_vwap:
-        technical_score += 5
-    if pd.notna(ah_vwap) and ah_price > ah_vwap:
-        technical_score += 6
-    technical_score = float(max(0, min(100, technical_score)))
-
-    # ---------------- Günlük momentum kalitesi ----------------
-    daily_momentum_score = 0.0
-    if pd.notna(return_1d_pct):
-        if 5 <= return_1d_pct <= 15:
-            daily_momentum_score += 24
-        elif 15 < return_1d_pct <= 30:
-            daily_momentum_score += 18
-        elif 2 <= return_1d_pct < 5:
-            daily_momentum_score += 10
-        elif return_1d_pct > 30:
-            daily_momentum_score += 8
-    if pd.notna(return_3d_pct):
-        if return_3d_pct >= 12:
-            daily_momentum_score += 14
-        elif return_3d_pct > 0:
-            daily_momentum_score += 8
-    if pd.notna(return_5d_pct):
-        if return_5d_pct >= 18:
-            daily_momentum_score += 12
-        elif return_5d_pct > 0:
-            daily_momentum_score += 6
-    if pd.notna(vol_spike10):
-        if vol_spike10 >= 5:
-            daily_momentum_score += 18
-        elif vol_spike10 >= 3:
-            daily_momentum_score += 14
-        elif vol_spike10 >= 2:
-            daily_momentum_score += 10
-        elif vol_spike10 >= 1.5:
-            daily_momentum_score += 6
-    if pd.notna(close_position):
-        if close_position >= 0.90:
-            daily_momentum_score += 14
-        elif close_position >= 0.80:
-            daily_momentum_score += 10
-        elif close_position >= 0.65:
-            daily_momentum_score += 5
-    if breakout_flag:
-        daily_momentum_score += 12
-    if pd.notna(breakout_pct):
-        if 0 <= breakout_pct <= 8:
-            daily_momentum_score += 8
-        elif 8 < breakout_pct <= 18:
-            daily_momentum_score += 4
-    if ema9_crossup_ema21:
-        daily_momentum_score += 8
-    daily_momentum_score = float(max(0, min(100, daily_momentum_score)))
-
-    # ---------------- Likidite kalitesi ----------------
-    liquidity_score = 0.0
-    if pd.notna(dollar_volume):
-        if dollar_volume >= 50_000_000:
-            liquidity_score += 70
-        elif dollar_volume >= 20_000_000:
-            liquidity_score += 62
-        elif dollar_volume >= 10_000_000:
-            liquidity_score += 52
-        elif dollar_volume >= 5_000_000:
-            liquidity_score += 40
-        elif dollar_volume >= 2_000_000:
-            liquidity_score += 28
-        elif dollar_volume >= 1_000_000:
-            liquidity_score += 18
-    if pd.notna(ah_volume_to_daily_pct):
-        if ah_volume_to_daily_pct >= 10:
-            liquidity_score += 18
-        elif ah_volume_to_daily_pct >= 4:
-            liquidity_score += 12
-        elif ah_volume_to_daily_pct >= 1:
-            liquidity_score += 6
-    if 1 <= ah_price <= 80:
-        liquidity_score += 12
-    liquidity_score = float(max(0, min(100, liquidity_score)))
-
-    # ---------------- Squeeze proxy ----------------
-    market_cap = safe_float(row.get("market_cap", np.nan), np.nan)
-    squeeze_score = 0.0
-    if pd.notna(market_cap):
-        if market_cap < 75_000_000:
-            squeeze_score += 26
-        elif market_cap < 300_000_000:
-            squeeze_score += 21
-        elif market_cap < 1_000_000_000:
-            squeeze_score += 12
-    if pd.notna(rvol20):
-        if rvol20 >= 8:
-            squeeze_score += 24
-        elif rvol20 >= 5:
-            squeeze_score += 19
-        elif rvol20 >= 3:
-            squeeze_score += 12
-    if pd.notna(vol_spike10):
-        if vol_spike10 >= 6:
-            squeeze_score += 14
-        elif vol_spike10 >= 3:
-            squeeze_score += 9
-    if pd.notna(ah_volume_to_daily_score_pct):
-        if ah_volume_to_daily_score_pct >= 12:
-            squeeze_score += 14
-        elif ah_volume_to_daily_score_pct >= 5:
-            squeeze_score += 9
-        elif ah_volume_to_daily_score_pct >= 2:
-            squeeze_score += 5
-    prior_20h = float(last.get("High_20D_prior", np.nan)) if pd.notna(last.get("High_20D_prior", np.nan)) else (float(dfi["High"].shift(1).rolling(20).max().iloc[-1]) if len(dfi) >= 21 else np.nan)
-    extension_above_20h_pct = _safe_pct(ah_price, prior_20h) if pd.notna(prior_20h) else np.nan
-    if pd.notna(prior_20h) and ah_price >= prior_20h * 0.995:
-        squeeze_score += 14
-    if pd.notna(live_change_pct) and live_change_pct >= 8:
-        squeeze_score += 6
-    squeeze_score = float(max(0, min(100, squeeze_score)))
-
-    fib = compute_fib_channel_features(dfi, ah_price)
-    channel_score = fib["channel_score"]
-
-    # ---------------- After-hours strength ----------------
-    ah_strength = 0.0
-    if pd.notna(ah_change_pct):
-        if ah_change_pct >= 8:
-            ah_strength += 30
-        elif ah_change_pct >= 4:
-            ah_strength += 22
-        elif ah_change_pct >= 1.5:
-            ah_strength += 12
-        elif ah_change_pct < -1:
-            ah_strength -= 12
-    if pd.notna(ah_vwap) and ah_price > ah_vwap:
-        ah_strength += 26
-    if pd.notna(reg_vwap) and ah_price > reg_vwap:
-        ah_strength += 16
-    if pd.notna(ah_volume_to_daily_score_pct):
-        if ah_volume_to_daily_score_pct >= 10:
-            ah_strength += 20
-        elif ah_volume_to_daily_score_pct >= 4:
-            ah_strength += 13
-        elif ah_volume_to_daily_score_pct >= 1:
-            ah_strength += 6
-    if pd.notna(ah_high) and ah_high > 0:
-        ah_close_strength = (ah_price - ah_low) / (ah_high - ah_low) if pd.notna(ah_low) and ah_high > ah_low else np.nan
-        if pd.notna(ah_close_strength):
-            if ah_close_strength >= 0.75:
-                ah_strength += 10
-            elif ah_close_strength < 0.35:
-                ah_strength -= 10
-    ah_strength = float(max(0, min(100, ah_strength)))
-
-    # Piyasa/sektör desteği: burada SPY canlı intraday entegrasyonu yok; nötr 50 veriyoruz.
-    market_support = 50.0
-
-    # ---------------- Fakeout / risk ----------------
-    fakeout_risk = 0.0
-    if pd.notna(close_position):
-        if close_position < 0.45:
-            fakeout_risk += 24
-        elif close_position < 0.65:
-            fakeout_risk += 12
-    if pd.notna(return_1d_pct):
-        if return_1d_pct >= 35:
-            fakeout_risk += 28
-        elif return_1d_pct >= 25:
-            fakeout_risk += 22
-        elif return_1d_pct >= 15:
-            fakeout_risk += 14
-        elif return_1d_pct >= 10:
-            fakeout_risk += 8
-    if pd.notna(price_to_ema9_pct):
-        if price_to_ema9_pct >= 18:
-            fakeout_risk += 24
-        elif price_to_ema9_pct >= 10:
-            fakeout_risk += 14
-        elif price_to_ema9_pct <= -2:
-            fakeout_risk += 12
-    if pd.notna(rsi14):
-        if rsi14 >= 85:
-            fakeout_risk += 22
-        elif rsi14 >= 78:
-            fakeout_risk += 12
-        elif rsi14 < 50:
-            fakeout_risk += 18
-    if pd.notna(ah_vwap) and ah_price < ah_vwap:
-        fakeout_risk += 20
-    if pd.notna(breakout_pct):
-        if breakout_pct >= 20:
-            fakeout_risk += 20
-        elif breakout_pct >= 12:
-            fakeout_risk += 10
-    if pd.notna(extension_above_20h_pct):
-        if extension_above_20h_pct >= 18:
-            fakeout_risk += 18
-        elif extension_above_20h_pct >= 10:
-            fakeout_risk += 9
-    if pd.notna(gap_pct_daily):
-        if gap_pct_daily >= 20:
-            fakeout_risk += 14
-        elif gap_pct_daily >= 10:
-            fakeout_risk += 8
-        elif gap_pct_daily <= -5:
-            fakeout_risk += 8
-    if pd.notna(atr_pct):
-        if atr_pct >= 18:
-            fakeout_risk += 12
-        elif atr_pct >= 12:
-            fakeout_risk += 6
-    if pd.notna(ah_volume_to_daily_pct) and ah_volume_to_daily_pct < 0.5:
-        fakeout_risk += 12
-    fakeout_risk = float(max(0, min(100, fakeout_risk)))
-
-    positive_score = (
-        0.20 * demand_score +
-        0.18 * technical_score +
-        0.15 * daily_momentum_score +
-        0.15 * squeeze_score +
-        0.12 * ah_strength +
-        0.10 * channel_score +
-        0.07 * liquidity_score +
-        0.03 * market_support
-    )
-    final_score = float(max(0, min(100, positive_score - 0.55 * fakeout_risk)))
-
-    hard_reject_reasons = []
-    if pd.isna(rvol20) or rvol20 < 1.3:
-        hard_reject_reasons.append("RVOL düşük")
-    if technical_score < 45:
-        hard_reject_reasons.append("Teknik hizalanma zayıf")
-    if ah_strength < 30:
-        hard_reject_reasons.append("After-hours güç zayıf")
-    if fakeout_risk >= 70:
-        hard_reject_reasons.append("Fakeout riski çok yüksek")
-    if ah_price < 1:
-        hard_reject_reasons.append("Fiyat < 1$")
-    if pd.notna(dollar_volume) and dollar_volume < 750_000:
-        hard_reject_reasons.append("Dolar hacmi çok düşük")
-    if microcap_guard["decision"] == "HARD_REJECT":
-        hard_reject_reasons.append("Microcap Trap Guard: " + microcap_guard["reason_text"])
-    elif microcap_guard["decision"] in {"LAB_ONLY", "STRICT_REVIEW"}:
-        hard_reject_reasons.append("Microcap Trap Guard: " + microcap_guard["reason_text"])
-
-    # Giriş bölgesi: AH VWAP ve son fiyatın üzerinde kontrollü bölge.
-    entry_base_candidates = [ah_price]
-    if pd.notna(ah_vwap) and ah_vwap > 0:
-        entry_base_candidates.append(ah_vwap * 1.002)
-    if pd.notna(reg_vwap) and reg_vwap > 0:
-        entry_base_candidates.append(reg_vwap * 1.002)
-    entry_low = max(entry_base_candidates)
-    entry_high = entry_low * (1.012 if ah_price < 10 else 1.006)
-
-    stop_anchor = ah_vwap if pd.notna(ah_vwap) and ah_vwap > 0 else reg_vwap if pd.notna(reg_vwap) and reg_vwap > 0 else last_close
-    # v22.1: Long stop için en uzak değil, en yakın makul invalidation tercih edilir.
-    stop_candidates = [entry_low * 0.94]
-    if pd.notna(stop_anchor) and pd.notna(atr14):
-        stop_candidates.append(stop_anchor - 0.65 * atr14)
-    valid_stops = [s for s in stop_candidates if pd.notna(s) and 0 < s < entry_low]
-    stop_price = max(valid_stops) if valid_stops else entry_low * 0.94
-    stop_price = max(0.01, stop_price)
-    if stop_price >= entry_low:
-        stop_price = entry_low * 0.94
-    risk = max(entry_low - stop_price, 0.01)
-    night_stop_distance_pct = (risk / entry_low * 100.0) if entry_low and entry_low > 0 else np.nan
-
-    # Karar katmanları
-    aggressive_reasons = []
-    if squeeze_score >= 65:
-        aggressive_reasons.append("Squeeze proxy yüksek")
-    if demand_score >= 70:
-        aggressive_reasons.append("Talep basıncı yüksek")
-    if daily_momentum_score >= 70:
-        aggressive_reasons.append("Günlük momentum kalitesi yüksek")
-    if ah_strength >= 65 and technical_score >= 80 and demand_score >= 60:
-        aggressive_reasons.append("AH + teknik momentum güçlü")
-
-    aggressive_watch_ok = (
-        final_score < 60
-        and fakeout_risk <= 60
-        and not hard_reject_reasons
-        and (
-            squeeze_score >= 65
-            or demand_score >= 70
-            or daily_momentum_score >= 75
-            or (ah_strength >= 65 and technical_score >= 80 and demand_score >= 60)
-        )
-    )
-
-    if final_score >= 85 and fakeout_risk <= 45 and not hard_reject_reasons:
-        grade = "A"
-        status = "TRADE_CANDIDATE"
-    elif final_score >= 75 and fakeout_risk <= 55 and not hard_reject_reasons:
-        grade = "B+"
-        status = "TRADE_CANDIDATE"
-    elif final_score >= 60 and fakeout_risk <= 60 and not hard_reject_reasons:
-        grade = "Paper Watchlist"
-        status = "PAPER_WATCHLIST"
-    elif aggressive_watch_ok:
-        grade = "Aggressive Squeeze Watch"
-        status = "AGGRESSIVE_SQUEEZE_WATCH"
-    else:
-        grade = "Reject / Watch Only"
-        status = "REJECT"
-
-    # Kategoriye göre daha gerçekçi hedefler: SKBL benzeri 0.6-1.0R hareketleri kaçırmamak için TP0 eklendi.
-    target_pct = _target_pct_by_price(ah_price)
-    if status == "TRADE_CANDIDATE":
-        tp0_rr, tp1_rr, tp2_rr = 0.8, 1.2, 2.0
-        tp1_pct_mult, tp2_pct_mult = 0.60, 1.25
-    elif status == "PAPER_WATCHLIST":
-        tp0_rr, tp1_rr, tp2_rr = 0.75, 1.0, 1.5
-        tp1_pct_mult, tp2_pct_mult = 0.40, 0.90
-    elif status == "AGGRESSIVE_SQUEEZE_WATCH":
-        tp0_rr, tp1_rr, tp2_rr = 0.5, 1.0, 2.2
-        tp1_pct_mult, tp2_pct_mult = 0.50, 1.50
-    else:
-        tp0_rr, tp1_rr, tp2_rr = 0.6, 1.0, 1.5
-        tp1_pct_mult, tp2_pct_mult = 0.35, 0.80
-
-    tp0 = entry_low + tp0_rr * risk
-    tp1 = max(entry_low + tp1_rr * risk, entry_low * (1 + target_pct * tp1_pct_mult))
-    tp2 = max(entry_low + tp2_rr * risk, entry_low * (1 + target_pct * tp2_pct_mult))
-
-    # v11 — %15 hard gate: gerçek alım sinyali için TP15 ve hedef fizibilitesi zorunlu.
-    tp15 = entry_low * (1 + MIN_REQUIRED_PROFIT_PCT / 100.0)
-    tp15_required_move_pct = MIN_REQUIRED_PROFIT_PCT
-    tp15_r_multiple = (tp15 - entry_low) / risk if risk and risk > 0 else np.nan
-    upside_to_fib127_pct_for_gate = fib.get("upside_to_1272_pct", np.nan) if isinstance(fib, dict) else np.nan
-    # v22.1: Expected_Target_% modelin kendi ürettiği TP2 hedefinden beslenmez.
-    # Bu gate sadece bağımsız/gözlenen kapasite metriklerinden oluşur.
-    atr_capacity_target_pct = 0.0
-    if pd.notna(atr_pct):
-        # ATR kapasitesi hedef potansiyelini sınırlı ve defansif şekilde temsil eder.
-        atr_capacity_target_pct = max(0.0, min(22.0, atr_pct * 2.2))
-    runner_pressure_target_pct = 0.0
-    if (squeeze_score >= 75 and demand_score >= 80 and pd.notna(rvol20) and rvol20 >= 3 and ah_strength >= 55):
-        runner_pressure_target_pct = 15.0
-    if (daily_momentum_score >= 82 and final_score >= 85 and ah_strength >= 65):
-        runner_pressure_target_pct = max(runner_pressure_target_pct, 15.0)
-    observed_upside_target_pct = upside_to_fib127_pct_for_gate if pd.notna(upside_to_fib127_pct_for_gate) else 0.0
-    expected_target_pct = max(
-        observed_upside_target_pct,
-        runner_pressure_target_pct,
-        atr_capacity_target_pct,
-    )
-    target15_score = _score_15pct_target_feasibility(
-        price=ah_price,
-        final_score=final_score,
-        demand_score=demand_score,
-        technical_score=technical_score,
-        daily_momentum_score=daily_momentum_score,
-        squeeze_score=squeeze_score,
-        ah_strength=ah_strength,
-        channel_score=channel_score,
-        liquidity_score=liquidity_score,
-        fakeout_risk=fakeout_risk,
-        rvol20=rvol20,
-        vol_spike10=vol_spike10,
-        atr_pct=atr_pct,
-        upside_to_fib127_pct=upside_to_fib127_pct_for_gate,
-        ah_change_pct=ah_change_pct,
-    )
-
-    price_ok_for_real_trade = pd.notna(ah_price) and 1.0 <= ah_price <= MAX_PRICE_FOR_REAL_NIGHT_BUY
-    price_watch_only = pd.notna(ah_price) and MAX_PRICE_FOR_REAL_NIGHT_BUY < ah_price <= MAX_PRICE_FOR_WATCH_ONLY
-    price_hard_reject_for_strategy = pd.notna(ah_price) and ah_price > MAX_PRICE_FOR_WATCH_ONLY
-
-    # v14 — D+1 %15 hedef katkıları: sadece teorik hedef değil, ertesi gün hedefe gidebilecek
-    # talep/squeeze/runner baskısını da kapı şartı yapıyoruz.
-    runner_squeeze_contribution = float(max(
-        squeeze_score,
-        0.50 * squeeze_score + 0.30 * demand_score + 0.20 * ah_strength,
-        0.45 * daily_momentum_score + 0.35 * squeeze_score + 0.20 * demand_score,
-    ))
-    liquidity_ok = bool(liquidity_score >= MIN_D1_LIQUIDITY_SCORE and (pd.isna(dollar_volume) or dollar_volume >= 1_000_000))
-    if liquidity_score < 45 or (pd.notna(dollar_volume) and dollar_volume < 750_000):
-        spread_risk = "HIGH"
-    elif liquidity_score < 60 or (pd.notna(dollar_volume) and dollar_volume < 2_000_000):
-        spread_risk = "MEDIUM"
-    else:
-        spread_risk = "LOW"
-
-    d1_15_target_score = (
-        0.22 * target15_score
-        + 0.18 * max(0, min(100, demand_score))
-        + 0.14 * max(0, min(100, daily_momentum_score))
-        + 0.14 * max(0, min(100, runner_squeeze_contribution))
-        + 0.12 * max(0, min(100, ah_strength))
-        + 0.10 * max(0, min(100, technical_score))
-        + 0.06 * max(0, min(100, liquidity_score))
-        + 0.04 * max(0, min(100, channel_score))
-        - 0.30 * max(0, min(100, fakeout_risk))
-    )
-    if pd.notna(expected_target_pct) and expected_target_pct >= 20:
-        d1_15_target_score += 4
-    if pd.notna(atr_pct) and 5 <= atr_pct <= 16:
-        d1_15_target_score += 3
-    if pd.notna(ah_change_pct) and 2 <= ah_change_pct <= 18:
-        d1_15_target_score += 3
-    d1_15_target_score = float(max(0, min(100, d1_15_target_score)))
-    d1_15_probability_proxy = float(max(0, min(95, d1_15_target_score * 0.82)))
-
-    has_15pct_upside = (
-        expected_target_pct >= MIN_REQUIRED_PROFIT_PCT
-        and target15_score >= MIN_15_TARGET_SCORE
-        and d1_15_target_score >= MIN_D1_15_TARGET_SCORE
-        and demand_score >= MIN_D1_DEMAND_PRESSURE
-        and daily_momentum_score >= MIN_D1_DAILY_MOMENTUM
-        and runner_squeeze_contribution >= MIN_D1_RUNNER_SQUEEZE
-        and ah_strength >= MIN_D1_AH_STRENGTH
-        and price_ok_for_real_trade
-        and fakeout_risk <= MAX_D1_FAKEOUT_RISK
-        and liquidity_ok
-        and (pd.isna(night_stop_distance_pct) or night_stop_distance_pct <= V22_MAX_STOP_DISTANCE_PCT)
-        and not price_hard_reject_for_strategy
-    )
-
-    no_trade_reasons = []
-    if expected_target_pct < MIN_REQUIRED_PROFIT_PCT:
-        no_trade_reasons.append("%15 hedef alanı modellenmedi")
-    if target15_score < MIN_15_TARGET_SCORE:
-        no_trade_reasons.append("%15 hedef fizibilite skoru yetersiz")
-    if d1_15_target_score < MIN_D1_15_TARGET_SCORE:
-        no_trade_reasons.append("D+1 %15 hedef skoru yetersiz")
-    if demand_score < MIN_D1_DEMAND_PRESSURE:
-        no_trade_reasons.append("Talep basıncı D+1 %15 için yetersiz")
-    if daily_momentum_score < MIN_D1_DAILY_MOMENTUM:
-        no_trade_reasons.append("Günlük momentum D+1 %15 için yetersiz")
-    if runner_squeeze_contribution < MIN_D1_RUNNER_SQUEEZE:
-        no_trade_reasons.append("Runner/squeeze katkısı yetersiz")
-    if ah_strength < MIN_D1_AH_STRENGTH:
-        no_trade_reasons.append("AH/premarket baskısı yetersiz")
-    if not price_ok_for_real_trade:
-        if price_watch_only:
-            no_trade_reasons.append("Fiyat 20$ üstü: %15 gece stratejisi için watch-only")
-        elif price_hard_reject_for_strategy:
-            no_trade_reasons.append("Fiyat 50$ üstü: gerçek gece sinyali yok")
-        else:
-            no_trade_reasons.append("Fiyat 1$ altında veya veri bozuk")
-    if fakeout_risk > MAX_REAL_FAKEOUT_RISK:
-        no_trade_reasons.append("Fakeout riski %15 stratejisi için yüksek")
-    if not liquidity_ok:
-        no_trade_reasons.append("Likidite/spread kalitesi yetersiz")
-    if pd.notna(night_stop_distance_pct) and night_stop_distance_pct > V22_MAX_STOP_DISTANCE_PCT:
-        no_trade_reasons.append("Stop mesafesi %8 üstü; fresh gece alım yok")
-
-    # A/B aday dahi olsa %15 kapısından geçemiyorsa gerçek trade adayı olmaktan çıkar.
-    if status == "TRADE_CANDIDATE" and not has_15pct_upside:
-        grade = "Watchlist — No 15%"
-        status = "WATCHLIST_NO_15"
-
-    why = []
-    if demand_score >= 70:
-        why.append("Talep/hacim güçlü")
-    if technical_score >= 70:
-        why.append("EMA/MACD/RSI hizalı")
-    if daily_momentum_score >= 70:
-        why.append("Günlük momentum kaliteli")
-    if squeeze_score >= 60:
-        why.append("Squeeze proxy güçlü")
-    if ah_strength >= 65:
-        why.append("AH tutunma güçlü")
-    if channel_score >= 60:
-        why.append("Kanal/Fib alanı açık")
-    if liquidity_score >= 60:
-        why.append("Dolar hacmi yeterli")
-
-    risk_notes = []
-    if fakeout_risk >= 50:
-        risk_notes.append("Fakeout riski yüksek")
-    if pd.notna(return_1d_pct) and return_1d_pct >= 10:
-        risk_notes.append("Önceki gün fazla prim")
-    if pd.notna(price_to_ema9_pct) and price_to_ema9_pct >= 10:
-        risk_notes.append("EMA9'dan uzak")
-    if pd.notna(rsi14) and rsi14 >= 78:
-        risk_notes.append("RSI şişmiş")
-    if pd.notna(breakout_pct) and breakout_pct >= 12:
-        risk_notes.append("Breakout aşırı uzamış")
-    if pd.notna(gap_pct_daily) and gap_pct_daily >= 10:
-        risk_notes.append("Gap fade riski")
-    if pd.notna(ah_volume_to_daily_pct) and ah_volume_to_daily_pct > 300:
-        risk_notes.append("AH hacim oranı anormal; veri/likidite kontrolü")
-    if hard_reject_reasons:
-        risk_notes.extend(hard_reject_reasons[:3])
-
-    # ---------------- Gece giriş sinyali / execution gate ----------------
-    # Amaç: Aday üretmek ile gerçekten geceden alım sinyali vermeyi ayırmak.
-    # Next Day adayları ancak bu katmandan YES_NOW / SMALL_SIZE geçerse gece alım için ciddiye alınır.
-    rnd = _price_round(ah_price)
-
-    current_vs_entry_low_pct = _safe_pct(ah_price, entry_low) if entry_low and entry_low > 0 else np.nan
-    current_vs_entry_high_pct = _safe_pct(ah_price, entry_high) if entry_high and entry_high > 0 else np.nan
-
-    in_entry_zone = (
-        pd.notna(current_vs_entry_low_pct)
-        and pd.notna(current_vs_entry_high_pct)
-        and current_vs_entry_low_pct >= -0.35
-        and current_vs_entry_high_pct <= 0.60
-    )
-    below_entry_zone = pd.notna(current_vs_entry_low_pct) and current_vs_entry_low_pct < -0.35
-    above_entry_zone = pd.notna(current_vs_entry_high_pct) and current_vs_entry_high_pct > 0.60
-
-    # Çok üstten kovalama filtresi. Düşük fiyatlı hisselerde tolerans biraz daha geniş.
-    chase_limit_pct = 3.0 if ah_price < 10 else 1.75
-    too_far_to_chase = pd.notna(current_vs_entry_high_pct) and current_vs_entry_high_pct > chase_limit_pct
-
-    if in_entry_zone:
-        entry_zone_status = "IN_ENTRY_ZONE"
-    elif below_entry_zone:
-        entry_zone_status = "BELOW_ENTRY_WAIT_RECLAIM"
-    elif above_entry_zone or too_far_to_chase:
-        entry_zone_status = "ABOVE_ENTRY_WAIT_PULLBACK"
-    else:
-        entry_zone_status = "UNCLEAR"
-
-    ah_confirmed = (
-        ah_strength >= 55
-        or (pd.notna(ah_change_pct) and ah_change_pct >= 1.5 and pd.notna(ah_volume_to_daily_score_pct) and ah_volume_to_daily_score_pct >= 1.0)
-        or (pd.notna(ah_vwap) and ah_price > ah_vwap and pd.notna(reg_vwap) and ah_price > reg_vwap)
-    )
-
-    signal_score = (
-        0.22 * final_score
-        + 0.18 * ah_strength
-        + 0.17 * demand_score
-        + 0.15 * technical_score
-        + 0.10 * daily_momentum_score
-        + 0.08 * squeeze_score
-        + 0.10 * liquidity_score
-        - 0.35 * fakeout_risk
-    )
-    signal_score = float(max(0, min(100, signal_score)))
-
-    d1_15_gate_passed = bool(
-        has_15pct_upside
-        and signal_score >= MIN_REAL_SIGNAL_SCORE
-        and final_score >= MIN_REAL_FINAL_SCORE
-        and d1_15_target_score >= MIN_D1_15_TARGET_SCORE
-        and ah_confirmed
-        and in_entry_zone
-        and not too_far_to_chase
-        and fakeout_risk <= MAX_D1_FAKEOUT_RISK
-        and liquidity_ok
-        and (pd.isna(night_stop_distance_pct) or night_stop_distance_pct <= V22_MAX_STOP_DISTANCE_PCT)
-    )
-    if has_15pct_upside and not d1_15_gate_passed:
-        if signal_score < MIN_REAL_SIGNAL_SCORE:
-            no_trade_reasons.append("Gece giriş sinyal skoru yetersiz")
-        if not ah_confirmed:
-            no_trade_reasons.append("AH/reclaim teyidi yok")
-        if not in_entry_zone:
-            no_trade_reasons.append("Fiyat giriş bölgesinde değil")
-        if too_far_to_chase:
-            no_trade_reasons.append("Fiyat kovalanamayacak kadar uzak")
-
-    # Gece alım sinyali: gerçek işlem için YES_NOW; daha zayıf yapı için SMALL_SIZE/PAPER_ONLY;
-    # uygun değilse WAIT_RECLAIM / WAIT_PULLBACK / NO_NIGHT_ENTRY.
-    trade_allowed = False
-    if hard_reject_reasons:
-        night_entry_signal = "NO_NIGHT_ENTRY"
-        night_action = "Gece alma: hard reject var."
-    elif not has_15pct_upside:
-        night_entry_signal = "NO_15_GATE"
-        night_action = "%15 hard gate geçilmedi: alım önerilmez. " + ("; ".join(no_trade_reasons[:4]) if no_trade_reasons else "")
-    elif status == "TRADE_CANDIDATE" and d1_15_gate_passed:
-        night_entry_signal = "YES_NOW"
-        trade_allowed = True
-        night_action = "D+1 %15 giriş sinyali VAR: %15 hedef kapısı + gece giriş teyidi geçti; şimdilik yalnızca planlı paper pozisyon düşünülebilir."
-    elif status == "TRADE_CANDIDATE" and signal_score >= MIN_REAL_SIGNAL_SCORE and ah_confirmed and below_entry_zone:
-        night_entry_signal = "WAIT_RECLAIM"
-        night_action = "Bekle: fiyat entry altında; entry reclaim + 5dk tutunma gelmeden alma."
-    elif status == "TRADE_CANDIDATE" and signal_score >= MIN_REAL_SIGNAL_SCORE and ah_confirmed and above_entry_zone:
-        night_entry_signal = "WAIT_PULLBACK"
-        night_action = "Bekle: fiyat entry bölgesinin üstünde; kovalamak yerine pullback/retest bekle."
-    elif status == "PAPER_WATCHLIST" and signal_score >= 62 and ah_confirmed and in_entry_zone and fakeout_risk <= 55:
-        night_entry_signal = "PAPER_OR_TINY"
-        night_action = "Sadece paper/çok küçük deneme: A/B kalitesinde gece sinyali değil."
-    elif status == "AGGRESSIVE_SQUEEZE_WATCH" and signal_score >= 58 and ah_confirmed and fakeout_risk <= 55:
-        night_entry_signal = "AGGRESSIVE_WAIT_CONFIRM"
-        night_action = "Agresif squeeze takibi: gece alım değil; premarket/canlı teyit bekle."
-    elif below_entry_zone:
-        night_entry_signal = "WAIT_RECLAIM"
-        night_action = "Bekle: entry altında; reclaim olmadan gece alma."
-    elif above_entry_zone or too_far_to_chase:
-        night_entry_signal = "WAIT_PULLBACK"
-        night_action = "Bekle: entry bölgesi kaçmış; pullback/retest olmadan kovalamama."
-    else:
-        night_entry_signal = "NO_NIGHT_ENTRY"
-        night_action = "Gece giriş sinyali yok: aday olsa bile execution onayı yok."
-
-    # Entry sonrası takip filtresi: MTRX gibi entry görüp 0.5R bile gitmeyenleri zayıf trigger sayacağız.
-    follow_through_05r = round(entry_low + 0.5 * risk, rnd)
-    follow_through_075r = round(entry_low + 0.75 * risk, rnd)
-    setup_invalidation = round(max(0.01, min(stop_price, entry_low - 1.75 * risk)), rnd)
-
-    if night_entry_signal == "YES_NOW":
-        rth_instruction = (
-            "Gece giriş sinyali var. Ertesi gün entry üstü kalıcılık izle; "
-            "0.5R gelmezse weak trigger, TP0 gelirse kısmi kâr düşün."
-        )
-    elif night_entry_signal == "PAPER_OR_TINY":
-        rth_instruction = (
-            "Gerçek A/B sinyal değil. Paper veya çok küçük deneme dışında alma; "
-            "açılış entry altında olursa reclaim + 5dk tutunma bekle."
-        )
-    else:
-        rth_instruction = (
-            "Gece alma. Açılış/after-hours entry altında olursa alma; "
-            "entry reclaim + 5dk tutunma ve 0.5R follow-through bekle."
-        )
-
-    result = {
-        "Symbol": symbol,
-        "Description": row.get("description", ""),
-        "Grade": grade,
-        "Status": status,
-        "Night_Entry_Signal": night_entry_signal,
-        "Trade_Allowed": bool(trade_allowed),
-        "Night_Action": night_action,
-        "Night_Signal_Score": round(signal_score, 1),
-        "Expected_Target_%": round(expected_target_pct, 2) if pd.notna(expected_target_pct) else np.nan,
-        "TP15": round(tp15, rnd),
-        "Runner_TP20": round(entry_low * 1.20, rnd),
-        "Runner_TP30": round(entry_low * 1.30, rnd),
-        "TP15_Required_Move_%": round(tp15_required_move_pct, 2),
-        "TP15_R_Multiple": round(tp15_r_multiple, 2) if pd.notna(tp15_r_multiple) else np.nan,
-        "Target15_Score": round(target15_score, 1),
-        "D1_15_Target_Score": round(d1_15_target_score, 1),
-        "D1_15_Probability_Proxy": round(d1_15_probability_proxy, 1),
-        "Runner_Squeeze_Contribution": round(runner_squeeze_contribution, 1),
-        "Liquidity_OK": bool(liquidity_ok),
-        "Spread_Risk": spread_risk,
-        "Entry_Zone_Status": entry_zone_status,
-        "D1_15_Gate_Passed": bool(d1_15_gate_passed),
-        "Has_15pct_Upside": bool(has_15pct_upside),
-        "MarketCap_M": round(market_cap / 1_000_000, 2) if pd.notna(market_cap) else np.nan,
-        "MarketCap_Bucket": microcap_guard["market_cap_bucket"],
-        "China_HK_Risk": bool(microcap_guard["china_hk_risk"]),
-        "Microcap_Guard_Decision": microcap_guard["decision"],
-        "Microcap_Trap_Reasons": microcap_guard["reason_text"],
-        "High_to_Current_Drop_%": round(ah_price_to_high_pct, 2) if pd.notna(ah_price_to_high_pct) else np.nan,
-        "No_Trade_Reason": "; ".join(no_trade_reasons[:8]) if no_trade_reasons else "-",
-        "AH_Confirmed": bool(ah_confirmed),
-        "In_Entry_Zone": bool(in_entry_zone),
-        "Too_Far_To_Chase": bool(too_far_to_chase),
-        "Current_vs_Entry_Low_%": round(current_vs_entry_low_pct, 2) if pd.notna(current_vs_entry_low_pct) else np.nan,
-        "Current_vs_Entry_High_%": round(current_vs_entry_high_pct, 2) if pd.notna(current_vs_entry_high_pct) else np.nan,
-        "Follow_Through_0_5R": follow_through_05r,
-        "Follow_Through_0_75R": follow_through_075r,
-        "Setup_Invalidation": setup_invalidation,
-        "Final_Night_Score": round(final_score, 1),
-        "Demand_Pressure": round(demand_score, 1),
-        "Technical_Alignment": round(technical_score, 1),
-        "Daily_Momentum_Quality": round(daily_momentum_score, 1),
-        "Squeeze_Proxy": round(squeeze_score, 1),
-        "AH_Strength": round(ah_strength, 1),
-        "Channel_Clarity": round(channel_score, 1),
-        "Liquidity_Quality": round(liquidity_score, 1),
-        "Fakeout_Risk": round(fakeout_risk, 1),
-        "Last_Close": round(last_close, rnd),
-        "AH_Live_Price": round(ah_price, rnd),
-        "AH_Change_%": round(ah_change_pct, 2) if pd.notna(ah_change_pct) else np.nan,
-        "Return_1D_%": round(return_1d_pct, 2) if pd.notna(return_1d_pct) else np.nan,
-        "Return_3D_%": round(return_3d_pct, 2) if pd.notna(return_3d_pct) else np.nan,
-        "Return_5D_%": round(return_5d_pct, 2) if pd.notna(return_5d_pct) else np.nan,
-        "Gap_%": round(gap_pct_daily, 2) if pd.notna(gap_pct_daily) else np.nan,
-        "RVOL20": round(rvol20, 2) if pd.notna(rvol20) else np.nan,
-        "VolSpike10": round(vol_spike10, 2) if pd.notna(vol_spike10) else np.nan,
-        "DollarVolume_M": round(dollar_volume / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
-        "ClosePosition": round(close_position, 2) if pd.notna(close_position) else np.nan,
-        "ATR_pct": round(atr_pct, 2) if pd.notna(atr_pct) else np.nan,
-        "Breakout_Flag": bool(breakout_flag),
-        "Breakout_Pct_%": round(breakout_pct, 2) if pd.notna(breakout_pct) else np.nan,
-        "AH_Vol_to_Daily_%": round(ah_volume_to_daily_pct, 2) if pd.notna(ah_volume_to_daily_pct) else np.nan,
-        "EMA9": round(ema9, rnd) if pd.notna(ema9) else np.nan,
-        "EMA20": round(ema20, rnd) if pd.notna(ema20) else np.nan,
-        "EMA21": round(ema21, rnd) if pd.notna(ema21) else np.nan,
-        "EMA9_gt_EMA20": bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20),
-        "EMA9_gt_EMA21": bool(pd.notna(ema9) and pd.notna(ema21) and ema9 > ema21),
-        "EMA9_CrossUp_EMA21": bool(ema9_crossup_ema21),
-        "RSI14": round(rsi14, 2) if pd.notna(rsi14) else np.nan,
-        "MACD_Hist": round(macd_hist, 4) if pd.notna(macd_hist) else np.nan,
-        "MACD_Rising": bool(macd_rising),
-        "AH_VWAP": round(ah_vwap, rnd) if pd.notna(ah_vwap) else np.nan,
-        "Regular_VWAP": round(reg_vwap, rnd) if pd.notna(reg_vwap) else np.nan,
-        "Fib_1272": round(fib["fib_1272"], rnd) if pd.notna(fib["fib_1272"]) else np.nan,
-        "Upside_to_Fib127_%": round(fib["upside_to_1272_pct"], 2) if pd.notna(fib["upside_to_1272_pct"]) else np.nan,
-        "Night_Entry_Low": round(entry_low, rnd),
-        "Night_Entry_High": round(entry_high, rnd),
-        "Stop": round(stop_price, rnd),
-        "TP0_Quick": round(tp0, rnd),
-        "TP1": round(tp1, rnd),
-        # TP2 intentionally removed in v21.3: TP15 is the main +15% target.
-        # Runner_TP20 / Runner_TP30 are shown separately for extended moves.
-        "Risk_per_Share": round(risk, rnd),
-        "RTH_Instruction": rth_instruction,
-        "Why": ", ".join(why[:6]) if why else "Net pozitif gerekçe zayıf",
-        "Risk_Notes": ", ".join(risk_notes[:7]) if risk_notes else "Belirgin kırmızı bayrak yok",
-        "Aggressive_Reason": ", ".join(aggressive_reasons[:4]) if aggressive_reasons else "-",
-        "Hard_Reject": bool(len(hard_reject_reasons) > 0),
-    }
-    return result, None
-
-
-def evaluate_night_buy_candidates(universe_df: pd.DataFrame, daily_dict: dict) -> tuple[list[dict], list[dict]]:
-    final_candidates = []
-    rejected = []
-    if universe_df is None or universe_df.empty:
-        return final_candidates, rejected
-
-    for _, row in universe_df.iterrows():
-        symbol = row["symbol"]
-        yahoo_symbol = row["yahoo_symbol"]
-        try:
-            daily_df = daily_dict.get(yahoo_symbol)
-            if daily_df is None or daily_df.empty:
-                rejected.append({"Hisse": symbol, "Neden": "Günlük veri yok"})
-                continue
-            intraday_df = get_recent_intraday_full_data(
-                symbol=symbol,
-                yahoo_symbol=yahoo_symbol,
-                api_key_value=api_key,
-                secret_key_value=secret_key,
-                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-            )
-            candidate, reason = compute_night_buy_candidate(row, daily_df, intraday_df)
-            if candidate is None:
-                rejected.append({"Hisse": symbol, "Neden": reason or "Night feature üretilemedi"})
-                continue
-            # Tüm skorlanmış adayları ana listeye ekliyoruz.
-            # UI tarafında bunlar TRADE_CANDIDATE / PAPER_WATCHLIST / REJECT olarak ayrılır.
-            final_candidates.append(candidate)
-        except Exception as exc:
-            rejected.append({"Hisse": symbol, "Neden": f"Hata: {exc}"})
-            log_debug(f"Night evaluate error {symbol}: {exc}")
-
-    signal_rank_map = {
-        "YES_NOW": 5,
-        "PAPER_OR_TINY": 4,
-        "WAIT_RECLAIM": 3,
-        "WAIT_PULLBACK": 2,
-        "AGGRESSIVE_WAIT_CONFIRM": 2,
-        "NO_15_GATE": 0,
-        "NO_NIGHT_ENTRY": 0,
-    }
-    final_candidates = sorted(
-        final_candidates,
-        key=lambda x: (
-            signal_rank_map.get(x.get("Night_Entry_Signal", "NO_NIGHT_ENTRY"), 0),
-            x.get("Night_Signal_Score", 0),
-            x["Final_Night_Score"],
-            x["Demand_Pressure"],
-            x.get("Daily_Momentum_Quality", 0),
-            x["Squeeze_Proxy"],
-        ),
-        reverse=True,
-    )
-    return final_candidates, rejected
-
-
-# ============================================================
-# RUNNER LAB / ULTRA MOMENTUM LAB — ONLY PAPER
-# ============================================================
-def _runner_sample_tickers(tickers: list[str], max_tickers: int, seed: int | None = None) -> list[str]:
-    """CSV evrenini her seferinde alfabetik ilk N'e kilitlememek için örnekler."""
-    if not tickers:
-        return []
-    clean = list(dict.fromkeys([str(t).strip().upper().replace('.', '-') for t in tickers if str(t).strip()]))
-    if max_tickers is None or max_tickers <= 0 or len(clean) <= max_tickers:
-        return clean
-    try:
-        rng = np.random.default_rng(seed if seed is not None else int(datetime.now().strftime('%Y%m%d')))
-        idx = rng.choice(len(clean), size=int(max_tickers), replace=False)
-        return [clean[i] for i in sorted(idx)]
-    except Exception:
-        return clean[:int(max_tickers)]
-
-
-def _runner_pool_score(runner_day_count: int, max_runner_gain_pct: float, days_since_last_run: int) -> float:
-    """Geçmiş runner DNA'sını 0-100 arası özetler."""
-    count_score = min(35.0, float(runner_day_count) * 12.0)
-    gain_score = min(40.0, max(0.0, float(max_runner_gain_pct) - 50.0) / 2.5)
-    if days_since_last_run <= 7:
-        recency_score = 25.0
-    elif days_since_last_run <= 30:
-        recency_score = 18.0
-    elif days_since_last_run <= 90:
-        recency_score = 10.0
-    else:
-        recency_score = 4.0
-    return round(min(100.0, count_score + gain_score + recency_score), 1)
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def build_runner_pool_from_tickers_cached(
-    tickers_tuple: tuple,
-    lookback_period: str = '180d',
-    min_price: float = 1.0,
-    max_price: float = 20.0,
-    min_runner_gain_pct: float = 50.0,
-    min_rvol20: float = 5.0,
-    min_volume: int = 500_000,
-    min_runner_days: int = 1,
-    chunk_size: int = 50,
-    pause: float = 0.8,
-) -> pd.DataFrame:
-    """Geçmişte SKK tipi ultra momentum günü üretmiş hisselerden runner havuzu oluşturur.
-
-    LAB_ONLY: Bu havuz gerçek alım sinyali değildir. Sadece paper/istatistik radarına kaynak sağlar.
-    """
-    tickers = list(tickers_tuple or [])
-    if not tickers:
-        return pd.DataFrame()
-
-    daily_dict = download_daily_data_chunked(
-        tickers,
-        period=lookback_period,
-        chunk_size=chunk_size,
-        pause=pause,
-        alpaca_key='',
-        alpaca_secret='',
-        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
-    )
-    if not daily_dict:
-        return pd.DataFrame()
-
-    try:
-        today = datetime.now(ZoneInfo('America/New_York')).date()
-    except Exception:
-        today = datetime.utcnow().date()
-
-    rows = []
-    for yahoo_symbol, df in daily_dict.items():
-        try:
-            if df is None or df.empty or len(df) < 40:
-                continue
-            dfi = df.copy()
-            dfi['PrevClose'] = dfi['Close'].shift(1)
-            dfi['ChangePct'] = (dfi['Close'] / dfi['PrevClose'] - 1.0) * 100.0
-            dfi['AvgVol20'] = dfi['Volume'].rolling(20).mean()
-            dfi['RVOL20'] = dfi['Volume'] / dfi['AvgVol20'].replace(0, np.nan)
-            dfi['DollarVolume'] = dfi['Close'] * dfi['Volume']
-            # v10: iki katmanlı havuz. STRICT boş kalırsa LOOSE runner DNA da yakalanır.
-            strict_mask = (
-                (dfi['Close'] >= min_price)
-                & (dfi['Close'] <= max_price)
-                & (dfi['ChangePct'] >= min_runner_gain_pct)
-                & (dfi['RVOL20'] >= min_rvol20)
-                & (dfi['Volume'] >= min_volume)
-            )
-            loose_gain = max(25.0, float(min_runner_gain_pct) * 0.60)
-            loose_rvol = max(2.0, float(min_rvol20) * 0.50)
-            loose_volume = max(100_000, int(float(min_volume) * 0.40))
-            loose_mask = (
-                (dfi['Close'] >= min_price)
-                & (dfi['Close'] <= max_price)
-                & (dfi['ChangePct'] >= loose_gain)
-                & (dfi['RVOL20'] >= loose_rvol)
-                & (dfi['Volume'] >= loose_volume)
-            )
-
-            strict_days = dfi[strict_mask].dropna(subset=['ChangePct', 'RVOL20', 'Volume'])
-            loose_days = dfi[loose_mask].dropna(subset=['ChangePct', 'RVOL20', 'Volume'])
-
-            if len(strict_days) >= int(min_runner_days):
-                runner_days = strict_days
-                runner_tier = 'STRICT_RUNNER_DNA'
-            elif len(loose_days) >= int(min_runner_days):
-                runner_days = loose_days
-                runner_tier = 'LOOSE_RUNNER_DNA'
-            else:
-                continue
-
-            count = len(runner_days)
-            max_gain = float(runner_days['ChangePct'].max())
-            max_rvol = float(runner_days['RVOL20'].max())
-            max_dollar_vol = float(runner_days['DollarVolume'].max()) if 'DollarVolume' in runner_days.columns else np.nan
-            last_idx = runner_days.index[-1]
-            try:
-                last_date = last_idx.date()
-            except Exception:
-                last_date = pd.to_datetime(last_idx).date()
-            days_since_last = int((today - last_date).days)
-            rows.append({
-                'symbol': str(yahoo_symbol).strip().upper(),
-                'yahoo_symbol': str(yahoo_symbol).strip().upper(),
-                'runner_day_count': int(count),
-                'max_runner_gain_pct': round(max_gain, 2),
-                'max_runner_rvol20': round(max_rvol, 2),
-                'max_runner_dollar_volume_M': round(max_dollar_vol / 1_000_000, 2) if pd.notna(max_dollar_vol) else np.nan,
-                'last_runner_date': last_date.isoformat(),
-                'days_since_last_run': days_since_last,
-                'runner_pool_tier': runner_tier,
-            })
-        except Exception as exc:
-            log_debug(f'Runner pool hesap hatası {yahoo_symbol}: {exc}')
-            continue
-
-    pool_df = pd.DataFrame(rows)
-    if pool_df.empty:
-        return pool_df
-    pool_df['Runner_DNA_Score'] = pool_df.apply(
-        lambda r: _runner_pool_score(r['runner_day_count'], r['max_runner_gain_pct'], r['days_since_last_run']), axis=1
-    )
-    # LOOSE havuz adayları faydalıdır ama gerçek geçmiş roket kadar güçlü kabul edilmez.
-    if 'runner_pool_tier' in pool_df.columns:
-        pool_df['Runner_DNA_Score'] = np.where(
-            pool_df['runner_pool_tier'].eq('LOOSE_RUNNER_DNA'),
-            (pool_df['Runner_DNA_Score'] * 0.72).round(1),
-            pool_df['Runner_DNA_Score']
-        )
-    return pool_df.sort_values(
-        ['Runner_DNA_Score', 'runner_day_count', 'max_runner_gain_pct'], ascending=[False, False, False]
-    ).reset_index(drop=True)
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def scan_intraday_runners_cached(
-    session_name: str,
-    runner_pool_records: tuple,
-    max_records: int = 60,
-    min_price: float = 1.0,
-    max_price: float = 20.0,
-    min_live_change_pct: float = 20.0,
-    exclude_stale_regular: bool = True,
-) -> pd.DataFrame:
-    """Canlı en hareketli hisseler ile geçmiş Runner DNA havuzunu birleştirir."""
-    if not runner_pool_records:
-        return pd.DataFrame()
-    runner_pool_df = pd.DataFrame(list(runner_pool_records))
-    if runner_pool_df.empty or 'yahoo_symbol' not in runner_pool_df.columns:
-        return pd.DataFrame()
-
-    universe_df = fetch_intraday_trade_universe(
-        session_name=session_name,
-        max_records=max_records,
-        min_price=min_price,
-        max_price=max_price,
-        exclude_stale_regular=exclude_stale_regular,
-    )
-    if universe_df is None or universe_df.empty:
-        return pd.DataFrame()
-
-    df = universe_df.copy()
-    df = df[df['live_change_pct'].fillna(-999) >= float(min_live_change_pct)].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    merged = df.merge(
-        runner_pool_df,
-        how='inner',
-        on='yahoo_symbol',
-        suffixes=('', '_runner'),
-    )
-    if merged.empty:
-        return merged
-
-    # Ultra momentum skoru: canlı hareket + hacim + geçmiş runner DNA.
-    merged['Live_Change_Score'] = np.minimum(45.0, merged['live_change_pct'].fillna(0).clip(lower=0) * 0.9)
-    merged['Live_Volume_Score'] = np.minimum(20.0, np.log10(merged['live_volume'].fillna(0).clip(lower=1)) * 4.0)
-    merged['Runner_Lab_Score'] = (
-        0.45 * merged['Live_Change_Score']
-        + 0.25 * merged['Live_Volume_Score']
-        + 0.30 * merged['Runner_DNA_Score'].fillna(0)
-    ).round(1)
-    merged['LAB_ONLY'] = True
-    guard_records = merged.apply(
-        lambda r: microcap_trap_guard(
-            symbol=r.get('symbol', ''),
-            description=r.get('description', ''),
-            market_cap=r.get('market_cap', np.nan),
-            price=r.get('live_price', np.nan),
-            price_to_high_pct=np.nan,
-            below_vwap=False,
-            change_pct=r.get('live_change_pct', np.nan),
-        ),
-        axis=1,
-    )
-    merged['Microcap_Guard_Decision'] = [g['decision'] for g in guard_records]
-    merged['Microcap_Trap_Reasons'] = [g['reason_text'] for g in guard_records]
-    merged['MarketCap_Bucket'] = [g['market_cap_bucket'] for g in guard_records]
-    merged['China_HK_Risk'] = [g['china_hk_risk'] for g in guard_records]
-    merged['Microcap_Trap_Guard'] = merged['Microcap_Guard_Decision'].eq('HARD_REJECT')
-    base_action = np.where(
-        (merged['live_change_pct'].fillna(0) >= 50) & (merged['Runner_DNA_Score'].fillna(0) >= 60),
-        'PAPER_ULTRA_WATCH',
-        'PAPER_WATCH',
-    )
-    merged['Runner_Action'] = np.select(
-        [
-            merged['Microcap_Guard_Decision'].eq('HARD_REJECT'),
-            merged['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']),
-        ],
-        ['TRAP_RUNNER_NO_TRADE', 'MICROCAP_LAB_ONLY'],
-        default=base_action,
-    )
-    merged['Risk_Label'] = np.where(
-        merged['Microcap_Guard_Decision'].eq('HARD_REJECT'),
-        'TRAP / NO_TRADE',
-        np.where(merged['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']), 'MICROCAP LAB ONLY', 'EXTREME / PAPER ONLY')
-    )
-
-    rename_map = {
-        'symbol': 'Symbol',
-        'description': 'Company',
-        'live_price': 'Live_Price',
-        'live_change_pct': 'Live_Change_%',
-        'live_volume': 'Live_Volume',
-        'market_cap': 'MarketCap',
-    }
-    merged = merged.rename(columns=rename_map)
-    return merged.sort_values(
-        ['Runner_Lab_Score', 'Live_Change_%', 'Runner_DNA_Score'], ascending=[False, False, False]
-    ).reset_index(drop=True)
-
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def scan_fresh_intraday_runners_cached(
-    session_name: str,
-    max_records: int = 100,
-    min_price: float = 1.0,
-    max_price: float = 20.0,
-    min_live_change_pct: float = 20.0,
-    exclude_stale_regular: bool = True,
-) -> pd.DataFrame:
-    """v10: Geçmiş runner DNA olmasa bile bugünkü ultra momentum hisselerini LAB_ONLY olarak gösterir.
-
-    Bu fonksiyon SKK gibi ilk kez koşan/taze runner adaylarını boş havuz yüzünden kaçırmamak için eklendi.
-    Gerçek alım sinyali üretmez; sadece PAPER / ULTRA RISK radar çıktısıdır.
-    """
-    universe_df = fetch_intraday_trade_universe(
-        session_name=session_name,
-        max_records=max_records,
-        min_price=min_price,
-        max_price=max_price,
-        exclude_stale_regular=exclude_stale_regular,
-    )
-    if universe_df is None or universe_df.empty:
-        return pd.DataFrame()
-
-    df = universe_df.copy()
-    df = df[df['live_change_pct'].fillna(-999) >= float(min_live_change_pct)].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    # Taze runnerlarda geçmiş DNA yok; canlı hareket ve hacim skorlanır.
-    df['Runner_DNA_Score'] = 0.0
-    df['runner_day_count'] = 0
-    df['max_runner_gain_pct'] = np.nan
-    df['max_runner_rvol20'] = np.nan
-    df['max_runner_dollar_volume_M'] = np.nan
-    df['last_runner_date'] = 'FRESH_TODAY'
-    df['days_since_last_run'] = 0
-    df['runner_pool_tier'] = 'FRESH_INTRADAY_RUNNER'
-    df['Live_Change_Score'] = np.minimum(60.0, df['live_change_pct'].fillna(0).clip(lower=0) * 1.0)
-    df['Live_Volume_Score'] = np.minimum(25.0, np.log10(df['live_volume'].fillna(0).clip(lower=1)) * 4.0)
-    df['Runner_Lab_Score'] = (0.70 * df['Live_Change_Score'] + 0.30 * df['Live_Volume_Score']).round(1)
-    df['LAB_ONLY'] = True
-    guard_records = df.apply(
-        lambda r: microcap_trap_guard(
-            symbol=r.get('symbol', ''),
-            description=r.get('description', ''),
-            market_cap=r.get('market_cap', np.nan),
-            price=r.get('live_price', np.nan),
-            price_to_high_pct=np.nan,
-            below_vwap=False,
-            change_pct=r.get('live_change_pct', np.nan),
-        ),
-        axis=1,
-    )
-    df['Microcap_Guard_Decision'] = [g['decision'] for g in guard_records]
-    df['Microcap_Trap_Reasons'] = [g['reason_text'] for g in guard_records]
-    df['MarketCap_Bucket'] = [g['market_cap_bucket'] for g in guard_records]
-    df['China_HK_Risk'] = [g['china_hk_risk'] for g in guard_records]
-    df['Microcap_Trap_Guard'] = df['Microcap_Guard_Decision'].eq('HARD_REJECT')
-    base_action = np.where(
-        df['live_change_pct'].fillna(0) >= 50,
-        'PAPER_FRESH_ULTRA_WATCH',
-        'PAPER_FRESH_WATCH',
-    )
-    df['Runner_Action'] = np.select(
-        [
-            df['Microcap_Guard_Decision'].eq('HARD_REJECT'),
-            df['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']),
-        ],
-        ['TRAP_RUNNER_NO_TRADE', 'MICROCAP_LAB_ONLY'],
-        default=base_action,
-    )
-    df['Risk_Label'] = np.where(
-        df['Microcap_Guard_Decision'].eq('HARD_REJECT'),
-        'TRAP / NO_TRADE',
-        np.where(df['Microcap_Guard_Decision'].isin(['LAB_ONLY', 'STRICT_REVIEW']), 'MICROCAP LAB ONLY', 'EXTREME / FRESH PAPER ONLY')
-    )
-
-    rename_map = {
-        'symbol': 'Symbol',
-        'description': 'Company',
-        'live_price': 'Live_Price',
-        'live_change_pct': 'Live_Change_%',
-        'live_volume': 'Live_Volume',
-        'market_cap': 'MarketCap',
-    }
-    df = df.rename(columns=rename_map)
-    return df.sort_values(['Runner_Lab_Score', 'Live_Change_%'], ascending=[False, False]).reset_index(drop=True)
-
-# ============================================================
-# v17 MULTI-MODULE ENGINE - CLEAN / CATALYST / WHALE / AGGRESSIVE
-# ============================================================
-MAIN_ACCOUNT_SIZE_DEFAULT = 2000.0
-MAIN_RISK_PER_TRADE_DEFAULT = 0.02
-AGGRESSIVE_BUDGET_DEFAULT = 100.0
-
-
-def v17_safe_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def v17_price_round(price: float) -> int:
-    if pd.isna(price):
-        return 4
-    return 4 if price < 1 else 3 if price < 10 else 2
-
-
-def v17_score_linear(value, low, high, clamp=True) -> float:
-    try:
-        if pd.isna(value) or high == low:
-            return 0.0
-        score = (float(value) - low) / (high - low) * 100.0
-        if clamp:
-            return float(max(0.0, min(100.0, score)))
-        return float(score)
-    except Exception:
-        return 0.0
-
-
-def v17_calc_ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def v17_calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    prev_close = df["Close"].shift(1)
-    tr = pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def v17_split_sessions(intraday_df: pd.DataFrame):
-    if intraday_df is None or intraday_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    df = intraday_df.copy()
-    idx = df.index
-    try:
-        et_times = idx.tz_convert("America/New_York")
-    except Exception:
-        try:
-            et_times = idx.tz_localize("America/New_York")
-        except Exception:
-            et_times = idx
-
-    df["et_dt"] = et_times
-    df["et_time"] = et_times.time
-
-    premarket = df[
-        (df["et_time"] >= pd.to_datetime("04:00").time())
-        & (df["et_time"] < pd.to_datetime("09:30").time())
-    ].copy()
-
-    regular = df[
-        (df["et_time"] >= pd.to_datetime("09:30").time())
-        & (df["et_time"] < pd.to_datetime("16:00").time())
-    ].copy()
-
-    afterhours = df[
-        (df["et_time"] >= pd.to_datetime("16:00").time())
-        & (df["et_time"] <= pd.to_datetime("20:00").time())
-    ].copy()
-
-    return premarket, regular, afterhours
-
-
-def v17_session_vwap(df: pd.DataFrame) -> float:
-    if df is None or df.empty:
-        return np.nan
-    temp = df.dropna(subset=["High", "Low", "Close", "Volume"]).copy()
-    if temp.empty:
-        return np.nan
-    typical = (temp["High"] + temp["Low"] + temp["Close"]) / 3.0
-    vol_sum = temp["Volume"].sum()
-    if vol_sum <= 0:
-        return np.nan
-    return float((typical * temp["Volume"]).sum() / vol_sum)
-
-
-def v17_active_session_et() -> str:
-    now_et = datetime.now(ZoneInfo("America/New_York")).time()
-    if pd.to_datetime("04:00").time() <= now_et < pd.to_datetime("09:30").time():
-        return "premarket"
-    if pd.to_datetime("09:30").time() <= now_et < pd.to_datetime("16:00").time():
-        return "regular"
-    if pd.to_datetime("16:00").time() <= now_et <= pd.to_datetime("20:00").time():
-        return "afterhours"
-    return "closed"
-
-
-def v17_enrich_daily(daily_df: pd.DataFrame) -> pd.DataFrame:
-    dfi = daily_df.copy().sort_index()
-    dfi["EMA9"] = v17_calc_ema(dfi["Close"], 9)
-    dfi["EMA20"] = v17_calc_ema(dfi["Close"], 20)
-    dfi["EMA50"] = v17_calc_ema(dfi["Close"], 50)
-    dfi["ATR14"] = v17_calc_atr(dfi, 14)
-    dfi["AvgVolume20"] = dfi["Volume"].rolling(20).mean()
-    dfi["AvgDollarVolume20"] = (dfi["Close"] * dfi["Volume"]).rolling(20).mean()
-    dfi["Return1D"] = dfi["Close"].pct_change()
-    dfi["Return3D"] = dfi["Close"].pct_change(3)
-    dfi["Return5D"] = dfi["Close"].pct_change(5)
-    daily_range = (dfi["High"] - dfi["Low"]).replace(0, np.nan)
-    dfi["ClosePosition"] = (dfi["Close"] - dfi["Low"]) / daily_range
-    dfi["High20Prior"] = dfi["High"].rolling(20).max().shift(1)
-    return dfi
-
-
-def v17_bar_pressure(active_df: pd.DataFrame) -> dict:
-    if active_df is None or active_df.empty:
-        return {
-            "buy_pressure_ratio": np.nan,
-            "last6_volume": 0.0,
-            "last6_green_ratio": np.nan,
-            "higher_low": False,
+        elif prev_cs < 0.45:
+            score -= 10
+            notes.append("Weak close")
+
+    if vol_ratio >= 1.5:
+        score += 12
+    if vol_ratio >= 3:
+        score += 8
+        notes.append("Volume expansion")
+
+    if dollar_vol >= 500_000:
+        score += 10
+    elif dollar_vol < 100_000:
+        score -= 10
+
+    if pd.notna(ema9) and pd.notna(ema20) and prev_close > ema9 > ema20:
+        score += 12
+        notes.append("EMA9 > EMA20")
+    elif pd.notna(ema20) and prev_close < ema20:
+        score -= 8
+
+    if pre_ctx["source"] != "REAL_PREMARKET":
+        decision = "İZLE" if score >= cont_score_al - 4 else "ALMA"
+        return clamp(score, 0, 100), decision, notes + ["Premarket veri yok"], {
+            "prev_ret": prev_ret, "prev_cs": prev_cs, "vol_ratio": vol_ratio,
+            "dollar_vol": dollar_vol, "ema9": ema9, "ema20": ema20
         }
 
-    temp = active_df.copy().dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-    if temp.empty:
-        return {
-            "buy_pressure_ratio": np.nan,
-            "last6_volume": 0.0,
-            "last6_green_ratio": np.nan,
-            "higher_low": False,
-        }
+    gap_pct = ((pre_ctx["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+    pre_dollar_vol = pre_ctx["price"] * pre_ctx["pre_vol"] if pd.notna(pre_ctx["price"]) else np.nan
+    above_vwap = pd.notna(pre_ctx["pre_vwap"]) and pd.notna(pre_ctx["price"]) and pre_ctx["price"] > pre_ctx["pre_vwap"]
 
-    up_vol = temp.loc[temp["Close"] >= temp["Open"], "Volume"].sum()
-    down_vol = temp.loc[temp["Close"] < temp["Open"], "Volume"].sum()
-    total = up_vol + down_vol
-    buy_pressure_ratio = up_vol / total if total > 0 else np.nan
+    if pd.notna(gap_pct):
+        if 2 <= gap_pct < 12:
+            score += 12
+        elif 12 <= gap_pct < 35:
+            score += 16
+        elif gap_pct >= 35:
+            score += 6
+            notes.append("Hot gap")
 
-    last6 = temp.tail(6).copy()
-    last6_volume = float(last6["Volume"].sum()) if not last6.empty else 0.0
-    last6_green_ratio = (
-        float((last6["Close"] >= last6["Open"]).mean()) if not last6.empty else np.nan
-    )
+    if pd.notna(pre_ratio):
+        if pre_ratio >= 0.8:
+            score += 8
+        if pre_ratio >= 1.5:
+            score += 10
 
-    higher_low = False
-    if len(temp) >= 8:
-        recent_low = float(temp["Low"].tail(3).min())
-        prior_low = float(temp["Low"].iloc[-8:-3].min())
-        higher_low = recent_low >= prior_low * 0.995
+    if pd.notna(pre_dollar_vol):
+        if pre_dollar_vol >= 250_000:
+            score += 12
+        elif pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
+            score -= 12
 
-    return {
-        "buy_pressure_ratio": buy_pressure_ratio,
-        "last6_volume": last6_volume,
-        "last6_green_ratio": last6_green_ratio,
-        "higher_low": bool(higher_low),
-    }
-
-
-def v17_choose_active_intraday_session(
-    premarket_df: pd.DataFrame,
-    regular_df: pd.DataFrame,
-    afterhours_df: pd.DataFrame,
-    preferred_session: str | None = None,
-) -> tuple[str, pd.DataFrame]:
-    preferred_session = preferred_session or v17_active_session_et()
-    if preferred_session == "afterhours" and afterhours_df is not None and not afterhours_df.empty:
-        return "afterhours", afterhours_df
-    if preferred_session == "premarket" and premarket_df is not None and not premarket_df.empty:
-        return "premarket", premarket_df
-    if preferred_session == "regular" and regular_df is not None and not regular_df.empty:
-        return "regular", regular_df
-
-    # Fall back to the most informative currently available session.
-    if afterhours_df is not None and not afterhours_df.empty:
-        return "afterhours", afterhours_df
-    if premarket_df is not None and not premarket_df.empty:
-        return "premarket", premarket_df
-    if regular_df is not None and not regular_df.empty:
-        return "regular", regular_df
-    return "none", pd.DataFrame()
-
-
-def v17_compute_candidate_features(
-    row: pd.Series | dict,
-    daily_df: pd.DataFrame,
-    intraday_df: pd.DataFrame,
-    preferred_session: str | None = None,
-) -> tuple[dict | None, str | None]:
-    if daily_df is None or daily_df.empty or len(daily_df) < 60:
-        return None, "daily_data_insufficient"
-
-    dfi = v17_enrich_daily(daily_df).dropna(subset=["Close", "Volume"]).copy()
-    if dfi.empty or len(dfi) < 45:
-        return None, "daily_indicators_insufficient"
-
-    row_get = row.get if hasattr(row, "get") else dict(row).get
-    symbol = str(row_get("symbol", row_get("Symbol", ""))).upper()
-    yahoo_symbol = str(row_get("yahoo_symbol", row_get("Yahoo_Symbol", symbol))).upper()
-
-    last = dfi.iloc[-1]
-    prev = dfi.iloc[-2] if len(dfi) >= 2 else last
-
-    last_close = v17_safe_float(last.get("Close"))
-    prev_close = v17_safe_float(prev.get("Close"))
-    avg_vol20 = v17_safe_float(last.get("AvgVolume20"))
-    avg_dollar_vol20 = v17_safe_float(last.get("AvgDollarVolume20"))
-    atr14 = v17_safe_float(last.get("ATR14"))
-    ema9 = v17_safe_float(last.get("EMA9"))
-    ema20 = v17_safe_float(last.get("EMA20"))
-    ema50 = v17_safe_float(last.get("EMA50"))
-    close_position = v17_safe_float(last.get("ClosePosition"))
-    high20_prior = v17_safe_float(last.get("High20Prior"))
-
-    live_price = v17_safe_float(row_get("live_price", row_get("Live_Price", np.nan)))
-    if pd.isna(live_price) or live_price <= 0:
-        live_price = last_close
-
-    live_change_pct = v17_safe_float(row_get("live_change_pct", row_get("Live_Change_%", np.nan)))
-    if pd.isna(live_change_pct) and prev_close > 0:
-        live_change_pct = (live_price - prev_close) / prev_close * 100.0
-
-    live_volume = v17_safe_float(row_get("live_volume", row_get("Live_Volume", np.nan)), 0.0)
-    market_cap = v17_safe_float(row_get("market_cap", row_get("MarketCap", np.nan)))
-    tv_rvol = v17_safe_float(row_get("tv_rvol", np.nan))
-
-    pre_df, reg_df, ah_df = v17_split_sessions(intraday_df)
-    active_session, active_df = v17_choose_active_intraday_session(
-        pre_df, reg_df, ah_df, preferred_session=preferred_session
-    )
-
-    if active_df is not None and not active_df.empty:
-        active_price = float(active_df["Close"].iloc[-1])
+    if above_vwap:
+        score += 12
     else:
-        active_price = live_price
+        score -= 10
+        notes.append("Premarket VWAP altı")
 
-    reg_vwap = v17_session_vwap(reg_df)
-    pre_vwap = v17_session_vwap(pre_df)
-    ah_vwap = v17_session_vwap(ah_df)
-    active_vwap = v17_session_vwap(active_df)
+    if pd.notna(pre_ctx["hold_quality"]):
+        if pre_ctx["hold_quality"] >= 80:
+            score += 16
+        elif pre_ctx["hold_quality"] >= 65:
+            score += 8
+        elif pre_ctx["hold_quality"] < 45:
+            score -= 12
 
-    active_high = float(active_df["High"].max()) if active_df is not None and not active_df.empty else np.nan
-    active_low = float(active_df["Low"].min()) if active_df is not None and not active_df.empty else np.nan
-    active_volume = float(active_df["Volume"].sum()) if active_df is not None and not active_df.empty else live_volume
-    regular_volume = float(reg_df["Volume"].sum()) if reg_df is not None and not reg_df.empty else 0.0
-    premarket_volume = float(pre_df["Volume"].sum()) if pre_df is not None and not pre_df.empty else 0.0
-    afterhours_volume = float(ah_df["Volume"].sum()) if ah_df is not None and not ah_df.empty else 0.0
-    ext_volume = premarket_volume + afterhours_volume
+    if flags["recent_reverse_split"]:
+        score -= 25
+        notes.append("Recent reverse split")
+    if flags["otc_risk"]:
+        score -= 30
+        notes.append("OTC risk")
+    if flags["recent_deficiency"]:
+        score -= 6
+        notes.append("Deficiency")
 
-    active_volume_to_daily_pct = (
-        active_volume / avg_vol20 * 100.0 if pd.notna(avg_vol20) and avg_vol20 > 0 else np.nan
-    )
-    ext_volume_to_daily_pct = (
-        ext_volume / avg_vol20 * 100.0 if pd.notna(avg_vol20) and avg_vol20 > 0 else np.nan
-    )
+    score = clamp(score, 0, 100)
 
-    bars_so_far = max(len(reg_df), 1) if reg_df is not None and not reg_df.empty else 1
-    session_rvol = (
-        regular_volume * (78.0 / bars_so_far) / avg_vol20
-        if pd.notna(avg_vol20) and avg_vol20 > 0 and regular_volume > 0
-        else np.nan
-    )
-    rvol20 = max(
-        [x for x in [tv_rvol, session_rvol, last["Volume"] / avg_vol20 if avg_vol20 else np.nan] if pd.notna(x)]
-        or [np.nan]
-    )
+    if (
+        score >= cont_score_strong and above_vwap and
+        pd.notna(pre_ctx["hold_quality"]) and pre_ctx["hold_quality"] >= 70 and
+        pd.notna(pre_dollar_vol) and pre_dollar_vol >= 300_000
+    ):
+        decision = "GÜÇLÜ AL"
+    elif (
+        score >= cont_score_al and above_vwap and
+        pd.notna(pre_ctx["hold_quality"]) and pre_ctx["hold_quality"] >= 58
+    ):
+        decision = "AL"
+    elif score >= cont_score_al - 4:
+        decision = "İZLE"
+    else:
+        decision = "ALMA"
 
-    pressure = v17_bar_pressure(active_df)
-    expected_5m_volume = avg_vol20 / 78.0 if pd.notna(avg_vol20) and avg_vol20 > 0 else np.nan
-    last6_volume_burst = (
-        pressure["last6_volume"] / max(expected_5m_volume * 6.0, 1.0)
-        if pd.notna(expected_5m_volume)
-        else np.nan
-    )
-
-    active_range_position = (
-        (active_price - active_low) / (active_high - active_low)
-        if pd.notna(active_high) and pd.notna(active_low) and active_high > active_low
-        else np.nan
-    )
-    price_to_active_high_pct = (
-        (active_price - active_high) / active_high * 100.0
-        if pd.notna(active_high) and active_high > 0
-        else np.nan
-    )
-    price_to_ema9_pct = (
-        (active_price - ema9) / ema9 * 100.0 if pd.notna(ema9) and ema9 > 0 else np.nan
-    )
-    price_to_reg_vwap_pct = (
-        (active_price - reg_vwap) / reg_vwap * 100.0
-        if pd.notna(reg_vwap) and reg_vwap > 0
-        else np.nan
-    )
-    price_to_active_vwap_pct = (
-        (active_price - active_vwap) / active_vwap * 100.0
-        if pd.notna(active_vwap) and active_vwap > 0
-        else np.nan
-    )
-    extension_above_20h_pct = (
-        (active_price - high20_prior) / high20_prior * 100.0
-        if pd.notna(high20_prior) and high20_prior > 0 and active_price > high20_prior
-        else 0.0
-    )
-    dist_to_20h_pct = (
-        (high20_prior - active_price) / active_price * 100.0
-        if pd.notna(high20_prior) and high20_prior > 0 and active_price < high20_prior
-        else 0.0
-    )
-
-    change_vs_prev_close_pct = (
-        (active_price - prev_close) / prev_close * 100.0
-        if pd.notna(prev_close) and prev_close > 0
-        else live_change_pct
-    )
-    ah_change_pct = (
-        (float(ah_df["Close"].iloc[-1]) - last_close) / last_close * 100.0
-        if ah_df is not None and not ah_df.empty and last_close > 0
-        else np.nan
-    )
-    premarket_change_pct = (
-        (float(pre_df["Close"].iloc[-1]) - prev_close) / prev_close * 100.0
-        if pre_df is not None and not pre_df.empty and prev_close > 0
-        else np.nan
-    )
-
-    dollar_volume = active_price * max(active_volume, live_volume, 0.0)
-    above_active_vwap = bool(pd.notna(active_vwap) and active_price > active_vwap)
-    above_reg_vwap = bool(pd.notna(reg_vwap) and active_price > reg_vwap)
-    above_ema9 = bool(pd.notna(ema9) and active_price > ema9)
-    ema_stack = bool(pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20)
-
-    whale_absorption_proxy = bool(
-        active_volume_to_daily_pct >= 2.0
-        and above_active_vwap
-        and (pd.isna(active_range_position) or active_range_position >= 0.50)
-        and (
-            pd.isna(pressure["buy_pressure_ratio"])
-            or pressure["buy_pressure_ratio"] >= 0.55
-            or pressure["higher_low"]
-        )
-    )
-
-    # v18 Microcap Trap Guard — v17 Clean/Catalyst/Whale/Runner kapısı
-    below_vwap_for_guard = bool(
-        (pd.notna(active_vwap) and active_price < active_vwap)
-        or (pd.notna(reg_vwap) and active_price < reg_vwap)
-    )
-    microcap_guard = microcap_trap_guard(
-        symbol=symbol,
-        description=row_get("description", row_get("Company", "")),
-        market_cap=market_cap,
-        price=active_price,
-        price_to_high_pct=price_to_active_high_pct,
-        below_vwap=below_vwap_for_guard,
-        return1d_pct=v17_safe_float(last.get("Return1D")) * 100.0 if pd.notna(last.get("Return1D")) else np.nan,
-        change_pct=change_vs_prev_close_pct,
-    )
-
-    return {
-        "symbol": symbol or yahoo_symbol,
-        "yahoo_symbol": yahoo_symbol or symbol,
-        "active_session": active_session,
-        "last_close": last_close,
-        "active_price": active_price,
-        "live_price": live_price,
-        "live_change_pct": live_change_pct,
-        "change_vs_prev_close_pct": change_vs_prev_close_pct,
-        "ah_change_pct": ah_change_pct,
-        "premarket_change_pct": premarket_change_pct,
-        "rvol20": rvol20,
-        "session_rvol": session_rvol,
-        "active_volume": active_volume,
-        "regular_volume": regular_volume,
-        "premarket_volume": premarket_volume,
-        "afterhours_volume": afterhours_volume,
-        "ext_volume": ext_volume,
-        "active_volume_to_daily_pct": active_volume_to_daily_pct,
-        "ext_volume_to_daily_pct": ext_volume_to_daily_pct,
-        "last6_volume_burst": last6_volume_burst,
-        "buy_pressure_ratio": pressure["buy_pressure_ratio"],
-        "last6_green_ratio": pressure["last6_green_ratio"],
-        "higher_low": pressure["higher_low"],
-        "whale_absorption_proxy": whale_absorption_proxy,
-        "active_vwap": active_vwap,
-        "regular_vwap": reg_vwap,
-        "premarket_vwap": pre_vwap,
-        "afterhours_vwap": ah_vwap,
-        "above_active_vwap": above_active_vwap,
-        "above_reg_vwap": above_reg_vwap,
-        "above_ema9": above_ema9,
-        "ema_stack": ema_stack,
+    return score, decision, notes, {
+        "prev_ret": prev_ret,
+        "prev_cs": prev_cs,
+        "vol_ratio": vol_ratio,
+        "dollar_vol": dollar_vol,
         "ema9": ema9,
         "ema20": ema20,
-        "ema50": ema50,
-        "atr14": atr14 if pd.notna(atr14) and atr14 > 0 else max(active_price * 0.045, 0.03),
-        "close_position": close_position,
-        "active_range_position": active_range_position,
-        "price_to_active_high_pct": price_to_active_high_pct,
-        "price_to_ema9_pct": price_to_ema9_pct,
-        "price_to_reg_vwap_pct": price_to_reg_vwap_pct,
-        "price_to_active_vwap_pct": price_to_active_vwap_pct,
-        "extension_above_20h_pct": extension_above_20h_pct,
-        "dist_to_20h_pct": dist_to_20h_pct,
-        "avg_vol20": avg_vol20,
-        "avg_dollar_vol20": avg_dollar_vol20,
-        "dollar_volume": dollar_volume,
-        "market_cap": market_cap,
-        "market_cap_bucket": microcap_guard["market_cap_bucket"],
-        "china_hk_risk": bool(microcap_guard["china_hk_risk"]),
-        "microcap_guard_decision": microcap_guard["decision"],
-        "microcap_trap_reasons": microcap_guard["reason_text"],
-        "microcap_trap_guard": bool(microcap_guard["decision"] == "HARD_REJECT"),
-        "high_to_current_drop_pct": price_to_active_high_pct,
-        "return1d_pct": v17_safe_float(last.get("Return1D")) * 100.0 if pd.notna(last.get("Return1D")) else np.nan,
-        "return3d_pct": v17_safe_float(last.get("Return3D")) * 100.0 if pd.notna(last.get("Return3D")) else np.nan,
-        "return5d_pct": v17_safe_float(last.get("Return5D")) * 100.0 if pd.notna(last.get("Return5D")) else np.nan,
-        "high20_prior": high20_prior,
-        "description": row_get("description", row_get("Company", "")),
-    }, None
+        "gap_pct": gap_pct,
+        "pre_dollar_vol": pre_dollar_vol,
+        "pre_vr": pre_ratio,
+        "above_vwap": above_vwap
+    }
 
 
-def v17_fakeout_risk(f: dict) -> float:
-    risk = 0.0
-    ret1 = f.get("return1d_pct", np.nan)
-    pema = f.get("price_to_ema9_pct", np.nan)
-    pvw = f.get("price_to_active_vwap_pct", np.nan)
-    range_pos = f.get("active_range_position", np.nan)
-    ext = f.get("extension_above_20h_pct", np.nan)
-    rvol = f.get("rvol20", np.nan)
-    price = f.get("active_price", np.nan)
+def build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time, cont_score_al, cont_score_strong, quotes_map):
+    ctx = get_trade_date_context(daily_df, trade_date_str)
+    if ctx is None:
+        return None
 
-    if pd.notna(ret1):
-        if ret1 >= 120:
-            risk += 30
-        elif ret1 >= 70:
-            risk += 22
-        elif ret1 >= 40:
-            risk += 14
-        elif ret1 >= 25:
-            risk += 8
-    if pd.notna(pema):
-        if pema >= 45:
-            risk += 26
-        elif pema >= 25:
-            risk += 18
-        elif pema >= 15:
-            risk += 10
-        elif pema <= -3:
-            risk += 10
-    if pd.notna(pvw) and pvw < -0.5:
-        risk += 18
-    if pd.notna(range_pos):
-        if range_pos < 0.35:
-            risk += 22
-        elif range_pos < 0.50:
-            risk += 10
-    if pd.notna(ext):
-        if ext >= 45:
-            risk += 24
-        elif ext >= 25:
-            risk += 15
-        elif ext >= 12:
-            risk += 8
-    if pd.notna(rvol) and rvol < 1.2:
-        risk += 12
-    if pd.notna(price) and price < 1:
-        risk += 18
+    flags = get_flags(symbol)
+    pre_ctx = get_premarket_context(minute_df, trade_date_str, cutoff_time)
+    baseline_median, _, samples = premarket_baseline_ratio(minute_df, ctx["prior_dates"], trade_date_str, cutoff_time)
 
-    guard_decision = f.get("microcap_guard_decision", "PASS")
-    high_drop = f.get("high_to_current_drop_pct", np.nan)
-    if guard_decision == "HARD_REJECT":
-        risk += 35
-    elif guard_decision == "LAB_ONLY":
-        risk += 22
-    elif guard_decision == "STRICT_REVIEW":
-        risk += 12
-    if pd.notna(high_drop):
-        if high_drop <= FAILED_RUNNER_HARD_DROP_PCT:
-            risk += 30
-        elif high_drop <= FAILED_RUNNER_VWAP_DROP_PCT:
-            risk += 18
+    pre_ratio = np.nan
+    if pre_ctx["source"] == "REAL_PREMARKET" and pd.notna(baseline_median) and baseline_median > 0:
+        pre_ratio = pre_ctx["pre_vol"] / baseline_median
 
-    return float(max(0, min(100, risk)))
-
-
-def v17_score_clean_continuation(f: dict) -> tuple[float, list[str]]:
-    score = 0.0
-    notes = []
-
-    rvol = f.get("rvol20", np.nan)
-    if pd.notna(rvol):
-        if rvol >= 6:
-            score += 22
-            notes.append("RVOL 6x+")
-        elif rvol >= 3:
-            score += 18
-            notes.append("RVOL 3x+")
-        elif rvol >= 1.8:
-            score += 11
-
-    if f.get("above_active_vwap"):
-        score += 16
-        notes.append("active VWAP ustu")
-    if f.get("above_reg_vwap"):
-        score += 10
-    if f.get("above_ema9"):
-        score += 8
-    if f.get("ema_stack"):
-        score += 8
-        notes.append("EMA9>EMA20")
-
-    close_pos = f.get("close_position", np.nan)
-    if pd.notna(close_pos):
-        if close_pos >= 0.85:
-            score += 14
-            notes.append("gun tepesine yakin kapanis")
-        elif close_pos >= 0.65:
-            score += 8
-
-    active_pos = f.get("active_range_position", np.nan)
-    if pd.notna(active_pos):
-        if active_pos >= 0.70:
-            score += 10
-        elif active_pos >= 0.55:
-            score += 6
-
-    change = f.get("change_vs_prev_close_pct", np.nan)
-    if pd.notna(change):
-        if 8 <= change <= 55:
-            score += 12
-        elif 3 <= change < 8:
-            score += 7
-        elif change > 90:
-            score -= 12
-
-    pema = f.get("price_to_ema9_pct", np.nan)
-    if pd.notna(pema):
-        if -1 <= pema <= 12:
-            score += 10
-        elif 12 < pema <= 22:
-            score += 3
-        elif pema > 35:
-            score -= 12
-
-    ah = f.get("ah_change_pct", np.nan)
-    if pd.notna(ah):
-        if ah >= 0:
-            score += 7
-        elif ah < -4:
-            score -= 10
-
-    dollar_vol = f.get("avg_dollar_vol20", np.nan)
-    if pd.notna(dollar_vol):
-        if dollar_vol >= 15_000_000:
-            score += 8
-        elif dollar_vol >= 5_000_000:
-            score += 5
-
-    risk = v17_fakeout_risk(f)
-    score -= 0.25 * risk
-    return float(max(0, min(100, score))), notes
-
-
-def v17_score_catalyst_runner(f: dict) -> tuple[float, list[str]]:
-    score = 0.0
-    notes = []
-    change = f.get("change_vs_prev_close_pct", np.nan)
-    rvol = f.get("rvol20", np.nan)
-    active_vol_pct = f.get("active_volume_to_daily_pct", np.nan)
-    ext_vol_pct = f.get("ext_volume_to_daily_pct", np.nan)
-    burst = f.get("last6_volume_burst", np.nan)
-    market_cap = f.get("market_cap", np.nan)
-    price = f.get("active_price", np.nan)
-
-    if pd.notna(change):
-        if change >= 80:
-            score += 26
-            notes.append("80%+ runner")
-        elif change >= 45:
-            score += 22
-            notes.append("45%+ runner")
-        elif change >= 20:
-            score += 17
-            notes.append("20%+ momentum")
-        elif change >= 10:
-            score += 10
-
-    if pd.notna(rvol):
-        if rvol >= 15:
-            score += 24
-            notes.append("RVOL 15x+")
-        elif rvol >= 8:
-            score += 19
-        elif rvol >= 4:
-            score += 13
-        elif rvol >= 2:
-            score += 7
-
-    if pd.notna(active_vol_pct):
-        if active_vol_pct >= 35:
-            score += 16
-            notes.append("aktif seans hacmi cok yuksek")
-        elif active_vol_pct >= 12:
-            score += 12
-        elif active_vol_pct >= 4:
-            score += 7
-    if pd.notna(ext_vol_pct):
-        if ext_vol_pct >= 10:
-            score += 8
-            notes.append("extended hacim var")
-        elif ext_vol_pct >= 3:
-            score += 5
-    if pd.notna(burst):
-        if burst >= 8:
-            score += 10
-            notes.append("son barlarda hacim patlamasi")
-        elif burst >= 3:
-            score += 6
-
-    if f.get("above_active_vwap"):
-        score += 12
-    if f.get("above_reg_vwap"):
-        score += 6
-    if f.get("higher_low"):
-        score += 6
-    if f.get("whale_absorption_proxy"):
-        score += 8
-        notes.append("absorption/whale proxy")
-
-    active_pos = f.get("active_range_position", np.nan)
-    if pd.notna(active_pos):
-        if active_pos >= 0.75:
-            score += 9
-        elif active_pos >= 0.55:
-            score += 5
-
-    if pd.notna(market_cap):
-        if 50_000_000 <= market_cap <= 1_500_000_000:
-            score += 8
-        elif market_cap < 50_000_000:
-            score += 4
-    if pd.notna(price):
-        if 1 <= price <= 20:
-            score += 6
-        elif price > 50:
-            score -= 8
-
-    if pd.notna(f.get("price_to_active_high_pct", np.nan)) and f["price_to_active_high_pct"] < -10:
-        score -= 14
-    if pd.notna(f.get("price_to_active_vwap_pct", np.nan)) and f["price_to_active_vwap_pct"] < -0.5:
-        score -= 18
-
-    # Catalyst runner icin fiyat momentumunun pozitif olmasi zorunluya yakin.
-    # Yuksek hacim/VWAP tek basina yeterli degil; aksi halde OIO gibi dusen hisseler
-    # hatali sekilde runner sinyali alabilir.
-    ah_change = f.get("ah_change_pct", np.nan)
-    premarket_change = f.get("premarket_change_pct", np.nan)
-    positive_runner_momentum = (
-        (pd.notna(change) and change >= 10.0)
-        or (pd.notna(ah_change) and ah_change >= 3.0)
-        or (pd.notna(premarket_change) and premarket_change >= 8.0)
+    score, decision, notes, extra = score_continuation(
+        ctx["last"], ctx["prev"], ctx["hist20"], pre_ctx, pre_ratio, flags, cont_score_al, cont_score_strong
     )
-    if pd.notna(change) and change <= 0:
-        score = min(score, 55.0)
-        notes.append("change negatif: runner buy yok")
-    elif not positive_runner_momentum:
-        score = min(score, 68.0)
-        notes.append("pozitif runner momentumu teyitsiz")
 
-    return float(max(0, min(100, score))), notes
+    prev_high = safe_float(ctx["last"]["High"], np.nan)
+    prev_close = safe_float(ctx["last"]["Close"], np.nan)
+    gap_pct = extra.get("gap_pct", np.nan)
+
+    entry_idea = np.nan
+    entry_type = "NO_TRADE"
+    stop = np.nan
+    tp1 = np.nan
+    tp2 = np.nan
+
+    if decision in ["GÜÇLÜ AL", "AL", "İZLE"]:
+        if pre_ctx["source"] == "REAL_PREMARKET":
+            reclaim = prev_high * 1.01 if pd.notna(prev_high) else np.nan
+            vwap_entry = pre_ctx["pre_vwap"] * 1.01 if pd.notna(pre_ctx["pre_vwap"]) else np.nan
+            entry_idea = max(reclaim, vwap_entry) if pd.notna(reclaim) and pd.notna(vwap_entry) else (reclaim if pd.notna(reclaim) else vwap_entry)
+
+            if pd.notna(entry_idea) and pd.notna(pre_ctx["price"]):
+                ext = (pre_ctx["price"] - entry_idea) / entry_idea if entry_idea > 0 else np.nan
+                if pd.notna(ext) and ext <= 0.03:
+                    entry_type = "BUY_NEAR_ENTRY"
+                elif pd.notna(ext) and ext <= DEFAULT_MAX_EXTENSION:
+                    entry_type = "WAIT_RETEST"
+                else:
+                    entry_type = "TOO_EXTENDED"
+        else:
+            entry_idea = prev_high * 1.01 if pd.notna(prev_high) else np.nan
+            entry_type = "WATCH_RECLAIM"
+
+        if pd.notna(entry_idea) and entry_idea > 0:
+            stop = entry_idea * 0.93
+            tp1 = entry_idea * 1.10
+            tp2 = entry_idea * 1.15
+
+    quote = quotes_map.get(symbol, {})
+    bid, ask = bid_ask_from_quote(quote)
+    risk = risk_gate(decision, pre_ctx["price"], entry_idea, stop, bid, ask, extra.get("pre_dollar_vol", np.nan))
+
+    return {
+        "Engine": "CONTINUATION",
+        "Symbol": symbol,
+        "Decision": decision,
+        "Score": score,
+        "Price": round_smart(pre_ctx["price"]),
+        "Prev_Close": round_smart(prev_close),
+        "Gap_%": round_smart(gap_pct),
+        "Prev_Ret_%": round_smart(extra.get("prev_ret", np.nan)),
+        "Prev_Close_Strength": round_smart(extra.get("prev_cs", np.nan) * 100 if pd.notna(extra.get("prev_cs", np.nan)) else np.nan),
+        "Prev_Vol_Ratio": round_smart(extra.get("vol_ratio", np.nan)),
+        "EMA9": round_smart(extra.get("ema9", np.nan)),
+        "EMA20": round_smart(extra.get("ema20", np.nan)),
+        "Pre_Vol": safe_int(pre_ctx["pre_vol"], 0),
+        "Pre_Baseline": safe_int(baseline_median, 0) if pd.notna(baseline_median) else 0,
+        "Pre_Vol_Ratio": round_smart(pre_ratio),
+        "Pre_VWAP": round_smart(pre_ctx["pre_vwap"]),
+        "Hold_%": round_smart(pre_ctx["hold_quality"]),
+        "Pre_Dollar_Vol": round_smart(extra.get("pre_dollar_vol", np.nan)),
+        "Source": pre_ctx["source"],
+        "Entry_Type": entry_type,
+        "Entry_Idea": round_smart(entry_idea),
+        "Stop": round_smart(stop),
+        "TP1": round_smart(tp1),
+        "TP2": round_smart(tp2),
+        "Notes": " | ".join(notes),
+        "Samples": samples,
+        **risk
+    }
 
 
-def v17_score_whale_footprint(f: dict) -> tuple[float, list[str]]:
-    score = 0.0
+# ============================================================
+# SUPERNOVA ENGINE
+# ============================================================
+ROCKET_PROTOTYPES = [
+    {
+        "name": "RMSG_STYLE_SUPERNOVA",
+        "weights": {
+            "price": 10, "drawdown90": 8, "base_tightness10": 8, "prev_day_ret": 9,
+            "prev_vol_ratio": 10, "prev_close_strength": 10, "breakout20": 6,
+            "gap_pct": 8, "pre_vol_ratio": 10, "hold_quality": 10,
+            "pre_dollar_vol": 8, "above_prev_high": 3
+        },
+        "bands": {
+            "price": (0.10, 3.50, 0.05, 5.00),
+            "drawdown90": (-90, -25, -99, -5),
+            "base_tightness10": (5, 35, 0, 80),
+            "prev_day_ret": (5, 45, -10, 90),
+            "prev_vol_ratio": (2, 15, 0.5, 40),
+            "prev_close_strength": (75, 100, 45, 100),
+            "breakout20": (1, 1, 0, 1),
+            "gap_pct": (10, 80, -10, 150),
+            "pre_vol_ratio": (1.2, 10, 0.2, 30),
+            "hold_quality": (65, 100, 40, 100),
+            "pre_dollar_vol": (200000, 20000000, 50000, 80000000),
+            "above_prev_high": (1, 1, 0, 1)
+        }
+    },
+    {
+        "name": "SQUEEZE_RECLAIM_STYLE",
+        "weights": {
+            "price": 9, "drawdown90": 8, "base_tightness10": 9, "prev_day_ret": 10,
+            "prev_vol_ratio": 10, "prev_close_strength": 10, "breakout20": 7,
+            "gap_pct": 7, "pre_vol_ratio": 8, "hold_quality": 9,
+            "pre_dollar_vol": 8, "above_prev_high": 5
+        },
+        "bands": {
+            "price": (0.25, 5.00, 0.10, 7.00),
+            "drawdown90": (-80, -20, -99, 0),
+            "base_tightness10": (3, 25, 0, 60),
+            "prev_day_ret": (12, 60, -5, 120),
+            "prev_vol_ratio": (2, 12, 0.5, 35),
+            "prev_close_strength": (78, 100, 50, 100),
+            "breakout20": (1, 1, 0, 1),
+            "gap_pct": (5, 50, -10, 100),
+            "pre_vol_ratio": (1.0, 8, 0.2, 20),
+            "hold_quality": (70, 100, 45, 100),
+            "pre_dollar_vol": (150000, 15000000, 40000, 60000000),
+            "above_prev_high": (1, 1, 0, 1)
+        }
+    },
+]
+
+
+def score_structural(price, drawdown90, base_tightness10, rebound30, breakout20, flags):
+    score = 0
     notes = []
 
-    active_vol_pct = f.get("active_volume_to_daily_pct", np.nan)
-    ext_vol_pct = f.get("ext_volume_to_daily_pct", np.nan)
-    buy_pressure = f.get("buy_pressure_ratio", np.nan)
-    burst = f.get("last6_volume_burst", np.nan)
+    if flags["otc_risk"]:
+        return 0, ["OTC risk"], True
+    if price < MIN_PRICE:
+        return 0, ["0.10 altı"], True
+    if price > MAX_PRICE_SUPERNOVA:
+        return 0, ["5 dolar üstü"], True
 
-    score += 0.25 * v17_score_linear(active_vol_pct, 1.0, 25.0)
-    score += 0.15 * v17_score_linear(ext_vol_pct, 0.5, 12.0)
-    score += 0.18 * v17_score_linear(buy_pressure, 0.48, 0.72)
-    score += 0.12 * v17_score_linear(burst, 1.2, 7.0)
+    if 0.10 <= price <= 1:
+        score += 24
+    elif 1 < price <= 3:
+        score += 20
+    elif 3 < price <= 5:
+        score += 12
 
-    if f.get("above_active_vwap"):
+    if -90 <= drawdown90 <= -35:
+        score += 18
+    elif -35 < drawdown90 <= -10:
+        score += 8
+
+    if 4 <= base_tightness10 <= 28:
+        score += 16
+    elif 28 < base_tightness10 <= 50:
+        score += 8
+    elif base_tightness10 > 70:
+        score -= 8
+        notes.append("Loose base")
+
+    if 5 <= rebound30 <= 120:
         score += 10
-    if f.get("above_reg_vwap"):
-        score += 6
-    if f.get("higher_low"):
-        score += 7
-        notes.append("higher-low")
-    if f.get("whale_absorption_proxy"):
+    elif rebound30 > 200:
+        score -= 5
+
+    if breakout20:
+        score += 12
+        notes.append("20d reclaim")
+
+    if flags["recent_reverse_split"]:
+        score -= 28
+        notes.append("Recent reverse split")
+    if flags["recent_deficiency"]:
+        score -= 6
+        notes.append("Deficiency")
+
+    return clamp(round(score), 0, 100), notes, False
+
+
+def score_ignition(prev_day_ret, prev_close_strength, prev_vol_ratio, prev_dollar_vol, range_expansion, flags):
+    score = 0
+    notes = []
+
+    if 4 <= prev_day_ret < 15:
+        score += 16
+    elif 15 <= prev_day_ret < 45:
+        score += 22
+    elif 45 <= prev_day_ret < 100:
         score += 14
-        notes.append("volume absorption")
-    if pd.notna(f.get("active_range_position", np.nan)) and f["active_range_position"] >= 0.60:
-        score += 6
-
-    dollar_vol = f.get("dollar_volume", np.nan)
-    if pd.notna(dollar_vol):
-        if dollar_vol >= 50_000_000:
-            score += 10
-        elif dollar_vol >= 10_000_000:
-            score += 6
-        elif dollar_vol >= 2_000_000:
-            score += 3
-
-    if pd.notna(f.get("price_to_active_vwap_pct", np.nan)) and f["price_to_active_vwap_pct"] < -0.5:
-        score -= 16
-    if pd.notna(f.get("buy_pressure_ratio", np.nan)) and f["buy_pressure_ratio"] < 0.45:
+    elif prev_day_ret < 0:
         score -= 12
 
-    return float(max(0, min(100, score))), notes
+    if 1.5 <= prev_vol_ratio < 3:
+        score += 12
+    elif 3 <= prev_vol_ratio < 8:
+        score += 20
+    elif prev_vol_ratio >= 8:
+        score += 24
+        notes.append("Vol shock")
+    elif prev_vol_ratio < 0.8:
+        score -= 8
 
-
-def v17_score_aggressive_supernova(f: dict) -> tuple[float, list[str]]:
-    score = 0.0
-    notes = []
-    price = f.get("active_price", np.nan)
-    market_cap = f.get("market_cap", np.nan)
-    change = f.get("change_vs_prev_close_pct", np.nan)
-    rvol = f.get("rvol20", np.nan)
-
-    if pd.notna(price):
-        if 0.5 <= price <= 8:
-            score += 16
-        elif 8 < price <= 20:
-            score += 9
-    if pd.notna(market_cap):
-        if market_cap < 75_000_000:
-            score += 18
-            notes.append("microcap/low-float proxy")
-        elif market_cap < 300_000_000:
-            score += 14
-        elif market_cap < 1_000_000_000:
-            score += 7
-    if pd.notna(change):
-        if change >= 100:
-            score += 24
-        elif change >= 50:
-            score += 20
-        elif change >= 25:
-            score += 14
-    if pd.notna(rvol):
-        if rvol >= 20:
-            score += 20
-        elif rvol >= 10:
-            score += 15
-        elif rvol >= 5:
-            score += 10
-    if pd.notna(f.get("active_volume_to_daily_pct", np.nan)) and f["active_volume_to_daily_pct"] >= 12:
+    if prev_close_strength >= 80:
+        score += 18
+    elif prev_close_strength >= 65:
         score += 10
-    if f.get("above_active_vwap"):
+    elif prev_close_strength < 45:
+        score -= 10
+        notes.append("Weak close")
+
+    if 150_000 <= prev_dollar_vol < 600_000:
+        score += 10
+    elif 600_000 <= prev_dollar_vol < 3_000_000:
+        score += 16
+    elif prev_dollar_vol >= 3_000_000:
+        score += 20
+    elif prev_dollar_vol < 50_000:
+        score -= 10
+
+    if 1.3 <= range_expansion < 2.5:
         score += 8
-    if f.get("whale_absorption_proxy"):
-        score += 8
-    if pd.notna(f.get("active_range_position", np.nan)) and f["active_range_position"] >= 0.70:
-        score += 6
-    if pd.notna(f.get("price_to_active_high_pct", np.nan)) and f["price_to_active_high_pct"] < -12:
-        score -= 15
+    elif range_expansion >= 2.5:
+        score += 14
 
-    return float(max(0, min(100, score))), notes
+    if flags["catalyst_fresh"]:
+        score += 12
+        notes.append("Fresh catalyst flag")
 
+    return clamp(round(score), 0, 100), notes
 
-def v17_position_size(
-    budget: float,
-    risk_pct: float,
-    entry: float,
-    stop: float,
-    risk_cap_budget: bool = True,
-) -> dict:
-    if entry <= 0 or stop <= 0 or stop >= entry:
-        return {"shares": 0, "dollar_size": 0.0, "risk_dollars": 0.0}
-    risk_per_share = entry - stop
-    cash_shares = math.floor(budget / entry)
-    risk_dollars = budget * risk_pct
-    risk_shares = math.floor(risk_dollars / risk_per_share) if risk_per_share > 0 else 0
-    shares = min(cash_shares, risk_shares) if risk_cap_budget else cash_shares
-    shares = max(0, int(shares))
-    return {
-        "shares": shares,
-        "dollar_size": round(shares * entry, 2),
-        "risk_dollars": round(shares * risk_per_share, 2),
-    }
 
-
-def v17_trade_plan(
-    f: dict,
-    module_signal: str,
-    account_size: float = MAIN_ACCOUNT_SIZE_DEFAULT,
-    risk_per_trade_pct: float = MAIN_RISK_PER_TRADE_DEFAULT,
-    aggressive_budget: float = AGGRESSIVE_BUDGET_DEFAULT,
-) -> dict:
-    price = f.get("active_price", np.nan)
-    atr = f.get("atr14", np.nan)
-    active_vwap = f.get("active_vwap", np.nan)
-    reg_vwap = f.get("regular_vwap", np.nan)
-    ema9 = f.get("ema9", np.nan)
-    rnd = v17_price_round(price)
-
-    support_candidates = [x for x in [active_vwap, reg_vwap, ema9] if pd.notna(x) and x > 0]
-    support = max(support_candidates) if support_candidates else price * 0.96
-
-    if pd.isna(atr) or atr <= 0:
-        atr = max(price * 0.04, 0.03)
-
-    current_vs_support_pct = (price - support) / support * 100.0 if support > 0 else np.nan
-    too_far_to_chase = bool(pd.notna(current_vs_support_pct) and current_vs_support_pct > (12.0 if price < 10 else 7.0))
-
-    if too_far_to_chase:
-        entry_low = round(max(support * 1.01, price * 0.94), rnd)
-        entry_high = round(entry_low * (1.025 if price < 10 else 1.012), rnd)
-        entry_status = "WAIT_PULLBACK"
-    elif price >= support * 0.995:
-        entry_low = round(max(price, support * 1.002), rnd)
-        entry_high = round(entry_low * (1.018 if price < 10 else 1.009), rnd)
-        entry_status = "IN_ENTRY_ZONE"
-    else:
-        entry_low = round(support * 1.002, rnd)
-        entry_high = round(entry_low * (1.018 if price < 10 else 1.009), rnd)
-        entry_status = "WAIT_RECLAIM"
-
-    stop_raw = min(entry_low * 0.925, support - 0.85 * atr)
-    stop = round(max(0.01, stop_raw), rnd)
-    if stop >= entry_low:
-        stop = round(entry_low * 0.925, rnd)
-
-    risk = max(entry_low - stop, 0.01)
-    tp15 = round(entry_low * 1.15, rnd)
-    tp20 = round(entry_low * 1.20, rnd)
-    tp30 = round(entry_low * 1.30, rnd)
-    tp0 = round(entry_low + 0.75 * risk, rnd)
-    follow_05r = round(entry_low + 0.5 * risk, rnd)
-
-    main_pos = v17_position_size(
-        budget=account_size,
-        risk_pct=risk_per_trade_pct,
-        entry=entry_low,
-        stop=stop,
-        risk_cap_budget=True,
-    )
-    aggressive_pos = v17_position_size(
-        budget=aggressive_budget,
-        risk_pct=1.0,
-        entry=entry_low,
-        stop=stop,
-        risk_cap_budget=False,
-    )
-
-    if module_signal in {"CLEAN_BUY", "CATALYST_RUNNER_BUY", "WHALE_FOOTPRINT_BUY"}:
-        exit_plan = (
-            "TP +15%: 40-50% sat; +20/+30%: bir parca daha sat; kalan pozisyonu "
-            "5dk EMA9 veya VWAP altina kapanis gelene kadar trail et."
-        )
-    elif module_signal == "PAPER_AGGRESSIVE_100DOLLAR_ONLY":
-        exit_plan = (
-            "Sadece kucuk butce/paper: +15% hizli kismi kar; VWAP kaybi veya halt sonrasi "
-            "reclaim yoksa cik."
-        )
-    elif entry_status == "WAIT_PULLBACK":
-        exit_plan = "Kovalama. VWAP/EMA9 retest veya yeni higher-low gelmeden giris yok."
-    else:
-        exit_plan = "Entry reclaim + 5dk tutunma bekle; +0.5R gelmezse zayif trigger kabul et."
-
-    return {
-        "Entry_Status": entry_status,
-        "Too_Far_To_Chase": too_far_to_chase,
-        "Entry_Low": entry_low,
-        "Entry_High": entry_high,
-        "Stop": stop,
-        "Risk_per_Share": round(risk, rnd),
-        "Follow_Through_0_5R": follow_05r,
-        "TP0_Risk": tp0,
-        "TP15": tp15,
-        "TP20": tp20,
-        "TP30": tp30,
-        "Paper_Main_Shares": main_pos["shares"],
-        "Main_Dollar_Size": main_pos["dollar_size"],
-        "Main_Risk_Dollars": main_pos["risk_dollars"],
-        "Aggressive_Shares_100": aggressive_pos["shares"],
-        "Aggressive_Dollar_Size": aggressive_pos["dollar_size"],
-        "Exit_Plan": exit_plan,
-    }
-
-
-
-def v19_entry_confirmation_overlay(
-    f: dict,
-    plan: dict,
-    module_signal: str,
-    fakeout_risk: float,
-    clean_score: float,
-    catalyst_score: float,
-    whale_score: float,
-    aggressive_score: float,
-) -> dict:
-    """v19 karar katmanı: seviye verildi diye işlem açmayı engeller.
-
-    Bu katman AVPT gibi entry sonrası devam edenleri, AIRJ gibi sadece iğne atıp dönen
-    zayıf tetiklerden ayırmak için tasarlandı. Buradaki PAPER_READY ifadesi bile
-    otomatik alım değil; entry üstünde en az 5 dakika tutunma ve/veya 0.5R follow-through
-    teyidi beklenmesi gerektiğini söyler.
-    """
-    entry_low = safe_float(plan.get("Entry_Low"), np.nan)
-    entry_high = safe_float(plan.get("Entry_High"), np.nan)
-    stop = safe_float(plan.get("Stop"), np.nan)
-    price = safe_float(f.get("active_price"), np.nan)
-    active_session = str(f.get("active_session", "")).lower()
-
-    above_vwap = bool(f.get("above_active_vwap") or f.get("above_reg_vwap"))
-    above_active_vwap = bool(f.get("above_active_vwap"))
-    active_range_pos = safe_float(f.get("active_range_position"), np.nan)
-    price_to_high_pct = safe_float(f.get("price_to_active_high_pct"), np.nan)
-    buy_pressure = safe_float(f.get("buy_pressure_ratio"), np.nan)
-    last6_vol_burst = safe_float(f.get("last6_volume_burst"), np.nan)
-    whale_absorption = bool(f.get("whale_absorption_proxy", False))
-    guard_decision = str(f.get("microcap_guard_decision", "PASS"))
-    entry_status = str(plan.get("Entry_Status", "UNKNOWN"))
-
-    buy_signal = module_signal in {"CLEAN_BUY", "CATALYST_RUNNER_BUY", "WHALE_FOOTPRINT_BUY"}
-    trap_signal = module_signal in {"TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"}
-
-    risk = max(entry_low - stop, 0.01) if pd.notna(entry_low) and pd.notna(stop) else np.nan
-    rnd = v17_price_round(entry_low if pd.notna(entry_low) else price)
-    tp0_05r = round(entry_low + 0.5 * risk, rnd) if pd.notna(entry_low) and pd.notna(risk) else np.nan
-    tp0_quick_3pct = round(entry_low * (1 + TP0_MIN_QUICK_PROFIT_PCT / 100.0), rnd) if pd.notna(entry_low) else np.nan
-    tp0_quick = np.nan
-    if pd.notna(tp0_05r) and pd.notna(tp0_quick_3pct):
-        tp0_quick = round(max(tp0_05r, tp0_quick_3pct), rnd)
-
-    in_or_above_entry_zone = bool(pd.notna(price) and pd.notna(entry_low) and price >= entry_low)
-    not_too_extended_from_entry = bool(pd.isna(entry_high) or pd.isna(price) or price <= entry_high * 1.03)
-    high_fade_risk = bool(
-        (pd.notna(price_to_high_pct) and price_to_high_pct <= HIGH_FADE_CAUTION_PCT)
-        or (pd.notna(active_range_pos) and active_range_pos < 0.35)
-    )
-    weak_trigger_guard = bool(
-        (entry_status in {"WAIT_RECLAIM", "WAIT_PULLBACK"})
-        or (not above_vwap)
-        or (pd.notna(price_to_high_pct) and price_to_high_pct <= WEAK_TRIGGER_HIGH_DROP_PCT)
-        or (pd.notna(active_range_pos) and active_range_pos < 0.45)
-    )
-
-    pressure_ok = bool(
-        (pd.notna(buy_pressure) and buy_pressure >= ENTRY_READY_MIN_BUY_PRESSURE)
-        or (pd.notna(last6_vol_burst) and last6_vol_burst >= 1.5)
-        or whale_absorption
-    )
-    entry_hold_confirmed_proxy = bool(
-        buy_signal
-        and guard_decision == "PASS"
-        and entry_status == "IN_ENTRY_ZONE"
-        and in_or_above_entry_zone
-        and above_vwap
-        and not_too_extended_from_entry
-        and (pd.isna(price_to_high_pct) or price_to_high_pct >= ENTRY_READY_MAX_DISTANCE_FROM_HIGH_PCT)
-        and (pd.isna(active_range_pos) or active_range_pos >= ENTRY_READY_MIN_RANGE_POSITION)
-        and pressure_ok
-        and fakeout_risk <= 50
-        and not high_fade_risk
-    )
-    premarket_reclaim_ok = bool(
-        active_session == "premarket"
-        and entry_status == "IN_ENTRY_ZONE"
-        and above_active_vwap
-        and in_or_above_entry_zone
-        and not high_fade_risk
-    )
-
-    # AVPT Pattern Score: entry skalası + premarket/AH devam + TP15 alanı olan adayları ölçer.
-    avpt_score = 0.0
-    if buy_signal:
-        avpt_score += 18
-    if guard_decision == "PASS":
-        avpt_score += 12
-    elif guard_decision in {"LAB_ONLY", "STRICT_REVIEW"}:
-        avpt_score -= 12
-    if above_vwap:
-        avpt_score += 14
-    if entry_status == "IN_ENTRY_ZONE":
-        avpt_score += 10
-    if pd.notna(active_range_pos):
-        if active_range_pos >= 0.75:
-            avpt_score += 14
-        elif active_range_pos >= 0.60:
-            avpt_score += 9
-    if pd.notna(price_to_high_pct):
-        if price_to_high_pct >= -1.5:
-            avpt_score += 12
-        elif price_to_high_pct >= -3.0:
-            avpt_score += 6
-        elif price_to_high_pct <= -8.0:
-            avpt_score -= 14
-    if pressure_ok:
-        avpt_score += 10
-    if fakeout_risk <= 35:
-        avpt_score += 12
-    elif fakeout_risk <= 50:
-        avpt_score += 6
-    else:
-        avpt_score -= 10
-    if max(clean_score, catalyst_score, whale_score) >= 85:
-        avpt_score += 10
-    elif max(clean_score, catalyst_score, whale_score) >= 75:
-        avpt_score += 6
-    if active_session in {"premarket", "afterhours"}:
-        avpt_score += 6
-    if pd.notna(entry_low) and entry_low > 0:
-        avpt_score += 4
-    avpt_score = float(max(0, min(100, avpt_score)))
-
-    if guard_decision == "HARD_REJECT" or module_signal == "TRAP_RUNNER_NO_TRADE":
-        readiness = "NO_TRADE"
-        reason = "Microcap/failed-runner hard reject."
-    elif trap_signal:
-        readiness = "LAB_ONLY"
-        reason = "Microcap guard nedeniyle ana paper trade yok; yalnız gözlem."
-    elif not buy_signal:
-        readiness = "WATCH_ONLY" if module_signal == "WATCH_CONFIRMATION" else "NO_TRADE"
-        reason = "Buy sinyali yok; sadece izleme."
-    elif entry_hold_confirmed_proxy:
-        readiness = "PAPER_READY_AFTER_5MIN_HOLD"
-        reason = "Entry bölgesi + VWAP + high'a yakınlık + basınç uygun; yine de 5dk tutunma bekle."
-    elif entry_status in {"WAIT_RECLAIM", "WAIT_PULLBACK"}:
-        readiness = "WAIT_CONFIRM"
-        reason = "Entry bölgesi henüz teyitli değil; reclaim/pullback bekle."
-    elif weak_trigger_guard:
-        readiness = "WAIT_CONFIRM"
-        reason = "Weak trigger riski: entry dokunması yeterli değil, 0.5R follow-through bekle."
-    else:
-        readiness = "WAIT_CONFIRM"
-        reason = "Sinyal var ama v19 entry confirmation tamam değil."
-
-    return {
-        "Trade_Readiness": readiness,
-        "AVPT_Pattern_Score": round(avpt_score, 1),
-        "Entry_Hold_Required_Min": ENTRY_CONFIRM_MIN_HOLD_MINUTES,
-        "Entry_Hold_Preferred_Min": ENTRY_CONFIRM_PREFERRED_HOLD_MINUTES,
-        "Entry_Hold_Confirmed_Proxy": bool(entry_hold_confirmed_proxy),
-        "Premarket_Reclaim_OK": bool(premarket_reclaim_ok),
-        "Weak_Trigger_Guard": bool(weak_trigger_guard),
-        "High_Fade_Risk": bool(high_fade_risk),
-        "TP0_0_5R": tp0_05r,
-        "TP0_Quick_3pct": tp0_quick_3pct,
-        "TP0_Quick": tp0_quick,
-        "Follow_Through_Min": tp0_05r,
-        "Trade_Readiness_Reason": reason,
-        "Entry_Confirmation_Rule": "Entry üstü 5-15dk tutunma + VWAP üstü + 0.5R follow-through şart",
-        "Weak_Trigger_Action": "Entry sadece iğneyle görülürse alma; 0.5R gelmezse weak trigger kabul et.",
-    }
-
-def v17_signal_from_scores(
-    clean_score: float,
-    catalyst_score: float,
-    whale_score: float,
-    aggressive_score: float,
-    fakeout_risk: float,
-    f: dict,
-) -> tuple[str, str]:
-    above_vwap = f.get("above_active_vwap") or f.get("above_reg_vwap")
-    active_pos = f.get("active_range_position", np.nan)
-    buy_pressure = f.get("buy_pressure_ratio", np.nan)
-    change = f.get("change_vs_prev_close_pct", np.nan)
-    ah_change = f.get("ah_change_pct", np.nan)
-    premarket_change = f.get("premarket_change_pct", np.nan)
-    catalyst_momentum_ok = (
-        (pd.notna(change) and change >= 10.0)
-        or (pd.notna(ah_change) and ah_change >= 3.0)
-        or (pd.notna(premarket_change) and premarket_change >= 8.0)
-    )
-    aggressive_momentum_ok = pd.notna(change) and change >= 20.0
-
-    guard_decision = f.get("microcap_guard_decision", "PASS")
-    if guard_decision == "HARD_REJECT":
-        return "TRAP_RUNNER_NO_TRADE", "HARD_REJECT_MICROCAP"
-    if guard_decision == "LAB_ONLY":
-        return "MICROCAP_LAB_ONLY", "LAB_ONLY_MICROCAP"
-    if guard_decision == "STRICT_REVIEW":
-        return "MICROCAP_STRICT_WATCH", "PAPER_ONLY_MICROCAP"
-
-    if clean_score >= 76 and fakeout_risk <= 48 and above_vwap:
-        return "CLEAN_BUY", "PAPER_MAIN_CONTROLLED"
-    if (
-        catalyst_score >= 78
-        and catalyst_momentum_ok
-        and above_vwap
-        and (pd.isna(active_pos) or active_pos >= 0.50)
-    ):
-        return "CATALYST_RUNNER_BUY", "PAPER_OR_HALF_SIZE"
-    if (
-        whale_score >= 78
-        and above_vwap
-        and (pd.isna(buy_pressure) or buy_pressure >= 0.55)
-        and fakeout_risk <= 65
-    ):
-        return "WHALE_FOOTPRINT_BUY", "PAPER_OR_HALF_SIZE"
-    if aggressive_score >= 75 and aggressive_momentum_ok and above_vwap:
-        return "PAPER_AGGRESSIVE_100DOLLAR_ONLY", "PAPER_AGGRESSIVE_100"
-    if catalyst_score >= 62 or whale_score >= 62 or clean_score >= 60:
-        return "WATCH_CONFIRMATION", "WATCHLIST"
-    return "NO_TRADE", "NONE"
-
-
-def v17_build_candidate_row(
-    row: pd.Series | dict,
-    daily_df: pd.DataFrame,
-    intraday_df: pd.DataFrame,
-    preferred_session: str | None = None,
-    account_size: float = MAIN_ACCOUNT_SIZE_DEFAULT,
-    risk_per_trade_pct: float = MAIN_RISK_PER_TRADE_DEFAULT,
-    aggressive_budget: float = AGGRESSIVE_BUDGET_DEFAULT,
-) -> tuple[dict | None, str | None]:
-    f, reason = v17_compute_candidate_features(
-        row=row,
-        daily_df=daily_df,
-        intraday_df=intraday_df,
-        preferred_session=preferred_session,
-    )
-    if f is None:
-        return None, reason
-
-    clean_score, clean_notes = v17_score_clean_continuation(f)
-    catalyst_score, catalyst_notes = v17_score_catalyst_runner(f)
-    whale_score, whale_notes = v17_score_whale_footprint(f)
-    aggressive_score, aggressive_notes = v17_score_aggressive_supernova(f)
-    fakeout = v17_fakeout_risk(f)
-    signal, budget_mode = v17_signal_from_scores(
-        clean_score=clean_score,
-        catalyst_score=catalyst_score,
-        whale_score=whale_score,
-        aggressive_score=aggressive_score,
-        fakeout_risk=fakeout,
-        f=f,
-    )
-
-    plan = v17_trade_plan(
-        f=f,
-        module_signal=signal,
-        account_size=account_size,
-        risk_per_trade_pct=risk_per_trade_pct,
-        aggressive_budget=aggressive_budget,
-    )
-    confirmation = v19_entry_confirmation_overlay(
-        f=f,
-        plan=plan,
-        module_signal=signal,
-        fakeout_risk=fakeout,
-        clean_score=clean_score,
-        catalyst_score=catalyst_score,
-        whale_score=whale_score,
-        aggressive_score=aggressive_score,
-    )
-
-    if signal == "CLEAN_BUY":
-        primary_reason = ", ".join(clean_notes[:4]) or "clean continuation alignment"
-    elif signal == "CATALYST_RUNNER_BUY":
-        primary_reason = ", ".join(catalyst_notes[:4]) or "catalyst/momentum runner"
-    elif signal == "WHALE_FOOTPRINT_BUY":
-        primary_reason = ", ".join(whale_notes[:4]) or "whale footprint proxy"
-    elif signal == "PAPER_AGGRESSIVE_100DOLLAR_ONLY":
-        primary_reason = ", ".join(aggressive_notes[:4]) or "aggressive supernova profile"
-    elif signal in {"TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"}:
-        primary_reason = f.get("microcap_trap_reasons", "Microcap Trap Guard")
-    else:
-        primary_reason = "confirmation needed"
-
-    rnd = v17_price_round(f["active_price"])
-    result = {
-        "Symbol": f["symbol"],
-        "Signal": signal,
-        "Budget_Mode": budget_mode,
-        "Active_Session": f["active_session"],
-        "Price": round(f["active_price"], rnd),
-        "Change_%": round(f["change_vs_prev_close_pct"], 2) if pd.notna(f["change_vs_prev_close_pct"]) else np.nan,
-        "Clean_Score": round(clean_score, 1),
-        "Catalyst_Runner_Score": round(catalyst_score, 1),
-        "Whale_Footprint_Score": round(whale_score, 1),
-        "Aggressive_Score": round(aggressive_score, 1),
-        "Fakeout_Risk": round(fakeout, 1),
-        "Primary_Reason": primary_reason,
-        "RVOL20": round(f["rvol20"], 2) if pd.notna(f["rvol20"]) else np.nan,
-        "Session_RVOL": round(f["session_rvol"], 2) if pd.notna(f["session_rvol"]) else np.nan,
-        "Active_Vol_to_Daily_%": round(f["active_volume_to_daily_pct"], 2) if pd.notna(f["active_volume_to_daily_pct"]) else np.nan,
-        "Ext_Vol_to_Daily_%": round(f["ext_volume_to_daily_pct"], 2) if pd.notna(f["ext_volume_to_daily_pct"]) else np.nan,
-        "Last6_Vol_Burst": round(f["last6_volume_burst"], 2) if pd.notna(f["last6_volume_burst"]) else np.nan,
-        "Buy_Pressure_Ratio": round(f["buy_pressure_ratio"], 2) if pd.notna(f["buy_pressure_ratio"]) else np.nan,
-        "Whale_Absorption_Proxy": bool(f["whale_absorption_proxy"]),
-        "Above_Active_VWAP": bool(f["above_active_vwap"]),
-        "Above_Regular_VWAP": bool(f["above_reg_vwap"]),
-        "Active_Range_Position": round(f["active_range_position"], 2) if pd.notna(f["active_range_position"]) else np.nan,
-        "Price_to_High_%": round(f["price_to_active_high_pct"], 2) if pd.notna(f["price_to_active_high_pct"]) else np.nan,
-        "Price_to_EMA9_%": round(f["price_to_ema9_pct"], 2) if pd.notna(f["price_to_ema9_pct"]) else np.nan,
-        "Return1D_%": round(f["return1d_pct"], 2) if pd.notna(f["return1d_pct"]) else np.nan,
-        "MarketCap_M": round(f["market_cap"] / 1_000_000, 2) if pd.notna(f["market_cap"]) else np.nan,
-        "MarketCap_Bucket": f.get("market_cap_bucket", "UNKNOWN"),
-        "China_HK_Risk": bool(f.get("china_hk_risk", False)),
-        "Microcap_Guard_Decision": f.get("microcap_guard_decision", "PASS"),
-        "Microcap_Trap_Reasons": f.get("microcap_trap_reasons", "PASS"),
-        "High_to_Current_Drop_%": round(f.get("high_to_current_drop_pct", np.nan), 2) if pd.notna(f.get("high_to_current_drop_pct", np.nan)) else np.nan,
-        "DollarVolume_M": round(f["dollar_volume"] / 1_000_000, 2) if pd.notna(f["dollar_volume"]) else np.nan,
-        **confirmation,
-        **plan,
-    }
-    return result, None
-
-
-def v17_evaluate_multimodule_candidates(
-    universe_df: pd.DataFrame,
-    daily_dict: dict,
-    intraday_loader,
-    preferred_session: str | None = None,
-    account_size: float = MAIN_ACCOUNT_SIZE_DEFAULT,
-    risk_per_trade_pct: float = MAIN_RISK_PER_TRADE_DEFAULT,
-    aggressive_budget: float = AGGRESSIVE_BUDGET_DEFAULT,
-) -> tuple[list[dict], list[dict]]:
-    candidates: list[dict] = []
-    rejected: list[dict] = []
-    if universe_df is None or universe_df.empty:
-        return candidates, rejected
-
-    for _, row in universe_df.iterrows():
-        symbol = str(row.get("symbol", row.get("Symbol", ""))).upper()
-        yahoo_symbol = str(row.get("yahoo_symbol", row.get("Yahoo_Symbol", symbol))).upper()
-        try:
-            daily_df = daily_dict.get(yahoo_symbol)
-            if daily_df is None or daily_df.empty:
-                rejected.append({"Symbol": symbol, "Reason": "daily_data_missing"})
-                continue
-            intraday_df = intraday_loader(symbol, yahoo_symbol)
-            if intraday_df is None or intraday_df.empty:
-                rejected.append({"Symbol": symbol, "Reason": "intraday_data_missing"})
-                continue
-
-            candidate, reason = v17_build_candidate_row(
-                row=row,
-                daily_df=daily_df,
-                intraday_df=intraday_df,
-                preferred_session=preferred_session,
-                account_size=account_size,
-                risk_per_trade_pct=risk_per_trade_pct,
-                aggressive_budget=aggressive_budget,
-            )
-            if candidate is None:
-                rejected.append({"Symbol": symbol, "Reason": reason or "feature_build_failed"})
-                continue
-            candidates.append(candidate)
-        except Exception as exc:
-            rejected.append({"Symbol": symbol, "Reason": f"error: {exc}"})
-
-    signal_rank = {
-        "CLEAN_BUY": 6,
-        "CATALYST_RUNNER_BUY": 5,
-        "WHALE_FOOTPRINT_BUY": 4,
-        "PAPER_AGGRESSIVE_100DOLLAR_ONLY": 3,
-        "WATCH_CONFIRMATION": 1,
-        "NO_TRADE": 0,
-    }
-    candidates = sorted(
-        candidates,
-        key=lambda x: (
-            signal_rank.get(x.get("Signal", "NO_TRADE"), 0),
-            max(
-                x.get("Clean_Score", 0),
-                x.get("Catalyst_Runner_Score", 0),
-                x.get("Whale_Footprint_Score", 0),
-                x.get("Aggressive_Score", 0),
-            ),
-            -x.get("Fakeout_Risk", 100),
-        ),
-        reverse=True,
-    )
-    return candidates, rejected
-
-
-def v17_backtest_daily_continuation(
-    symbol: str,
-    daily_df: pd.DataFrame,
-    min_price: float = 1.0,
-    max_price: float = 30.0,
-    target_pct: float = 15.0,
-    stop_pct: float = 8.0,
-    min_score: float = 62.0,
-) -> tuple[pd.DataFrame, dict]:
-    """Simple daily replay: signal at close, check next-day +target%.
-
-    This is deliberately conservative and data-light. It does not know
-    premarket prints, Level 2, or news. Use it to calibrate thresholds before
-    trusting the live modules.
-    """
-    if daily_df is None or daily_df.empty or len(daily_df) < 90:
-        return pd.DataFrame(), {
-            "Symbol": symbol,
-            "Signals": 0,
-            "Target_Hit_Rate_%": np.nan,
-            "Avg_Max_Up_%": np.nan,
-            "Avg_Max_Down_%": np.nan,
-        }
-
-    dfi = v17_enrich_daily(daily_df).dropna(subset=["Close", "Volume", "AvgVolume20"]).copy()
-    if len(dfi) < 60:
-        return pd.DataFrame(), {
-            "Symbol": symbol,
-            "Signals": 0,
-            "Target_Hit_Rate_%": np.nan,
-            "Avg_Max_Up_%": np.nan,
-            "Avg_Max_Down_%": np.nan,
-        }
-
-    rows = []
-    # Last row cannot be scored because we need the next day outcome.
-    for i in range(45, len(dfi) - 1):
-        day = dfi.iloc[i]
-        nxt = dfi.iloc[i + 1]
-        close = v17_safe_float(day.get("Close"))
-        if pd.isna(close) or close < min_price or close > max_price:
-            continue
-
-        avg_vol20 = v17_safe_float(day.get("AvgVolume20"))
-        rvol = day["Volume"] / avg_vol20 if avg_vol20 and avg_vol20 > 0 else np.nan
-        close_pos = v17_safe_float(day.get("ClosePosition"))
-        ret1 = v17_safe_float(day.get("Return1D")) * 100 if pd.notna(day.get("Return1D")) else np.nan
-        ret3 = v17_safe_float(day.get("Return3D")) * 100 if pd.notna(day.get("Return3D")) else np.nan
-        ema9 = v17_safe_float(day.get("EMA9"))
-        ema20 = v17_safe_float(day.get("EMA20"))
-        high20 = v17_safe_float(day.get("High20Prior"))
-        dollar_vol = close * v17_safe_float(day.get("Volume"), 0)
-        price_to_ema9 = (close - ema9) / ema9 * 100 if pd.notna(ema9) and ema9 > 0 else np.nan
-        breakout = pd.notna(high20) and close >= high20 * 0.995
-
-        score = 0.0
-        if pd.notna(rvol):
-            if rvol >= 8:
-                score += 24
-            elif rvol >= 4:
-                score += 18
-            elif rvol >= 2:
-                score += 12
-            elif rvol >= 1.4:
-                score += 6
-        if pd.notna(close_pos):
-            if close_pos >= 0.85:
-                score += 18
-            elif close_pos >= 0.65:
-                score += 10
-        if pd.notna(ret1):
-            if 5 <= ret1 <= 35:
-                score += 16
-            elif 2 <= ret1 < 5:
-                score += 8
-            elif ret1 > 70:
-                score -= 12
-        if pd.notna(ret3) and ret3 > 0:
-            score += min(10, ret3 / 2)
-        if pd.notna(ema9) and close > ema9:
-            score += 8
-        if pd.notna(ema9) and pd.notna(ema20) and ema9 > ema20:
-            score += 8
-        if breakout:
-            score += 12
-        if dollar_vol >= 20_000_000:
-            score += 8
-        elif dollar_vol >= 5_000_000:
-            score += 5
-        if pd.notna(price_to_ema9):
-            if 0 <= price_to_ema9 <= 15:
-                score += 8
-            elif price_to_ema9 > 35:
-                score -= 12
-
-        if score < min_score:
-            continue
-
-        entry = close
-        next_high = v17_safe_float(nxt.get("High"))
-        next_low = v17_safe_float(nxt.get("Low"))
-        next_close = v17_safe_float(nxt.get("Close"))
-        max_up_pct = (next_high - entry) / entry * 100 if entry > 0 else np.nan
-        max_down_pct = (next_low - entry) / entry * 100 if entry > 0 else np.nan
-        close_ret_pct = (next_close - entry) / entry * 100 if entry > 0 else np.nan
-        hit_target = pd.notna(max_up_pct) and max_up_pct >= target_pct
-        hit_stop = pd.notna(max_down_pct) and max_down_pct <= -abs(stop_pct)
-
-        try:
-            signal_date = day.name.date().isoformat()
-            outcome_date = nxt.name.date().isoformat()
-        except Exception:
-            signal_date = str(day.name)
-            outcome_date = str(nxt.name)
-
-        rows.append(
-            {
-                "Symbol": symbol,
-                "Signal_Date": signal_date,
-                "Outcome_Date": outcome_date,
-                "Entry_Close": round(entry, v17_price_round(entry)),
-                "Score": round(score, 1),
-                "RVOL20": round(rvol, 2) if pd.notna(rvol) else np.nan,
-                "Return1D_%": round(ret1, 2) if pd.notna(ret1) else np.nan,
-                "ClosePosition": round(close_pos, 2) if pd.notna(close_pos) else np.nan,
-                "Breakout_Proxy": bool(breakout),
-                "Next_Max_Up_%": round(max_up_pct, 2) if pd.notna(max_up_pct) else np.nan,
-                "Next_Max_Down_%": round(max_down_pct, 2) if pd.notna(max_down_pct) else np.nan,
-                "Next_Close_Return_%": round(close_ret_pct, 2) if pd.notna(close_ret_pct) else np.nan,
-                "Hit_Target": bool(hit_target),
-                "Hit_Stop": bool(hit_stop),
-            }
-        )
-
-    trades = pd.DataFrame(rows)
-    if trades.empty:
-        summary = {
-            "Symbol": symbol,
-            "Signals": 0,
-            "Target_Hit_Rate_%": np.nan,
-            "Stop_Hit_Rate_%": np.nan,
-            "Avg_Max_Up_%": np.nan,
-            "Avg_Max_Down_%": np.nan,
-        }
-    else:
-        summary = {
-            "Symbol": symbol,
-            "Signals": int(len(trades)),
-            "Target_Hit_Rate_%": round(float(trades["Hit_Target"].mean() * 100), 2),
-            "Stop_Hit_Rate_%": round(float(trades["Hit_Stop"].mean() * 100), 2),
-            "Avg_Max_Up_%": round(float(trades["Next_Max_Up_%"].mean()), 2),
-            "Avg_Max_Down_%": round(float(trades["Next_Max_Down_%"].mean()), 2),
-        }
-    return trades, summary
-
-
-def v17_backtest_universe_daily(
-    daily_dict: dict,
-    min_price: float = 1.0,
-    max_price: float = 30.0,
-    target_pct: float = 15.0,
-    stop_pct: float = 8.0,
-    min_score: float = 62.0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    all_trades = []
-    summaries = []
-    for symbol, df in (daily_dict or {}).items():
-        trades, summary = v17_backtest_daily_continuation(
-            symbol=symbol,
-            daily_df=df,
-            min_price=min_price,
-            max_price=max_price,
-            target_pct=target_pct,
-            stop_pct=stop_pct,
-            min_score=min_score,
-        )
-        summaries.append(summary)
-        if trades is not None and not trades.empty:
-            all_trades.append(trades)
-
-    trades_df = pd.concat(all_trades, ignore_index=True, sort=False) if all_trades else pd.DataFrame()
-    summary_df = pd.DataFrame(summaries)
-    if not summary_df.empty:
-        summary_df = summary_df.sort_values(
-            ["Target_Hit_Rate_%", "Signals", "Avg_Max_Up_%"],
-            ascending=[False, False, False],
-            na_position="last",
-        )
-    return trades_df, summary_df
-
-
-def render_v17_multimodule_tab(
-    st,
-    fetch_intraday_trade_universe,
-    fetch_night_buy_universe,
-    download_daily_data_chunked,
-    get_recent_intraday_full_data,
-    api_key: str = "",
-    secret_key: str = "",
-    alpaca_feed: str = "iex",
-):
-    st.subheader("v19 Multi-Module: Entry Confirmation + TP0 + Clean/Catalyst/Whale")
-    st.write(
-        "Ana fikir: seviye verildi diye otomatik işlem yok. "
-        "CLEAN_BUY/CATALYST/Whale adayları bile entry üstünde 5-15dk tutunma, VWAP ve 0.5R follow-through teyidi ister."
-    )
-    st.warning(
-        "Bu modul yatirim tavsiyesi degildir. Whale_Footprint gercek emir defteri degil, OHLCV uzerinden proxy skorudur."
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        source = st.selectbox(
-            "Evren",
-            ["live_movers", "night_universe", "mixed"],
-            index=2,
-            format_func=lambda x: {
-                "live_movers": "Canli mover",
-                "night_universe": "Night/extended evren",
-                "mixed": "Birlesik",
-            }[x],
-            key="v17_source",
-        )
-    with c2:
-        session_name = st.selectbox(
-            "Seans",
-            ["auto", "premarket", "regular", "afterhours"],
-            index=0,
-            key="v17_session",
-        )
-    with c3:
-        max_records = st.slider("Evren genisligi", 20, 150, 100, 10, key="v17_max_records")
-    with c4:
-        min_live_change = st.slider("Min canli degisim %", 0, 100, 5, 5, key="v17_min_change")
-
-    c5, c6, c7, c8 = st.columns(4)
-    with c5:
-        min_price = st.number_input("Min fiyat", 0.3, 50.0, 1.0, 0.5, key="v17_min_price")
-    with c6:
-        max_price = st.number_input("Max fiyat", 2.0, 500.0, 30.0, 1.0, key="v17_max_price")
-    with c7:
-        account_size = st.number_input("Paper hesap buyuklugu ($)", 100.0, 100_000.0, 2000.0, 100.0, key="v17_account")
-    with c8:
-        aggressive_budget = st.number_input("Agresif deneme $", 10.0, 5_000.0, 100.0, 10.0, key="v17_aggressive_budget")
-
-    risk_pct = st.slider("Ana trade risk %", 0.25, 10.0, 2.0, 0.25, key="v17_risk_pct") / 100.0
-    run_daily_backtest = st.checkbox(
-        "Basit daily backtest hesapla (+15 next-day replay)",
-        value=False,
-        key="v17_run_daily_backtest",
-    )
-    manual_tickers_text = st.text_input(
-        "Manuel semboller (opsiyonel)",
-        value="",
-        key="v17_manual_tickers",
-        help="Evren bos donerse veya belirli hisseleri test etmek istersen RXT,AEHL,YMAT gibi virgulle yaz.",
-    )
-    active_session = v17_active_session_et()
-    preferred_session = active_session if session_name == "auto" else session_name
-    st.caption(f"Aktif ABD seansi: {active_session.upper()} | Kullanilan seans: {preferred_session.upper()}")
-
-    if not st.button("v17 Motoru Calistir", key="btn_v17_run"):
-        return
-
-    universe_frames = []
-    diagnostics = []
-
-    if source in {"live_movers", "mixed"}:
-        with st.spinner("Canli mover evreni aliniyor..."):
-            live_df = fetch_intraday_trade_universe(
-                session_name=preferred_session if preferred_session != "closed" else "premarket",
-                max_records=int(max_records),
-                min_price=float(min_price),
-                max_price=float(max_price),
-                exclude_stale_regular=True,
-            )
-        diagnostics.append({"source": "live_movers", "count": 0 if live_df is None else len(live_df)})
-        if live_df is not None and not live_df.empty:
-            live_df = live_df.copy()
-            live_df["Universe_Source"] = "LIVE_MOVERS"
-            universe_frames.append(live_df)
-
-    if source in {"night_universe", "mixed"}:
-        with st.spinner("Night/extended evreni aliniyor..."):
-            night_df = fetch_night_buy_universe(
-                scan_mode=preferred_session if preferred_session in {"premarket", "regular", "afterhours"} else "afterhours",
-                max_records=int(max_records),
-                min_price=float(min_price),
-                max_price=float(max_price),
-                min_volume=100_000,
-            )
-        diagnostics.append({"source": "night_universe", "count": 0 if night_df is None else len(night_df)})
-        if night_df is not None and not night_df.empty:
-            night_df = night_df.copy()
-            night_df["Universe_Source"] = "NIGHT_UNIVERSE"
-            universe_frames.append(night_df)
-
-    manual_tickers = []
-    if manual_tickers_text.strip():
-        seen_manual = set()
-        for raw_symbol in manual_tickers_text.replace(";", ",").replace(" ", ",").split(","):
-            symbol = raw_symbol.strip().upper().replace(".", "-")
-            if not symbol or symbol in seen_manual:
-                continue
-            seen_manual.add(symbol)
-            manual_tickers.append(symbol)
-
-    if manual_tickers:
-        manual_df = pd.DataFrame(
-            [
-                {
-                    "symbol": symbol,
-                    "yahoo_symbol": symbol,
-                    "description": "Manual v17 ticker",
-                    "live_price": np.nan,
-                    "live_change_pct": np.nan,
-                    "live_volume": np.nan,
-                    "market_cap": np.nan,
-                    "Universe_Source": "MANUAL",
-                }
-                for symbol in manual_tickers
-            ]
-        )
-        diagnostics.append({"source": "manual_tickers", "count": len(manual_df)})
-        universe_frames.append(manual_df)
-
-    # After-hours ilk dakikalarda TradingView postmarket kolonlari bos donebilir.
-    # Bu durumda sistemi tamamen bos birakmak yerine regular momentum fallback deneriz.
-    if not universe_frames:
-        with st.spinner("After-hours evren bos; regular momentum fallback deneniyor..."):
-            fallback_df = fetch_night_buy_universe(
-                scan_mode="regular",
-                max_records=int(max_records),
-                min_price=float(min_price),
-                max_price=float(max_price),
-                min_volume=50_000,
-            )
-        diagnostics.append({"source": "regular_fallback", "count": 0 if fallback_df is None else len(fallback_df)})
-        if fallback_df is not None and not fallback_df.empty:
-            fallback_df = fallback_df.copy()
-            fallback_df["Universe_Source"] = "REGULAR_FALLBACK"
-            universe_frames.append(fallback_df)
-
-    if not universe_frames:
-        st.warning(
-            "Evren bos. After-hours yeni baslamis olabilir veya TradingView postmarket kolonlari bos donuyor olabilir. "
-            "Manuel sembol kutusuna RXT,AEHL,YMAT gibi hisseleri yazip tekrar calistir."
-        )
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-        return
-
-    universe_df = pd.concat(universe_frames, ignore_index=True, sort=False)
-    if "yahoo_symbol" in universe_df.columns:
-        universe_df = universe_df.drop_duplicates(subset=["yahoo_symbol"], keep="first")
-    if "live_change_pct" in universe_df.columns and min_live_change > 0:
-        keep_sources = {"MANUAL", "REGULAR_FALLBACK"}
-        source_series = universe_df.get("Universe_Source", pd.Series("", index=universe_df.index)).fillna("")
-        change_series = universe_df["live_change_pct"]
-        universe_df = universe_df[
-            source_series.isin(keep_sources)
-            | change_series.isna()
-            | (change_series >= float(min_live_change))
-        ].copy()
-
-    if universe_df.empty:
-        st.warning("Min canli degisim filtresinden sonra evren bos kaldi.")
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-        return
-
-    tickers = universe_df["yahoo_symbol"].dropna().unique().tolist()
-    with st.spinner(f"Gunluk veri indiriliyor: {len(tickers)} sembol..."):
-        daily_dict = download_daily_data_chunked(
-            tickers,
-            period="260d",
-            chunk_size=10,
-            pause=0.8,
-            alpaca_key=api_key,
-            alpaca_secret=secret_key,
-            alpaca_feed=alpaca_feed,
-        )
-
-    def intraday_loader(symbol: str, yahoo_symbol: str):
-        return get_recent_intraday_full_data(
-            symbol=symbol,
-            yahoo_symbol=yahoo_symbol,
-            api_key_value=api_key,
-            secret_key_value=secret_key,
-            alpaca_feed=alpaca_feed,
-        )
-
-    with st.spinner("v17 skorlar hesaplaniyor..."):
-        candidates, rejected = v17_evaluate_multimodule_candidates(
-            universe_df=universe_df,
-            daily_dict=daily_dict,
-            intraday_loader=intraday_loader,
-            preferred_session=preferred_session,
-            account_size=float(account_size),
-            risk_per_trade_pct=float(risk_pct),
-            aggressive_budget=float(aggressive_budget),
-        )
-
-    out = pd.DataFrame(candidates)
-    rej = pd.DataFrame(rejected)
-    st.markdown("#### Diagnostik")
-    st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
-
-    if out.empty:
-        st.error("v17 skorlanabilir aday uretmedi.")
-        if not rej.empty:
-            st.dataframe(rej.head(100), use_container_width=True)
-        return
-
-    show_cols = [
-        "Symbol",
-        "Signal",
-        "Budget_Mode",
-        "Active_Session",
-        "Price",
-        "Change_%",
-        "Clean_Score",
-        "Catalyst_Runner_Score",
-        "Whale_Footprint_Score",
-        "Aggressive_Score",
-        "Fakeout_Risk",
-        "Primary_Reason",
-        "Entry_Status",
-        "Trade_Readiness",
-        "AVPT_Pattern_Score",
-        "Entry_Hold_Confirmed_Proxy",
-        "Premarket_Reclaim_OK",
-        "Weak_Trigger_Guard",
-        "High_Fade_Risk",
-        "Trade_Readiness_Reason",
-        "Entry_Confirmation_Rule",
-        "Too_Far_To_Chase",
-        "Entry_Low",
-        "Entry_High",
-        "Stop",
-        "TP0_Quick",
-        "TP0_0_5R",
-        "TP0_Quick_3pct",
-        "Follow_Through_Min",
-        "TP15",
-        "TP20",
-        "TP30",
-        "Paper_Main_Shares",
-        "Main_Dollar_Size",
-        "Aggressive_Shares_100",
-        "Active_Vol_to_Daily_%",
-        "Ext_Vol_to_Daily_%",
-        "Last6_Vol_Burst",
-        "Buy_Pressure_Ratio",
-        "Whale_Absorption_Proxy",
-        "Above_Active_VWAP",
-        "Above_Regular_VWAP",
-        "Active_Range_Position",
-        "Price_to_High_%",
-        "Price_to_EMA9_%",
-        "RVOL20",
-        "Return1D_%",
-        "MarketCap_M",
-        "MarketCap_Bucket",
-        "China_HK_Risk",
-        "Microcap_Guard_Decision",
-        "Microcap_Trap_Reasons",
-        "High_to_Current_Drop_%",
-        "Exit_Plan",
-    ]
-    show_cols = [c for c in show_cols if c in out.columns]
-
-    clean_df = out[out["Signal"].eq("CLEAN_BUY")].copy()
-    catalyst_df = out[out["Signal"].eq("CATALYST_RUNNER_BUY")].copy()
-    whale_df = out[
-        out["Signal"].eq("WHALE_FOOTPRINT_BUY")
-        | (
-            (out["Whale_Footprint_Score"].fillna(0) >= 82)
-            & (
-                (out.get("Above_Active_VWAP", False) == True)
-                | (out.get("Above_Regular_VWAP", False) == True)
-            )
-        )
-    ].copy()
-    aggressive_df = out[out["Signal"].eq("PAPER_AGGRESSIVE_100DOLLAR_ONLY")].copy()
-    trap_df = out[out["Signal"].isin(["TRAP_RUNNER_NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH"])].copy()
-    ready_df = out[out.get("Trade_Readiness", pd.Series("", index=out.index)).eq("PAPER_READY_AFTER_5MIN_HOLD")].copy()
-    wait_confirm_df = out[out.get("Trade_Readiness", pd.Series("", index=out.index)).eq("WAIT_CONFIRM")].copy()
-    watch_df = out[out["Signal"].isin(["WATCH_CONFIRMATION", "NO_TRADE", "MICROCAP_LAB_ONLY", "MICROCAP_STRICT_WATCH", "TRAP_RUNNER_NO_TRADE"])].copy()
-
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Clean", len(clean_df))
-    m2.metric("Catalyst", len(catalyst_df))
-    m3.metric("Whale proxy", len(whale_df))
-    m4.metric("Aggressive", len(aggressive_df))
-    m5.metric("Paper Ready", len(ready_df))
-    m6.metric("Trap/Watch/No", len(watch_df))
-
-    if not ready_df.empty:
-        st.subheader("✅ v19 Paper Ready — yine de 5dk tutunma bekle")
-        st.caption("Bu tablo otomatik alım değildir. Entry üstü 5-15 dakika tutunma ve 0.5R follow-through teyidi aranır.")
-        st.dataframe(ready_df[show_cols].head(30), use_container_width=True)
-
-    if not trap_df.empty:
-        st.subheader("⛔ Microcap Trap Guard — alınmayacak hareketli hisseler")
-        st.caption("CLIK tipi nanocap/microcap, Çin-HK/Cayman, high'dan sert fade veya VWAP altı tuzak adayları. Alım sinyali değildir.")
-        st.dataframe(trap_df[show_cols].head(50), use_container_width=True)
-
-    if not clean_df.empty:
-        st.subheader("Clean Continuation - paper ana takip listesi")
-        st.dataframe(clean_df[show_cols].head(30), use_container_width=True)
-    if not catalyst_df.empty:
-        st.subheader("Catalyst Runner - RXT tipi erken/aktif momentum")
-        st.dataframe(catalyst_df[show_cols].head(30), use_container_width=True)
-    if not whale_df.empty:
-        st.subheader("Whale Footprint Proxy - balina izi adaylari")
-        st.caption(
-            "Bu tablo sinyal onceliginden bagimsizdir: ana sinyal CLEAN_BUY olsa bile "
-            "Whale_Footprint_Score yuksekse burada ayrica gorunur."
-        )
-        st.dataframe(whale_df[show_cols].head(30), use_container_width=True)
-    if not aggressive_df.empty:
-        st.subheader("Aggressive Supernova - sadece 100$ / paper")
-        st.dataframe(aggressive_df[show_cols].head(30), use_container_width=True)
-
-    if not wait_confirm_df.empty:
-        st.subheader("⏳ WAIT_CONFIRM — seviye var ama entry teyidi eksik")
-        st.dataframe(wait_confirm_df[show_cols].head(50), use_container_width=True)
-
-    st.subheader("Tum v19 skorlar")
-    st.dataframe(out[show_cols].head(100), use_container_width=True)
-    st.download_button(
-        "v19 tum skorlar CSV indir",
-        data=out.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"v19_multimodule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        key="download_v17_multimodule",
-    )
-
-    if run_daily_backtest:
-        with st.spinner("Basit daily backtest hesaplaniyor..."):
-            bt_trades, bt_summary = v17_backtest_universe_daily(
-                daily_dict=daily_dict,
-                min_price=float(min_price),
-                max_price=float(max_price),
-                target_pct=15.0,
-                stop_pct=8.0,
-                min_score=62.0,
-            )
-        st.subheader("v17 Basit Daily Backtest - ertesi gun +15 hedef")
-        st.caption(
-            "Bu backtest yalnizca gunluk OHLCV ile calisir: sinyal kapanista, sonuc ertesi gun high/low. "
-            "Premarket, order book, haber ve slipaj dahil degildir."
-        )
-        if bt_summary.empty:
-            st.info("Backtest summary bos.")
-        else:
-            st.dataframe(bt_summary.head(50), use_container_width=True)
-        if not bt_trades.empty:
-            st.dataframe(bt_trades.sort_values("Signal_Date", ascending=False).head(200), use_container_width=True)
-            st.download_button(
-                "v17 daily backtest trades CSV indir",
-                data=bt_trades.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"v17_daily_backtest_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_v17_daily_backtest",
-            )
-
-    with st.expander("v17 rejected / data errors"):
-        if rej.empty:
-            st.write("Kayit yok.")
-        else:
-            st.dataframe(rej.head(200), use_container_width=True)
-
-
-
-
-# ============================================================
-# v21.2 PRE-IGNITION + EARLY TAPE BURST + TRADABLE SUPERNOVA GATE
-# ============================================================
-# Amaç: TDIC/SKK/RXT benzeri patlayıcı hisseleri, ülke/menşei ve fiyat/piyasa değeri
-# yüzünden saklamadan radar ekranına düşürmek. Bu modül "al" motoru değildir.
-# Microcap/China-HK/low-float benzeri riskler sinyali gizlemez; sadece Risk_Flags ve
-# Trade_Status içinde açıkça gösterilir.
-
-V20_EXPLOSIVE_DEFAULT_MIN_CHANGE = 5.0
-V20_EXPLOSIVE_DEFAULT_MIN_VOLUME = 100_000
-V20_EXPLOSIVE_DEFAULT_MAX_RECORDS = 500
-V20_TAPE_DEEP_TOP_N = 25
-
-
-def v20_resolve_session(session_choice: str) -> str:
-    session_choice = (session_choice or "auto").lower()
-    if session_choice == "auto":
-        active = get_active_session_et()
-        return active if active in ["premarket", "regular", "afterhours"] else "regular"
-    if session_choice in ["premarket", "regular", "afterhours"]:
-        return session_choice
-    return "regular"
-
-
-@st.cache_data(ttl=15, show_spinner=False)
-def v20_fetch_live_explosive_universe(
-    session_name: str = "auto",
-    max_records: int = 250,
-    min_live_change_pct: float = 20.0,
-    min_volume: int = 100_000,
-    min_price: float = 0.01,
-    max_price: float = 1000.0,
-    ignore_price_filter: bool = True,
-) -> pd.DataFrame:
-    """TradingView canlı mover evreni. Menşei/piyasa değeri hard reject yapmaz; sadece radar evreni oluşturur."""
-    use_session = v20_resolve_session(session_name)
-    active_session = get_active_session_et()
-
-    if use_session == "premarket":
-        sort_field = "premarket_change"
-        vol_field = "premarket_volume"
-        price_field = "premarket_close"
-        change_source = "PREMARKET"
-    elif use_session == "afterhours":
-        sort_field = "postmarket_change"
-        vol_field = "postmarket_volume"
-        price_field = "postmarket_close"
-        change_source = "AFTERHOURS"
-    else:
-        sort_field = "change"
-        vol_field = "volume"
-        price_field = "close"
-        change_source = "REGULAR"
-
-    price_filter = (
-        {"left": price_field, "operation": "greater", "right": 0.01}
-        if ignore_price_filter
-        else {"left": price_field, "operation": "in_range", "right": [float(min_price), float(max_price)]}
-    )
-
-    filters = [
-        price_filter,
-        {"left": vol_field, "operation": "greater", "right": int(min_volume)},
-        {"left": sort_field, "operation": "greater", "right": float(min_live_change_pct)},
-        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-    ]
-
-    columns = [
-        "name", "description", price_field, sort_field, vol_field,
-        "market_cap_basic", "relative_volume_10d_calc", "float_shares_outstanding",
-    ]
-
-    raw = tradingview_scan(
-        base_filters=filters,
-        columns=columns,
-        sort_field=sort_field,
-        max_records=int(max_records),
-        page_size=min(100, int(max_records)),
-    )
-
-    rows = []
-    seen = set()
-    for item in raw:
-        try:
-            d = item.get("d", [])
-            symbol = str(d[0]).upper().strip()
-            company = d[1] or ""
-            if not symbol or symbol in seen:
-                continue
-            # ETF/warrant/unit vb. yine dışarıda kalır; hisse menşei/piyasa değeri ise dışlanmaz.
-            if is_likely_non_common_stock(symbol, company):
-                continue
-            seen.add(symbol)
-            price = safe_float(d[2], np.nan)
-            chg = safe_float(d[3], np.nan)
-            vol = safe_float(d[4], np.nan)
-            mcap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
-            rvol10 = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
-            float_shares = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
-            rows.append({
-                "symbol": symbol,
-                "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
-                "description": company,
-                "live_price": price,
-                "live_change_pct": chg,
-                "live_volume": vol,
-                "market_cap": mcap,
-                "tv_rvol": rvol10,
-                "float_shares": float_shares,
-                "change_source": change_source,
-                "data_status": f"V20_{change_source}_LIVE" if active_session == use_session else f"V20_{change_source}_SELECTED_ACTIVE_{active_session.upper()}",
-                "active_session_et": active_session,
-            })
-        except Exception as exc:
-            log_debug(f"v20 explosive parse error: {exc}")
-    return pd.DataFrame(rows)
-
-
-def v20_manual_symbol_candidates(symbols_text: str) -> pd.DataFrame:
-    """Manuel sembolleri Yahoo intraday ile kabaca radar evrenine ekler. En fazla 10 sembol."""
-    syms = []
-    for raw in str(symbols_text or "").replace(";", ",").replace("\n", ",").split(","):
-        s = raw.strip().upper()
-        if s and s not in syms:
-            syms.append(s)
-    syms = syms[:10]
-    rows = []
-    for symbol in syms:
-        try:
-            ys = normalize_symbol_for_yahoo(symbol)
-            t = yf.Ticker(ys)
-            hist = t.history(period="2d", interval="1m", prepost=True, auto_adjust=False)
-            daily = t.history(period="5d", interval="1d", auto_adjust=False)
-            if hist is None or hist.empty:
-                continue
-            price = float(hist["Close"].dropna().iloc[-1])
-            live_volume = float(hist["Volume"].fillna(0).sum())
-            prev_close = np.nan
-            if daily is not None and not daily.empty and len(daily.dropna()) >= 2:
-                prev_close = float(daily["Close"].dropna().iloc[-2])
-            elif daily is not None and not daily.empty:
-                prev_close = float(daily["Close"].dropna().iloc[0])
-            change = (price - prev_close) / prev_close * 100.0 if pd.notna(prev_close) and prev_close > 0 else np.nan
-            try:
-                info = t.get_info()
-            except Exception:
-                info = {}
-            rows.append({
-                "symbol": symbol,
-                "yahoo_symbol": ys,
-                "description": info.get("longName") or info.get("shortName") or "MANUAL",
-                "live_price": price,
-                "live_change_pct": change,
-                "live_volume": live_volume,
-                "market_cap": safe_float(info.get("marketCap"), np.nan),
-                "tv_rvol": np.nan,
-                "float_shares": safe_float(info.get("floatShares"), np.nan),
-                "change_source": "MANUAL_YAHOO",
-                "data_status": "MANUAL_YAHOO_INTRADAY",
-                "active_session_et": get_active_session_et(),
-            })
-        except Exception as exc:
-            log_debug(f"v20 manual symbol error {symbol}: {exc}")
-    return pd.DataFrame(rows)
-
-
-def v20_accumulation_score_from_daily(daily_df: pd.DataFrame) -> dict:
-    """Patlama öncesi sessiz birikim / absorption proxy. Son günü dışarıda bırakarak geçmiş tabanı okur."""
-    if daily_df is None or daily_df.empty or len(daily_df.dropna()) < 45:
-        return {
-            "Accumulation_Score": 0.0,
-            "Absorption_Score": 0.0,
-            "Base_Days": 0,
-            "Range_Compression_%": np.nan,
-            "Volume_Without_Price_Move": np.nan,
-            "OBV_Trend_20": np.nan,
-            "PreExplosion_Note": "daily insufficient",
-        }
-
-    df = daily_df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-    if len(df) < 45:
-        return {
-            "Accumulation_Score": 0.0,
-            "Absorption_Score": 0.0,
-            "Base_Days": 0,
-            "Range_Compression_%": np.nan,
-            "Volume_Without_Price_Move": np.nan,
-            "OBV_Trend_20": np.nan,
-            "PreExplosion_Note": "daily insufficient",
-        }
-
-    # Son mum bugünkü patlama olabilir; pre-base için son günü dışarıda bırakıyoruz.
-    pre = df.iloc[:-1].copy() if len(df) >= 46 else df.copy()
-    if len(pre) < 40:
-        pre = df.copy()
-
-    close = pre["Close"]
-    vol = pre["Volume"].fillna(0)
-    last_close = float(close.iloc[-1])
-    look20 = pre.tail(20)
-    look60 = pre.tail(60)
-
-    range20_pct = (float(look20["High"].max()) - float(look20["Low"].min())) / max(last_close, 0.01) * 100.0
-    range60_pct = (float(look60["High"].max()) - float(look60["Low"].min())) / max(last_close, 0.01) * 100.0
-    ret20_abs = abs((float(close.iloc[-1]) - float(close.iloc[-20])) / max(float(close.iloc[-20]), 0.01) * 100.0) if len(close) >= 20 else np.nan
-    avgv5 = float(vol.tail(5).mean()) if len(vol) >= 5 else np.nan
-    avgv20 = float(vol.tail(20).mean()) if len(vol) >= 20 else np.nan
-    avgv60 = float(vol.tail(60).mean()) if len(vol) >= 60 else np.nan
-    vol_ratio_5_20 = avgv5 / max(avgv20, 1.0) if pd.notna(avgv5) and pd.notna(avgv20) else np.nan
-    vol_ratio_20_60 = avgv20 / max(avgv60, 1.0) if pd.notna(avgv20) and pd.notna(avgv60) else np.nan
-
-    close_diff = close.diff().fillna(0)
-    obv = pd.Series(np.where(close_diff > 0, vol, np.where(close_diff < 0, -vol, 0)), index=pre.index).cumsum()
-    obv_trend20 = float(obv.iloc[-1] - obv.iloc[-20]) if len(obv) >= 20 else np.nan
-    obv_positive = pd.notna(obv_trend20) and obv_trend20 > 0
-
-    base_days = int(((look20["Close"] >= look20["Low"].min() * 0.95) & (look20["Close"] <= look20["High"].max() * 1.05)).sum()) if not look20.empty else 0
-    volume_without_price_move = (vol_ratio_5_20 if pd.notna(vol_ratio_5_20) else 0) * (1.0 if pd.notna(ret20_abs) and ret20_abs <= 20 else 0.55)
-
-    score = 0.0
-    if pd.notna(range20_pct):
-        if range20_pct <= 20: score += 24
-        elif range20_pct <= 35: score += 16
-        elif range20_pct <= 55: score += 8
-    if pd.notna(ret20_abs):
-        if ret20_abs <= 12: score += 18
-        elif ret20_abs <= 25: score += 10
-    if pd.notna(vol_ratio_5_20):
-        if vol_ratio_5_20 >= 2.0: score += 22
-        elif vol_ratio_5_20 >= 1.4: score += 14
-        elif vol_ratio_5_20 >= 1.1: score += 7
-    if pd.notna(vol_ratio_20_60):
-        if vol_ratio_20_60 >= 1.8: score += 16
-        elif vol_ratio_20_60 >= 1.25: score += 9
-    if obv_positive: score += 14
-    if base_days >= 16: score += 6
-
-    score = float(max(0.0, min(100.0, score)))
-    absorption = float(max(0.0, min(100.0, 0.45 * score + 25.0 * min(volume_without_price_move, 3.0) / 3.0 + (15.0 if obv_positive else 0.0))))
-    note = []
-    if range20_pct <= 35: note.append("dar taban")
-    if pd.notna(vol_ratio_5_20) and vol_ratio_5_20 >= 1.4: note.append("son hacim artışı")
-    if obv_positive: note.append("OBV pozitif")
-    if pd.notna(ret20_abs) and ret20_abs <= 20: note.append("fiyat yatay")
-    return {
-        "Accumulation_Score": round(score, 1),
-        "Absorption_Score": round(absorption, 1),
-        "Base_Days": base_days,
-        "Range_Compression_%": round(range20_pct, 2) if pd.notna(range20_pct) else np.nan,
-        "Range60_%": round(range60_pct, 2) if pd.notna(range60_pct) else np.nan,
-        "Volume_Without_Price_Move": round(volume_without_price_move, 2) if pd.notna(volume_without_price_move) else np.nan,
-        "OBV_Trend_20": round(obv_trend20, 0) if pd.notna(obv_trend20) else np.nan,
-        "PreExplosion_Note": ", ".join(note) if note else "zayıf/normal",
-    }
-
-
-def v20_score_explosive_candidate(row: dict, daily_df: pd.DataFrame | None = None, intraday_df: pd.DataFrame | None = None, preferred_session: str | None = None) -> dict:
-    symbol = str(row.get("symbol") or row.get("Symbol") or "").upper()
-    yahoo_symbol = str(row.get("yahoo_symbol") or row.get("Yahoo_Symbol") or normalize_symbol_for_yahoo(symbol)).upper()
-    description = row.get("description") or row.get("Company") or ""
-    live_price = safe_float(row.get("live_price", row.get("Live_Price", np.nan)))
-    live_change_pct = safe_float(row.get("live_change_pct", row.get("Live_Change_%", np.nan)))
-    live_volume = safe_float(row.get("live_volume", row.get("Live_Volume", 0)), 0.0)
-    market_cap = safe_float(row.get("market_cap", row.get("MarketCap", np.nan)))
-    tv_rvol = safe_float(row.get("tv_rvol", np.nan))
-    float_shares = safe_float(row.get("float_shares", np.nan))
-
-    f = None
-    feature_reason = ""
-    if daily_df is not None and not daily_df.empty and intraday_df is not None and not intraday_df.empty:
-        f, feature_reason = v17_compute_candidate_features(
-            row,
-            daily_df=daily_df,
-            intraday_df=intraday_df,
-            preferred_session=preferred_session,
-        )
-
-    if f:
-        active_price = f.get("active_price", live_price)
-        live_price = active_price if pd.notna(active_price) else live_price
-        live_change_pct = f.get("change_vs_prev_close_pct", live_change_pct)
-        live_volume = max(live_volume, f.get("active_volume", 0.0), f.get("regular_volume", 0.0), f.get("premarket_volume", 0.0), f.get("afterhours_volume", 0.0))
-        market_cap = f.get("market_cap", market_cap)
-        active_session = f.get("active_session", row.get("change_source", "unknown"))
-        active_vwap = f.get("active_vwap", np.nan)
-        above_vwap = bool(f.get("above_active_vwap", False))
-        high_drop = safe_float(f.get("price_to_active_high_pct", np.nan))
-        range_pos = safe_float(f.get("active_range_position", np.nan))
-        last6_burst = safe_float(f.get("last6_volume_burst", np.nan))
-        buy_pressure = safe_float(f.get("buy_pressure_ratio", np.nan))
-        green_ratio = safe_float(f.get("last6_green_ratio", np.nan))
-        active_vol_daily = safe_float(f.get("active_volume_to_daily_pct", np.nan))
-        dollar_volume = safe_float(f.get("dollar_volume", np.nan))
-    else:
-        active_session = row.get("change_source", "TV")
-        active_vwap = np.nan
-        above_vwap = False
-        high_drop = np.nan
-        range_pos = np.nan
-        last6_burst = np.nan
-        buy_pressure = np.nan
-        green_ratio = np.nan
-        active_vol_daily = np.nan
-        dollar_volume = live_price * live_volume if pd.notna(live_price) else np.nan
-
-    guard = microcap_trap_guard(
-        symbol=symbol,
-        description=description,
-        market_cap=market_cap,
-        price=live_price,
-        price_to_high_pct=high_drop,
-        below_vwap=bool(pd.notna(active_vwap) and live_price < active_vwap),
-        change_pct=live_change_pct,
-    )
-    acc = v20_accumulation_score_from_daily(daily_df) if daily_df is not None and not daily_df.empty else v20_accumulation_score_from_daily(pd.DataFrame())
-
-    change_score = v17_score_linear(live_change_pct, 20, 250) if pd.notna(live_change_pct) else 0.0
-    if pd.notna(live_change_pct) and live_change_pct >= 300:
-        change_score = 100.0
-    volume_score = min(100.0, max(0.0, np.log10(max(live_volume, 1.0)) * 12.5 - 25.0))
-    dollar_score = min(100.0, max(0.0, np.log10(max(dollar_volume if pd.notna(dollar_volume) else 1.0, 1.0)) * 13.0 - 45.0))
-    rvol_score = v17_score_linear(tv_rvol, 1.5, 10.0) if pd.notna(tv_rvol) else 0.0
-    near_high_score = 0.0
-    if pd.notna(high_drop):
-        if high_drop >= -3: near_high_score = 100.0
-        elif high_drop >= -10: near_high_score = 70.0
-        elif high_drop >= -20: near_high_score = 35.0
-        else: near_high_score = 0.0
-    elif pd.notna(range_pos):
-        near_high_score = v17_score_linear(range_pos, 0.45, 0.95)
-
-    tape_score = 0.0
-    if pd.notna(last6_burst):
-        tape_score += min(38.0, last6_burst * 8.0)
-    if pd.notna(active_vol_daily):
-        tape_score += min(22.0, active_vol_daily * 0.9)
-    if pd.notna(buy_pressure):
-        tape_score += v17_score_linear(buy_pressure, 0.50, 0.75) * 0.20
-    if pd.notna(green_ratio):
-        tape_score += v17_score_linear(green_ratio, 0.45, 0.85) * 0.12
-    if above_vwap:
-        tape_score += 12.0
-    tape_score = float(max(0.0, min(100.0, tape_score)))
-
-    explosion_score = (
-        0.32 * change_score
-        + 0.19 * volume_score
-        + 0.15 * dollar_score
-        + 0.13 * rvol_score
-        + 0.13 * tape_score
-        + 0.08 * near_high_score
-    )
-    ignition_score = (
-        0.45 * explosion_score
-        + 0.25 * tape_score
-        + 0.15 * acc.get("Accumulation_Score", 0.0)
-        + 0.15 * near_high_score
-    )
-    explosion_score = round(float(max(0, min(100, explosion_score))), 1)
-    ignition_score = round(float(max(0, min(100, ignition_score))), 1)
-
-    risk_flags = []
-    if guard["decision"] != "PASS":
-        risk_flags.append(guard["decision"])
-    if guard.get("china_hk_risk"):
-        risk_flags.append("CHINA_HK_CAYMAN_RISK")
-    if pd.notna(market_cap) and market_cap < 100_000_000:
-        risk_flags.append("MICRO_OR_NANOCAP")
-    if pd.notna(float_shares) and float_shares > 0 and float_shares < 5_000_000:
-        risk_flags.append("LOW_FLOAT_PROXY")
-    if pd.notna(live_change_pct) and live_change_pct >= 300:
-        risk_flags.append("300%+ EXTREME MOVE")
-    elif pd.notna(live_change_pct) and live_change_pct >= 100:
-        risk_flags.append("100%+ EXTREME MOVE")
-    if pd.notna(high_drop) and high_drop <= -25:
-        risk_flags.append("HIGH_FADE")
-    if not above_vwap and f:
-        risk_flags.append("VWAP_NOT_CONFIRMED")
-
-    # v21: hedef, sadece patlamışları değil; patlama öncesi birikimi ve erken ateşlemeyi ayırmak.
-    early_change_score = v17_score_linear(live_change_pct, 5.0, 60.0) if pd.notna(live_change_pct) else 0.0
-    pre_ignition_score = round(float(max(0, min(100,
-        0.55 * acc.get("Accumulation_Score", 0.0)
-        + 0.20 * acc.get("Absorption_Score", 0.0)
-        + 0.10 * rvol_score
-        + 0.10 * near_high_score
-        + 0.05 * dollar_score
-    ))), 1)
-
-    early_ignition_score = round(float(max(0, min(100,
-        0.30 * tape_score
-        + 0.20 * near_high_score
-        + 0.20 * early_change_score
-        + 0.15 * acc.get("Accumulation_Score", 0.0)
-        + 0.10 * dollar_score
-        + 0.05 * rvol_score
-        + (6.0 if above_vwap else 0.0)
-    ))), 1)
-
-    already_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 100)
-    extreme_exploded = bool(pd.notna(live_change_pct) and live_change_pct >= 300)
-    early_window = bool(pd.notna(live_change_pct) and 5.0 <= live_change_pct <= 80.0)
-    ideal_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 60.0)
-    high_fade_bad = bool(pd.notna(high_drop) and high_drop <= -25.0)
-    high_fade_failed = bool(pd.notna(high_drop) and high_drop <= -35.0)
-    no_chase_reason = []
-    if already_exploded:
-        no_chase_reason.append("already +100% extended / no fresh buy")
-    if high_fade_bad:
-        no_chase_reason.append("high'dan sert fade")
-    if guard["decision"] == "HARD_REJECT":
-        no_chase_reason.append("microcap/trap hard reject")
-
-    ready_trigger = bool(
-        ideal_early_window
-        and early_ignition_score >= 72
-        and tape_score >= 55
-        and above_vwap
-        and (pd.isna(high_drop) or high_drop >= -10)
-    )
-
-    # v21.2: Tradable Supernova Gate
-    # Amaç: TDIC'i 20$'da kovalamak değil; KULR/TDIC erken evresi gibi
-    # +8/+20/+40 bölgesinde, VWAP üstü, tepeye yakın ve hacim/tape akışı güçlü olanları
-    # PAPER_READY_SUPERNOVA olarak ayırmak.
-    supernova_early_window = bool(pd.notna(live_change_pct) and 8.0 <= live_change_pct <= 60.0)
-    supernova_not_chase = bool(not already_exploded and not high_fade_bad)
-    supernova_near_high_ok = bool((pd.isna(high_drop) or high_drop >= -8.0) and (pd.isna(range_pos) or range_pos >= 0.72))
-    supernova_liquidity_ok = bool(
-        (pd.notna(live_volume) and live_volume >= 100_000)
-        and (pd.notna(dollar_volume) and dollar_volume >= 3_000_000)
-    )
-    supernova_guard_ok = guard["decision"] in ["PASS", "STRICT_REVIEW", "LAB_ONLY"]
-    supernova_hard_block = bool(guard["decision"] == "HARD_REJECT" or high_fade_failed or not above_vwap)
-    # Stop mesafesi geniş ise fresh supernova buy yok; risk engine ayrıca denetler.
-    supernova_stop_distance_ok = True
-
-    chase_risk = 0.0
-    if pd.notna(live_change_pct):
-        if live_change_pct >= 300:
-            chase_risk += 45
-        elif live_change_pct >= 150:
-            chase_risk += 32
-        elif live_change_pct >= 100:
-            chase_risk += 22
-        elif live_change_pct >= 80:
-            chase_risk += 12
-    if pd.notna(high_drop):
-        if high_drop <= -35:
-            chase_risk += 35
-        elif high_drop <= -25:
-            chase_risk += 25
-        elif high_drop <= -15:
-            chase_risk += 12
-        elif high_drop <= -8:
-            chase_risk += 6
-    if not above_vwap and f:
-        chase_risk += 22
-    if guard["decision"] == "HARD_REJECT":
-        chase_risk += 18
-    elif guard["decision"] == "LAB_ONLY":
-        chase_risk += 10
-    elif guard["decision"] == "STRICT_REVIEW":
-        chase_risk += 6
-    chase_risk = round(float(max(0, min(100, chase_risk))), 1)
-
-    supernova_tradability_score = round(float(max(0, min(100,
-        0.26 * tape_score
-        + 0.23 * early_ignition_score
-        + 0.16 * near_high_score
-        + 0.14 * dollar_score
-        + 0.10 * acc.get("Accumulation_Score", 0.0)
-        + 0.06 * rvol_score
-        + (5.0 if above_vwap else 0.0)
-        - 0.22 * chase_risk
-    ))), 1)
-
-    # v21.4 Late Entry Guard:
-    # KULR vakasında model 4.04 civarı erken sinyal verdi, ancak 4.45 geç giriş zarar yazdı.
-    # Bu nedenle VWAP/reclaim bazlı teorik trigger'dan %5-8 fazla uzaklaşmış ve TP0 alanına
-    # yaklaşmış/geçmiş hisselerde yeni giriş artık FRESH_BUY değil, PULLBACK_ONLY olur.
-    base_trigger_price = np.nan
-    if pd.notna(active_vwap) and active_vwap > 0:
-        base_trigger_price = active_vwap * 1.003
-    elif pd.notna(live_price) and live_price > 0:
-        base_trigger_price = live_price
-    fresh_entry_max = base_trigger_price * 1.05 if pd.notna(base_trigger_price) else np.nan
-    ideal_pullback_zone_low = base_trigger_price * 0.995 if pd.notna(base_trigger_price) else np.nan
-    ideal_pullback_zone_high = base_trigger_price * 1.03 if pd.notna(base_trigger_price) else np.nan
-    late_entry_pct = ((live_price - base_trigger_price) / base_trigger_price * 100.0) if pd.notna(live_price) and pd.notna(base_trigger_price) and base_trigger_price > 0 else np.nan
-    # v22.1: TP0 already reached kontrolü trigger/planned entry üzerinden üretilen standart TP0'a bakar.
-    preliminary_stop_for_trigger = np.nan
-    if pd.notna(base_trigger_price):
-        prelim_stops = []
-        if pd.notna(active_vwap):
-            prelim_stops.append(active_vwap * 0.985)
-        prelim_stops.append(base_trigger_price * 0.92)
-        prelim_stops = [s for s in prelim_stops if pd.notna(s) and 0 < s < base_trigger_price]
-        preliminary_stop_for_trigger = max(prelim_stops) if prelim_stops else base_trigger_price * 0.92
-    preliminary_targets = v22_standard_targets(base_trigger_price, preliminary_stop_for_trigger) if pd.notna(base_trigger_price) else {}
-    tp0_from_trigger = preliminary_targets.get("TP0", np.nan)
-    tp0_already_reached_from_trigger = bool(pd.notna(live_price) and pd.notna(tp0_from_trigger) and live_price >= tp0_from_trigger)
-    late_entry_hard = bool(pd.notna(late_entry_pct) and (late_entry_pct >= 8.0 or (late_entry_pct >= 5.0 and tp0_already_reached_from_trigger)))
-    late_entry_soft = bool(pd.notna(late_entry_pct) and 5.0 <= late_entry_pct < 8.0 and not late_entry_hard)
-    if late_entry_hard:
-        late_entry_warning = "LATE_ENTRY_NO_FRESH_BUY"
-        late_entry_action = "Geç giriş: yeni alım yok; sadece VWAP/trigger pullback + reclaim gelirse paper düşün"
-    elif late_entry_soft:
-        late_entry_warning = "LATE_ENTRY_PULLBACK_ONLY"
-        late_entry_action = "Trigger'dan uzak; marketten kovalamak yerine pullback/retest bekle"
-    else:
-        late_entry_warning = "FRESH_ENTRY_OK"
-        late_entry_action = "Trigger'a yakın; yine de 5-15dk hold şart"
-
-    paper_ready_supernova_raw = bool(
-        supernova_early_window
-        and supernova_not_chase
-        and supernova_near_high_ok
-        and supernova_liquidity_ok
-        and supernova_guard_ok
-        and not supernova_hard_block
-        and tape_score >= 70
-        and early_ignition_score >= 68
-        and supernova_tradability_score >= 62
-        and (
-            pd.isna(preliminary_targets.get("Stop_Distance_%", np.nan))
-            or preliminary_targets.get("Stop_Distance_%", np.nan) <= V22_MAX_STOP_DISTANCE_PCT
-        )
-    )
-    paper_ready_supernova = bool(paper_ready_supernova_raw and not late_entry_hard and not late_entry_soft)
-    late_entry_supernova = bool(paper_ready_supernova_raw and (late_entry_hard or late_entry_soft))
-
-    tiny_ready_supernova = bool(
-        paper_ready_supernova
-        and guard["decision"] in ["PASS", "STRICT_REVIEW"]
-        and chase_risk <= 35
-        and supernova_tradability_score >= 70
-    )
-
-    if extreme_exploded:
-        signal = "ALREADY_EXPLODED_SUPERNOVA"
-        stage = "ALREADY_EXPLODED_NO_CHASE"
-    elif high_fade_failed:
-        signal = "FAILED_RUNNER_NO_CHASE"
-        stage = "FAILED_RUNNER"
-    elif paper_ready_supernova:
-        signal = "PAPER_READY_SUPERNOVA"
-        stage = "TRADABLE_SUPERNOVA_READY"
-    elif late_entry_supernova:
-        signal = "LATE_ENTRY_PULLBACK_ONLY"
-        stage = "LATE_ENTRY_NO_FRESH_BUY"
-    elif ready_trigger:
-        signal = "READY_TRIGGER"
-        stage = "EARLY_IGNITION_READY"
-    elif early_window and early_ignition_score >= 65 and tape_score >= 45:
-        signal = "EARLY_IGNITION"
-        stage = "EARLY_IGNITION_WATCH"
-    elif pre_ignition_score >= 72 and (pd.isna(live_change_pct) or live_change_pct < 25):
-        signal = "PRE_IGNITION_WATCH"
-        stage = "PRE_IGNITION"
-    elif acc.get("Accumulation_Score", 0.0) >= 70 and pd.notna(live_change_pct) and live_change_pct >= 15:
-        signal = "ACCUMULATION_IGNITION"
-        stage = "ACCUMULATION_TO_IGNITION"
-    elif already_exploded:
-        signal = "ALREADY_EXPLODED"
-        stage = "ALREADY_EXPLODED_NO_CHASE"
-    elif explosion_score >= 65:
-        signal = "EXPLOSIVE_RUNNER_RADAR"
-        stage = "EXPLOSIVE_RADAR"
-    elif acc.get("Accumulation_Score", 0.0) >= 70:
-        signal = "SILENT_ACCUMULATION_WATCH"
-        stage = "PRE_IGNITION"
-    else:
-        signal = "WATCH"
-        stage = "WATCH"
-
-    if high_fade_failed:
-        trade_status = "NO_TRADE_FAILED_RUNNER"
-    elif stage == "ALREADY_EXPLODED_NO_CHASE" or guard["decision"] == "HARD_REJECT":
-        trade_status = "RADAR_ONLY_EXTREME_RISK"
-    elif paper_ready_supernova and guard["decision"] == "PASS":
-        trade_status = "PAPER_READY_SUPERNOVA"
-    elif paper_ready_supernova:
-        trade_status = "PAPER_READY_SUPERNOVA_RISK_TAGGED"
-    elif late_entry_supernova:
-        trade_status = "LATE_ENTRY_PULLBACK_ONLY"
-    elif ready_trigger and guard["decision"] == "PASS":
-        trade_status = "PAPER_READY_CONFIRM_ONLY"
-    elif ready_trigger:
-        trade_status = "RADAR_ONLY_RISK_TAGGED"
-    elif stage in ["EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"]:
-        trade_status = "PAPER_WATCH_RECLAIM_ONLY" if guard["decision"] == "PASS" else "LAB_ONLY_RISK_TAGGED"
-    elif stage == "PRE_IGNITION":
-        trade_status = "WATCH_ONLY_PRE_IGNITION"
-    elif guard["decision"] in ["LAB_ONLY", "STRICT_REVIEW"]:
-        trade_status = "LAB_ONLY_NO_MAIN_TRADE"
-    else:
-        trade_status = "WATCH_ONLY"
-
-    v21_action = {
-        "PAPER_READY_SUPERNOVA": "Alinabilir supernova paper adayi: 5-15dk VWAP/entry ustu tutunma + stop zorunlu",
-        "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Alinabilir ama risk etiketli supernova: sadece paper/mikro risk, onay bekle",
-        "LATE_ENTRY_PULLBACK_ONLY": "Geç giriş: marketten kovalamak yok; pullback + reclaim bekle",
-        "PAPER_READY_CONFIRM_ONLY": "Paper icin bile 5-15dk VWAP/entry ustu tutunma bekle",
-        "RADAR_ONLY_RISK_TAGGED": "Erken atesleme var ama risk etiketi nedeniyle ana trade yok",
-        "PAPER_WATCH_RECLAIM_ONLY": "Reclaim/VWAP teyidi gelirse paper izle",
-        "LAB_ONLY_RISK_TAGGED": "Riskli erken hareket; sadece lab/paper gozlem",
-        "WATCH_ONLY_PRE_IGNITION": "Patlama oncesi havuza al; canli ignition bekle",
-        "RADAR_ONLY_EXTREME_RISK": "Goruldu ama kovalama yok",
-        "NO_TRADE_FAILED_RUNNER": "Failed runner; islem yok",
-    }.get(trade_status, "Izle / teyit bekle")
-
-    entry_reclaim = np.nan
-    if pd.notna(base_trigger_price):
-        entry_reclaim = base_trigger_price
-    elif pd.notna(live_price):
-        entry_reclaim = live_price
-        if pd.notna(active_vwap):
-            entry_reclaim = max(entry_reclaim, active_vwap * 1.003)
-    # v22.1: Supernova hedefleri geç kalmış live_price üzerinden değil,
-    # trigger/planned_entry üzerinden hesaplanır. Stop en yakın makul invalidation olmalıdır.
-    planned_supernova_entry = entry_reclaim if pd.notna(entry_reclaim) else live_price
-    emergency_stop = np.nan
-    if pd.notna(planned_supernova_entry):
-        stop_candidates = []
-        if pd.notna(active_vwap):
-            stop_candidates.append(active_vwap * 0.985)
-        if pd.notna(live_price):
-            stop_candidates.append(live_price * 0.90)
-        stop_candidates.append(planned_supernova_entry * 0.92)
-        valid_stops = [s for s in stop_candidates if pd.notna(s) and 0 < s < planned_supernova_entry]
-        emergency_stop = max(valid_stops) if valid_stops else planned_supernova_entry * 0.92
-        emergency_stop = round(emergency_stop, v17_price_round(planned_supernova_entry))
-
-    std_targets_supernova = v22_standard_targets(planned_supernova_entry, emergency_stop)
-    tp0 = std_targets_supernova.get("TP0", np.nan)
-    tp15 = std_targets_supernova.get("TP15", np.nan)
-    tp30 = std_targets_supernova.get("Runner_TP30", np.nan)
-    trigger_price = planned_supernova_entry
-    kill_level = emergency_stop
-    if stage == "TRADABLE_SUPERNOVA_READY":
-        entry_mode = "VWAP_HOD_HOLD_OR_FIRST_PULLBACK" if above_vwap else "WAIT_VWAP_RECLAIM"
-    elif stage == "LATE_ENTRY_NO_FRESH_BUY":
-        entry_mode = "PULLBACK_RECLAIM_ONLY"
-    elif ready_trigger:
-        entry_mode = "WAIT_5_15MIN_HOLD"
-    elif stage == "ALREADY_EXPLODED_NO_CHASE":
-        entry_mode = "NO_CHASE"
-    elif stage == "FAILED_RUNNER":
-        entry_mode = "NO_TRADE"
-    else:
-        entry_mode = "WATCH_ONLY"
-
-    if trade_status == "PAPER_READY_SUPERNOVA":
-        position_risk_mode = "PAPER_ONLY_CONTROLLED"
-    elif trade_status == "PAPER_READY_SUPERNOVA_RISK_TAGGED":
-        position_risk_mode = "PAPER_ONLY_TINY_RISK"
-    elif trade_status == "LATE_ENTRY_PULLBACK_ONLY":
-        position_risk_mode = "NO_FRESH_BUY_PULLBACK_ONLY"
-    elif "NO_TRADE" in trade_status or "EXTREME" in trade_status:
-        position_risk_mode = "NO_MAIN_TRADE"
-    else:
-        position_risk_mode = "WATCH_OR_LAB"
-
-    supernova_action = {
-        "PAPER_READY_SUPERNOVA": "Paper alinabilir: Entry ustu 5-15dk tutunma, VWAP kaybi/kill level ile cikis",
-        "PAPER_READY_SUPERNOVA_RISK_TAGGED": "Sadece paper/mikro risk: guclu teyit olmadan giris yok",
-        "LATE_ENTRY_PULLBACK_ONLY": "Geç giriş: yeni alım yok; pullback + VWAP/trigger reclaim bekle",
-        "PAPER_READY_CONFIRM_ONLY": "Teyit bekle; entry ignesi yetmez",
-        "RADAR_ONLY_EXTREME_RISK": "Goruldu ama kovalama yok",
-        "NO_TRADE_FAILED_RUNNER": "Failed runner; islem yok",
-    }.get(trade_status, v21_action)
-
-    return {
-        "Symbol": symbol,
-        "Company": description,
-        "Signal": signal,
-        "Stage": stage,
-        "Trade_Status": trade_status,
-        "V21_Action": v21_action,
-        "Supernova_Action": supernova_action,
-        "Supernova_Tradability_Score": supernova_tradability_score,
-        "Chase_Risk": chase_risk,
-        "Late_Entry_%": round(late_entry_pct, 2) if pd.notna(late_entry_pct) else np.nan,
-        "Late_Entry_Warning": late_entry_warning,
-        "Late_Entry_Action": late_entry_action,
-        "Fresh_Entry_Max": round(fresh_entry_max, v17_price_round(fresh_entry_max)) if pd.notna(fresh_entry_max) else np.nan,
-        "Pullback_Reentry_Zone": (f"{round(ideal_pullback_zone_low, v17_price_round(ideal_pullback_zone_low))}-{round(ideal_pullback_zone_high, v17_price_round(ideal_pullback_zone_high))}" if pd.notna(ideal_pullback_zone_low) and pd.notna(ideal_pullback_zone_high) else "-"),
-        "TP0_Already_Reached_From_Trigger": bool(tp0_already_reached_from_trigger),
-        "Entry_Mode": entry_mode,
-        "Trigger_Price": round(trigger_price, v17_price_round(trigger_price)) if pd.notna(trigger_price) else np.nan,
-        "Kill_Level": kill_level,
-        "Position_Risk_Mode": position_risk_mode,
-        "Pre_Ignition_Score": pre_ignition_score,
-        "Early_Ignition_Score": early_ignition_score,
-        "Ready_Trigger": bool(ready_trigger),
-        "Already_Exploded": bool(already_exploded),
-        "No_Chase_Reason": "; ".join(no_chase_reason),
-        "Active_Session": active_session,
-        "Change_%": round(live_change_pct, 2) if pd.notna(live_change_pct) else np.nan,
-        "Price": round(live_price, v17_price_round(live_price)) if pd.notna(live_price) else np.nan,
-        "Live_Volume": int(live_volume) if pd.notna(live_volume) else 0,
-        "Dollar_Volume_M": round((dollar_volume or 0) / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
-        "MarketCap_M": round(market_cap / 1_000_000, 2) if pd.notna(market_cap) else np.nan,
-        "Float_M": round(float_shares / 1_000_000, 2) if pd.notna(float_shares) else np.nan,
-        "MarketCap_Bucket": guard["market_cap_bucket"],
-        "Origin_Risk": bool(guard.get("china_hk_risk")),
-        "Microcap_Decision": guard["decision"],
-        "Explosion_Score": explosion_score,
-        "Ignition_Score": ignition_score,
-        "Tape_Burst_Proxy": round(tape_score, 1),
-        "Accumulation_Score": acc.get("Accumulation_Score", 0.0),
-        "Absorption_Score": acc.get("Absorption_Score", 0.0),
-        "Range_Compression_%": acc.get("Range_Compression_%", np.nan),
-        "Volume_Without_Price_Move": acc.get("Volume_Without_Price_Move", np.nan),
-        "PreExplosion_Note": acc.get("PreExplosion_Note", ""),
-        "TV_RVOL": round(tv_rvol, 2) if pd.notna(tv_rvol) else np.nan,
-        "Last6_Volume_Burst": round(last6_burst, 2) if pd.notna(last6_burst) else np.nan,
-        "Active_Vol_to_Daily_%": round(active_vol_daily, 2) if pd.notna(active_vol_daily) else np.nan,
-        "Buy_Pressure": round(buy_pressure, 2) if pd.notna(buy_pressure) else np.nan,
-        "Above_VWAP": bool(above_vwap),
-        "High_to_Current_Drop_%": round(high_drop, 2) if pd.notna(high_drop) else np.nan,
-        "Range_Position": round(range_pos, 2) if pd.notna(range_pos) else np.nan,
-        "Reclaim_Entry_Only": round(entry_reclaim, v17_price_round(entry_reclaim)) if pd.notna(entry_reclaim) else np.nan,
-        "TP0_8pct": tp0,
-        "TP15": tp15,
-        "TP30": tp30,
-        "Emergency_Stop": emergency_stop,
-        "Risk_Flags": "; ".join(risk_flags) if risk_flags else "",
-        "Guard_Reasons": guard["reason_text"],
-        "Data_Status": row.get("data_status", ""),
-        "Feature_Status": "OK" if f else (feature_reason or "TV_ONLY"),
-    }
-
-
-def v20_scan_explosive_radar(
-    live_df: pd.DataFrame,
-    deep_intraday: bool,
-    deep_top_n: int,
-    preferred_session: str,
-    api_key_value: str,
-    secret_key_value: str,
-    alpaca_feed: str,
-) -> pd.DataFrame:
-    if live_df is None or live_df.empty:
-        return pd.DataFrame()
-
-    live_df = live_df.drop_duplicates(subset=["symbol"]).copy()
-    symbols = list(live_df["yahoo_symbol"].dropna().astype(str).unique())
-    daily_dict = download_daily_data_chunked(
-        symbols,
-        period="1y",
-        chunk_size=12,
-        pause=0.8,
-        alpaca_key=api_key_value,
-        alpaca_secret=secret_key_value,
-        alpaca_feed=alpaca_feed,
-    )
-
-    rows = []
-    score_preview = live_df.copy()
-    score_preview["_chg"] = score_preview["live_change_pct"].fillna(0)
-    score_preview["_vol"] = score_preview["live_volume"].fillna(0)
-    score_preview = score_preview.sort_values(["_chg", "_vol"], ascending=False)
-    deep_symbols = set(score_preview.head(int(deep_top_n))["symbol"].astype(str).tolist()) if deep_intraday else set()
-
-    for _, r in live_df.iterrows():
-        symbol = str(r.get("symbol", "")).upper()
-        ys = str(r.get("yahoo_symbol", normalize_symbol_for_yahoo(symbol)))
-        daily_df = daily_dict.get(ys, pd.DataFrame())
-        intraday_df = pd.DataFrame()
-        if deep_intraday and symbol in deep_symbols:
-            intraday_df = get_recent_intraday_full_data(
-                symbol,
-                ys,
-                api_key_value=api_key_value,
-                secret_key_value=secret_key_value,
-                alpaca_feed=alpaca_feed,
-            )
-        rows.append(v20_score_explosive_candidate(
-            r.to_dict(),
-            daily_df=daily_df,
-            intraday_df=intraday_df,
-            preferred_session=preferred_session,
-        ))
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    status_rank = {
-        "PAPER_READY_SUPERNOVA": 0,
-        "PAPER_READY_SUPERNOVA_RISK_TAGGED": 1,
-        "LATE_ENTRY_PULLBACK_ONLY": 2,
-        "PAPER_READY_CONFIRM_ONLY": 3,
-        "PAPER_WATCH_RECLAIM_ONLY": 4,
-        "WATCH_ONLY_PRE_IGNITION": 5,
-        "RADAR_ONLY_EXTREME_RISK": 6,
-        "NO_TRADE_FAILED_RUNNER": 7,
-    }
-    out["_status_rank"] = out.get("Trade_Status", pd.Series(index=out.index, dtype=str)).map(status_rank).fillna(4).astype(int)
-    sort_cols = [c for c in ["_status_rank", "Supernova_Tradability_Score", "Early_Ignition_Score", "Tape_Burst_Proxy", "Explosion_Score", "Change_%"] if c in out.columns]
-    asc = [True] + [False] * (len(sort_cols) - 1) if sort_cols else [False]
-    out = out.sort_values(sort_cols, ascending=asc).drop(columns=["_status_rank"], errors="ignore")
-    return out.reset_index(drop=True)
-
-
-def _v21_normalize_symbol_list(tickers: list[str]) -> list[str]:
-    """Tekilleştirilmiş, Yahoo uyumlu, boş/garip sembolleri temizlenmiş liste."""
-    out = []
-    seen = set()
-    for raw in tickers or []:
-        sym = normalize_symbol_for_yahoo(str(raw).strip().upper())
-        if not sym or sym in seen:
-            continue
-        # Basit bozuk ticker koruması
-        if len(sym) > 12 or " " in sym:
-            continue
-        seen.add(sym)
-        out.append(sym)
-    return out
-
-
-def _v21_sample_tickers_for_accumulation(
-    tickers: list[str],
-    max_tickers: int,
-    sample_mode: str = "daily_shuffle",
-    seed_offset: int = 0,
-) -> tuple[list[str], str]:
-    """Silent accumulation için alfabetik ilk N tuzağını kırar.
-
-    Eski sürümde CSV'nin ilk N sembolü alındığı için sonuçlar A harfine kilitlenebiliyordu.
-    Bu fonksiyon her gün deterministik shuffle yapar veya kullanıcı isterse tüm/ilk N tarar.
-    """
-    clean = _v21_normalize_symbol_list(tickers)
-    if not clean:
-        return [], "empty"
-
-    max_tickers = int(max(1, min(max_tickers, len(clean))))
-    mode = (sample_mode or "daily_shuffle").lower()
-
-    if mode == "first_n":
-        return clean[:max_tickers], f"first_n_{max_tickers}"
-
-    if mode == "full_then_limit":
-        # Pratikte yine max_tickers ile sınırlı; isim kullanıcıya geniş tarama niyetini gösterir.
-        return clean[:max_tickers], f"full_then_limit_{max_tickers}"
-
-    # Varsayılan: günlük deterministik karıştırma. Aynı gün aynı örnek; ertesi gün yeni örnek.
-    seed_base = int(datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")) + int(seed_offset)
-    series = pd.Series(clean)
-    sampled = series.sample(n=max_tickers, random_state=seed_base).tolist()
-    return sampled, f"daily_shuffle_seed_{seed_base}_n_{max_tickers}"
-
-
-def v20_scan_silent_accumulation_universe(
-    tickers: list[str],
-    max_tickers: int,
-    min_acc_score: float,
-    api_key_value: str,
-    secret_key_value: str,
-    alpaca_feed: str,
-    sample_mode: str = "daily_shuffle",
-    min_last_volume: int = 50_000,
-    min_dollar_volume: float = 500_000,
-    manual_symbols_text: str = "",
-) -> pd.DataFrame:
-    if not tickers and not manual_symbols_text:
-        return pd.DataFrame()
-
-    manual_syms = _v21_normalize_symbol_list(
-        str(manual_symbols_text or "").replace(";", ",").replace("\n", ",").split(",")
-    )
-    sample, sampling_note = _v21_sample_tickers_for_accumulation(
-        tickers=tickers,
-        max_tickers=int(max_tickers),
-        sample_mode=sample_mode,
-    )
-
-    # Manuel semboller her zaman örneğe zorla eklenir; TDIC/RXT/SOBR gibi geçmiş örnekleri kontrol için.
-    if manual_syms:
-        sample = list(dict.fromkeys(manual_syms + sample))[: max(int(max_tickers), len(manual_syms))]
-        sampling_note = sampling_note + f"; manual_forced={','.join(manual_syms[:10])}"
-
-    if not sample:
-        return pd.DataFrame()
-
-    daily_dict = download_daily_data_chunked(
-        sample,
-        period="1y",
-        chunk_size=15,
-        pause=0.6,
-        alpaca_key=api_key_value,
-        alpaca_secret=secret_key_value,
-        alpaca_feed=alpaca_feed,
-    )
-    rows = []
-    low_liq_rows = []
-    for ys, df in daily_dict.items():
-        acc = v20_accumulation_score_from_daily(df)
-        if acc.get("Accumulation_Score", 0) >= float(min_acc_score):
-            last_price = np.nan
-            last_vol = 0
-            dollar_volume = np.nan
-            try:
-                last_price = float(df["Close"].dropna().iloc[-1])
-                last_vol = float(df["Volume"].fillna(0).iloc[-1])
-                dollar_volume = float(last_price * last_vol) if pd.notna(last_price) else np.nan
-            except Exception:
-                pass
-
-            liquidity_ok = (
-                pd.notna(last_price)
-                and float(last_vol) >= float(min_last_volume)
-                and pd.notna(dollar_volume)
-                and float(dollar_volume) >= float(min_dollar_volume)
-            )
-            base_row = {
-                "Symbol": ys.replace("-", "."),
-                "Price": round(last_price, v17_price_round(last_price)) if pd.notna(last_price) else np.nan,
-                "Last_Volume": int(last_vol),
-                "Dollar_Volume_M": round(float(dollar_volume) / 1_000_000, 3) if pd.notna(dollar_volume) else np.nan,
-                "Liquidity_OK": bool(liquidity_ok),
-                "Liquidity_Filter": f"LastVol>={int(min_last_volume):,}; DollarVol>={int(min_dollar_volume):,}",
-                "Sampling_Note": sampling_note,
-                **acc,
-                "Signal": "SILENT_ACCUMULATION_WATCH" if liquidity_ok else "LOW_LIQUIDITY_ACCUMULATION_SUPPRESSED",
-                "Trade_Status": "WATCH_ONLY_PRE_IGNITION" if liquidity_ok else "LOW_LIQUIDITY_NO_TRADE",
-            }
-            if liquidity_ok:
-                rows.append(base_row)
-            else:
-                low_liq_rows.append(base_row)
-
-    out = pd.DataFrame(rows)
-    low = pd.DataFrame(low_liq_rows)
-
-    if not out.empty:
-        out = out.sort_values(["Accumulation_Score", "Absorption_Score", "Dollar_Volume_M"], ascending=False).reset_index(drop=True)
-
-    # Düşük likiditeliler tamamen kaybolmasın; ana listenin altına NO_TRADE olarak eklenir.
-    # Kullanıcı CSV'de neden eski A-harfli düşük hacimli adayların dışlandığını görebilsin.
-    if not low.empty:
-        low = low.sort_values(["Accumulation_Score", "Absorption_Score"], ascending=False).reset_index(drop=True)
-        if out.empty:
-            return low
-        return pd.concat([out, low.head(50)], ignore_index=True)
-
-    return out
-
-
-def render_v20_explosive_runner_tab():
-    st.subheader("🚀 v21.4 Pre-Ignition + Tradable Supernova Gate")
-    st.info(
-        "Bu modül alım motoru değildir. Amaç TDIC gibi hisseleri yalnızca +600 olduktan sonra değil, "
-        "+5/+10/+20 erken ateşleme aşamasında veya sessiz birikim evresinde görünür yapmaktır. "
-        "v21.4 ile erken ateşleme içinde alınabilir süpernova sınıfı ayrıca ayrılır; geç giriş uyarısı ve VIVO-pattern takibi eklenir; "
-        "TDIC gibi geç kalınmış hareketler No-Chase, KULR benzeri erken ve sağlam yapılar Paper-Ready olarak görünür."
-    )
-
-    active = get_active_session_et()
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        session_choice = st.selectbox(
-            "Seans",
-            ["auto", "premarket", "regular", "afterhours"],
-            index=0,
-            key="v20_session",
-            help="auto: ABD saatine göre aktif seansı seçer. Regular açıkken TDIC tipi patlamalar için regular kullanılır.",
-        )
-    with c2:
-        max_records = st.slider("TV evren genişliği", 50, 1000, V20_EXPLOSIVE_DEFAULT_MAX_RECORDS, 50, key="v20_max_records")
-    with c3:
-        min_change = st.slider("Min canlı değişim (%)", 5.0, 300.0, V20_EXPLOSIVE_DEFAULT_MIN_CHANGE, 5.0, key="v20_min_change")
-    with c4:
-        min_volume = st.number_input("Min canlı hacim", 10_000, 50_000_000, V20_EXPLOSIVE_DEFAULT_MIN_VOLUME, 50_000, key="v20_min_volume")
-
-    c5, c6, c7, c8 = st.columns(4)
-    with c5:
-        ignore_price = st.checkbox("Fiyat filtresini kaldır", value=True, key="v20_ignore_price")
-    with c6:
-        min_price = st.number_input("Min fiyat", 0.01, 1000.0, 0.01, 0.01, key="v20_min_price")
-    with c7:
-        max_price = st.number_input("Max fiyat", 0.01, 5000.0, 1000.0, 1.0, key="v20_max_price")
-    with c8:
-        deep_intraday = st.checkbox("Top adaylarda tape/VWAP derin teyit", value=True, key="v20_deep_intraday")
-
-    c9, c10 = st.columns([1, 3])
-    with c9:
-        deep_top_n = st.slider("Derin teyit top N", 5, 75, V20_TAPE_DEEP_TOP_N, 5, key="v20_deep_top_n")
-    with c10:
-        manual_symbols = st.text_input("Manuel sembol ekle (opsiyonel, örn: TDIC,CLIK,RXT)", value="", key="v20_manual_symbols")
-
-    st.caption(f"Aktif ABD seansı: **{active.upper()}** | Kullanılacak seans: **{v20_resolve_session(session_choice).upper()}**")
-
-    if st.button("🚀 Explosive Runner Radar'ı Çalıştır", key="btn_v20_explosive"):
-        used_session = v20_resolve_session(session_choice)
-        with st.spinner("TradingView canlı mover evreni çekiliyor..."):
-            live_df = v20_fetch_live_explosive_universe(
-                session_name=session_choice,
-                max_records=max_records,
-                min_live_change_pct=min_change,
-                min_volume=min_volume,
-                min_price=min_price,
-                max_price=max_price,
-                ignore_price_filter=ignore_price,
-            )
-            man_df = v20_manual_symbol_candidates(manual_symbols)
-            if man_df is not None and not man_df.empty:
-                live_df = pd.concat([live_df, man_df], ignore_index=True).drop_duplicates(subset=["symbol"], keep="first")
-
-        if live_df is None or live_df.empty:
-            st.warning("Explosive evren boş döndü. Min değişim/hacim eşiğini düşür veya seansı kontrol et.")
-        else:
-            st.success(f"Canlı explosive evren: {len(live_df)} sembol")
-            with st.spinner("Günlük veri + opsiyonel tape/VWAP teyidi hesaplanıyor..."):
-                scored = v20_scan_explosive_radar(
-                    live_df=live_df,
-                    deep_intraday=deep_intraday,
-                    deep_top_n=deep_top_n,
-                    preferred_session=used_session,
-                    api_key_value=api_key,
-                    secret_key_value=secret_key,
-                    alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                )
-            if scored.empty:
-                st.warning("Skorlanan explosive aday çıkmadı.")
-            else:
-                st.metric("Explosive aday", len(scored))
-                top_cols = [
-                    "Symbol", "Signal", "Stage", "Trade_Status", "V21_Action", "Supernova_Action", "Active_Session", "Change_%", "Price", "Live_Volume",
-                    "Dollar_Volume_M", "MarketCap_M", "Float_M", "Supernova_Tradability_Score", "Chase_Risk",
-                    "Late_Entry_%", "Late_Entry_Warning", "Fresh_Entry_Max", "Pullback_Reentry_Zone",
-                    "Pre_Ignition_Score", "Early_Ignition_Score",
-                    "Explosion_Score", "Ignition_Score", "Tape_Burst_Proxy", "Accumulation_Score", "Above_VWAP", "High_to_Current_Drop_%",
-                    "Entry_Mode", "Trigger_Price", "Kill_Level", "Position_Risk_Mode", "Reclaim_Entry_Only", "TP0_8pct", "TP15", "TP30", "Emergency_Stop", "Ready_Trigger", "Already_Exploded", "No_Chase_Reason", "Risk_Flags",
-                ]
-                top_cols = [c for c in top_cols if c in scored.columns]
-
-                supernova_ready = scored[scored["Trade_Status"].astype(str).str.contains("PAPER_READY_SUPERNOVA", na=False)].copy() if "Trade_Status" in scored.columns else pd.DataFrame()
-                early = scored[scored["Stage"].isin(["TRADABLE_SUPERNOVA_READY", "EARLY_IGNITION_READY", "EARLY_IGNITION_WATCH", "ACCUMULATION_TO_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
-                pre = scored[scored["Stage"].isin(["PRE_IGNITION"])].copy() if "Stage" in scored.columns else pd.DataFrame()
-                no_chase = scored[scored["Stage"].astype(str).str.contains("ALREADY_EXPLODED|FAILED_RUNNER", na=False)].copy() if "Stage" in scored.columns else pd.DataFrame()
-                late_entry = scored[scored["Trade_Status"].astype(str).str.contains("LATE_ENTRY", na=False)].copy() if "Trade_Status" in scored.columns else pd.DataFrame()
-                traps = scored[scored["Trade_Status"].astype(str).str.contains("EXTREME|FAILED|LAB_ONLY|NO_TRADE", na=False)].copy()
-
-                st.markdown("### ✅ Paper-Ready Supernova — alınabilir erken süpernova adayı")
-                if supernova_ready.empty:
-                    st.info("Paper-ready supernova yok. Bu iyi olabilir; geç kalınmış/bozulmuş hareketleri kovalamıyoruz.")
-                else:
-                    st.dataframe(supernova_ready[top_cols].head(50), use_container_width=True)
-
-                st.markdown("### 🟡 Late Entry Guard — iyi hisse ama taze giriş kaçmış olabilir")
-                if late_entry.empty:
-                    st.write("Late-entry uyarısı yok.")
-                else:
-                    st.dataframe(late_entry[top_cols + [c for c in ["Late_Entry_Action", "Data_Status", "Feature_Status"] if c in late_entry.columns]].head(100), use_container_width=True)
-
-                st.markdown("### ⚡ Early Ignition / Ready Trigger — patlamadan önce/erken yakalama")
-                if early.empty:
-                    st.info("Erken ateşleme adayı yok. Min değişimi 5-10 aralığına indirip evreni büyütebilirsin.")
-                else:
-                    st.dataframe(early[top_cols].head(100), use_container_width=True)
-
-                st.markdown("### 🧊 Pre-Ignition / Silent Accumulation — henüz patlamadan havuz")
-                if pre.empty:
-                    st.write("Pre-ignition adayı bu canlı evrende yok. Aşağıdaki Silent Accumulation Scanner ile geniş evren taranabilir.")
-                else:
-                    st.dataframe(pre[top_cols + [c for c in ["PreExplosion_Note", "Data_Status", "Feature_Status"] if c in pre.columns]].head(100), use_container_width=True)
-
-                st.markdown("### 🚫 Already Exploded / No-Chase — görüldü ama kovalama yok")
-                if no_chase.empty:
-                    st.write("No-chase tablosu boş.")
-                else:
-                    st.dataframe(no_chase[top_cols + [c for c in ["Guard_Reasons", "PreExplosion_Note", "Data_Status", "Feature_Status"] if c in no_chase.columns]].head(100), use_container_width=True)
-
-                st.markdown("### ⛔ Risk / Trap Board — görüldü ama temiz alım değil")
-                if traps.empty:
-                    st.write("Risk/trap tablosu boş.")
-                else:
-                    st.dataframe(traps[top_cols + [c for c in ["Guard_Reasons", "PreExplosion_Note", "Data_Status", "Feature_Status"] if c in traps.columns]].head(100), use_container_width=True)
-
-                st.markdown("### 📊 Tüm v21 skorlar")
-                st.dataframe(scored, use_container_width=True)
-                st.download_button(
-                    "📥 v21 erken ateşleme skorlarını CSV indir",
-                    data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_4_tradable_supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_v20_explosive_csv",
-                )
-
-    st.divider()
-    st.markdown("### 🧊 Sessiz Birikim / Absorption taraması (opsiyonel, ağır olabilir)")
-    st.caption("Patlamadan önce fiyat yatayken hacim/OBV birikimi arar. Bu modül canlı explosion değil, ön radar üretir.")
-    csv_file = st.file_uploader("Ticker CSV yükle (opsiyonel)", type=["csv"], key="v20_acc_csv")
-    csv_col = st.text_input("CSV sembol kolonu (boş=otomatik)", value="", key="v20_acc_col")
-    acc_max = st.number_input("Max ticker tarama", 50, 5000, 500, 50, key="v20_acc_max")
-    acc_min_score = st.slider("Min Accumulation Score", 40.0, 95.0, 70.0, 5.0, key="v20_acc_min_score")
-    acc_c1, acc_c2, acc_c3, acc_c4 = st.columns(4)
-    with acc_c1:
-        acc_sample_mode = st.selectbox(
-            "Evren örnekleme",
-            ["daily_shuffle", "first_n"],
-            index=0,
-            key="v21_acc_sample_mode",
-            help="daily_shuffle alfabetik ilk N sorununu çözer; her gün farklı ama aynı gün deterministik örneklem üretir.",
-        )
-    with acc_c2:
-        acc_min_last_vol = st.number_input("Min son gün hacmi", 0, 50_000_000, 50_000, 10_000, key="v21_acc_min_last_vol")
-    with acc_c3:
-        acc_min_dollar_vol = st.number_input("Min son gün dolar hacmi", 0, 100_000_000, 500_000, 100_000, key="v21_acc_min_dollar_vol")
-    with acc_c4:
-        acc_manual_symbols = st.text_input("Zorunlu sembol kontrolü", value="", key="v21_acc_manual_symbols", help="Örn: TDIC,RXT,SOBR. Bu semboller shuffle örneğine ayrıca eklenir.")
-
-    if st.button("🧊 Silent Accumulation Scanner'ı Çalıştır", key="btn_v20_accumulation"):
-        tickers = []
-        source = ""
-        if csv_file is not None:
-            try:
-                df_csv = pd.read_csv(csv_file)
-                cols = list(df_csv.columns)
-                chosen = csv_col.strip() if csv_col.strip() in cols else None
-                if chosen is None:
-                    for c in cols:
-                        if str(c).lower() in ["symbol", "ticker", "name"]:
-                            chosen = c
-                            break
-                if chosen is None:
-                    chosen = cols[0]
-                tickers = df_csv[chosen].astype(str).str.upper().str.strip().dropna().unique().tolist()
-                source = f"Yüklenen CSV / kolon: {chosen}"
-            except Exception as exc:
-                st.error(f"CSV okunamadı: {exc}")
-        else:
-            tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", csv_col.strip() or None)
-            source = "Repo nasdaq_nyse_tickers.csv"
-
-        if not tickers:
-            st.warning("Ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
-        else:
-            with st.spinner(f"Silent accumulation taranıyor... Kaynak: {source}; örnekleme: {acc_sample_mode}; ticker: {min(len(tickers), int(acc_max))}"):
-                acc_df = v20_scan_silent_accumulation_universe(
-                    tickers=tickers,
-                    max_tickers=int(acc_max),
-                    min_acc_score=float(acc_min_score),
-                    api_key_value=api_key,
-                    secret_key_value=secret_key,
-                    alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                    sample_mode=acc_sample_mode,
-                    min_last_volume=int(acc_min_last_vol),
-                    min_dollar_volume=float(acc_min_dollar_vol),
-                    manual_symbols_text=acc_manual_symbols,
-                )
-            if acc_df.empty:
-                st.info("Silent accumulation adayı çıkmadı. Eşiği düşür veya daha geniş evren tara.")
-            else:
-                st.success(f"Silent accumulation satırı: {len(acc_df)} — ana adaylar ve düşük likidite nedeniyle bastırılanlar birlikte gösterilir.")
-                st.dataframe(acc_df.head(200), use_container_width=True)
-                st.download_button(
-                    "📥 v21 Silent accumulation CSV indir",
-                    data=acc_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v21_4_silent_accumulation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_v20_acc_csv",
-                )
-
-
-
-# ============================================================
-# v23 HOT MOVER DISCOVERY + SECOND-WAVE ENGINE
-# ============================================================
-V23_MIN_HOT_CHANGE = 10.0
-V23_MIN_TRADEABLE_CHANGE = 12.0
-V23_MAX_TRADEABLE_CHANGE = 60.0
-V23_RISK_TAG_CHANGE = 95.0
-V23_ALREADY_EXPLODED_CHANGE = 100.0
-V23_MIN_RVOL = 3.0
-V23_IDEAL_RVOL = 4.0
-V23_MIN_DOLLAR_VOLUME = 2_000_000
-V23_IDEAL_DOLLAR_VOLUME = 5_000_000
-V23_MIN_RANGE_POSITION = 0.80
-V23_IDEAL_RANGE_POSITION = 0.85
-V23_MAX_HIGH_FADE_FRESH = -8.0
-V23_MAX_VWAP_DISTANCE_PCT = 15.0
-V23_MAX_LATE_ENTRY_FRESH = 5.0
-V23_MIN_PRIOR_SPIKE = 45.0
-
-
-def v23_float_rotation(volume: float, float_shares: float) -> float:
-    volume = safe_float(volume, np.nan)
-    float_shares = safe_float(float_shares, np.nan)
-    if pd.isna(volume) or pd.isna(float_shares) or float_shares <= 0:
-        return np.nan
-    return float(volume / float_shares)
-
-
-def v23_safe_pct(a: float, b: float) -> float:
-    a = safe_float(a, np.nan)
-    b = safe_float(b, np.nan)
-    if pd.isna(a) or pd.isna(b) or b == 0:
-        return np.nan
-    return (a - b) / b * 100.0
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def v23_fetch_hot_mover_universe(
-    session_name: str = "auto",
-    max_records: int = 500,
-    min_change_pct: float = 5.0,
-    min_volume: int = 50_000,
-    min_price: float = 0.25,
-    max_price: float = 100.0,
-) -> pd.DataFrame:
-    """Piyasa geneli hot-mover evreni. Burada amaç alım değil, hiçbir büyük hareketliyi kaçırmamak."""
-    use_session = v20_resolve_session(session_name)
-    active_session = get_active_session_et()
-
-    if use_session == "premarket":
-        sort_field = "premarket_change"
-        vol_field = "premarket_volume"
-        price_field = "premarket_close"
-        change_source = "PREMARKET"
-    elif use_session == "afterhours":
-        sort_field = "postmarket_change"
-        vol_field = "postmarket_volume"
-        price_field = "postmarket_close"
-        change_source = "AFTERHOURS"
-    else:
-        sort_field = "change"
-        vol_field = "volume"
-        price_field = "close"
-        change_source = "REGULAR"
-
-    filters = [
-        {"left": price_field, "operation": "in_range", "right": [float(min_price), float(max_price)]},
-        {"left": vol_field, "operation": "greater", "right": int(min_volume)},
-        {"left": sort_field, "operation": "greater", "right": float(min_change_pct)},
-        {"left": "exchange", "operation": "in_range", "right": ["NASDAQ", "NYSE", "AMEX"]},
-    ]
-    columns = [
-        "name", "description", price_field, sort_field, vol_field,
-        "market_cap_basic", "relative_volume_10d_calc", "float_shares_outstanding",
-    ]
-    raw = tradingview_scan(
-        base_filters=filters,
-        columns=columns,
-        sort_field=sort_field,
-        max_records=int(max_records),
-        page_size=min(100, int(max_records)),
-    )
-    rows, seen = [], set()
-    for item in raw:
-        d = item.get("d", [])
-        if len(d) < 5:
-            continue
-        symbol = str(d[0]).upper().strip()
-        company = d[1] or ""
-        if not symbol or symbol in seen:
-            continue
-        if is_likely_non_common_stock(symbol, company):
-            continue
-        seen.add(symbol)
-        price = safe_float(d[2], np.nan)
-        chg = safe_float(d[3], np.nan)
-        vol = safe_float(d[4], np.nan)
-        mcap = safe_float(d[5], np.nan) if len(d) > 5 else np.nan
-        rvol = safe_float(d[6], np.nan) if len(d) > 6 else np.nan
-        flt = safe_float(d[7], np.nan) if len(d) > 7 else np.nan
-        dollar_volume = price * vol if pd.notna(price) and pd.notna(vol) else np.nan
-        rows.append({
-            "symbol": symbol,
-            "yahoo_symbol": normalize_symbol_for_yahoo(symbol),
-            "description": company,
-            "live_price": price,
-            "live_change_pct": chg,
-            "live_volume": vol,
-            "market_cap": mcap,
-            "tv_rvol": rvol,
-            "float_shares": flt,
-            "Float_Rotation_Proxy": v23_float_rotation(vol, flt),
-            "Dollar_Volume": dollar_volume,
-            "Dollar_Volume_M": round(dollar_volume / 1_000_000, 2) if pd.notna(dollar_volume) else np.nan,
-            "change_source": change_source,
-            "data_status": f"V23_{change_source}_HOT_MOVER",
-            "active_session_et": active_session,
-        })
-    return pd.DataFrame(rows)
-
-
-def v23_manual_symbol_candidates(symbols_text: str) -> pd.DataFrame:
-    base = v20_manual_symbol_candidates(symbols_text)
-    if base is None or base.empty:
-        return pd.DataFrame()
-    base = base.copy()
-    base["Float_Rotation_Proxy"] = base.apply(lambda r: v23_float_rotation(r.get("live_volume"), r.get("float_shares")), axis=1)
-    base["Dollar_Volume"] = base["live_price"].astype(float) * base["live_volume"].astype(float)
-    base["Dollar_Volume_M"] = (base["Dollar_Volume"] / 1_000_000).round(2)
-    base["data_status"] = "V23_MANUAL_HOT_CHECK"
-    return base
-
-
-def v23_combine_universes(*dfs: pd.DataFrame) -> pd.DataFrame:
-    frames = [d for d in dfs if d is not None and not d.empty]
-    if not frames:
-        return pd.DataFrame()
-    df = pd.concat(frames, ignore_index=True)
-    if "symbol" not in df.columns:
-        return pd.DataFrame()
-    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-    df = df.drop_duplicates(subset=["symbol"], keep="first")
-    sort_cols = [c for c in ["live_change_pct", "Dollar_Volume"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-    return df.reset_index(drop=True)
-
-
-def v23_fetch_daily_intraday_for_symbol(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ys = normalize_symbol_for_yahoo(symbol)
-    daily_df, intraday_df = pd.DataFrame(), pd.DataFrame()
-    try:
-        t = yf.Ticker(ys)
-        daily_df = t.history(period="90d", interval="1d", auto_adjust=False)
-        intraday_df = t.history(period="2d", interval="1m", prepost=True, auto_adjust=False)
-    except Exception as exc:
-        log_debug(f"v23 fetch detail error {symbol}: {exc}")
-    return daily_df, intraday_df
-
-
-def v23_classify_scored_candidate(row: dict) -> dict:
-    change = safe_float(row.get("Change_%"), np.nan)
-    price = safe_float(row.get("Price"), np.nan)
-    dollar_m = safe_float(row.get("Dollar_Volume_M"), np.nan)
-    dollar = dollar_m * 1_000_000 if pd.notna(dollar_m) else np.nan
-    rvol = safe_float(row.get("TV_RVOL"), np.nan)
-    range_pos = safe_float(row.get("Range_Position"), np.nan)
-    high_drop = safe_float(row.get("High_to_Current_Drop_%"), np.nan)
-    above_vwap = bool(row.get("Above_VWAP"))
-    tape = safe_float(row.get("Tape_Burst_Proxy"), np.nan)
-    late_pct = safe_float(row.get("Late_Entry_%"), np.nan)
-    micro = str(row.get("Microcap_Decision", "UNKNOWN"))
-    already = bool(row.get("Already_Exploded")) or (pd.notna(change) and change >= V23_ALREADY_EXPLODED_CHANGE)
-    tp0_hit = bool(row.get("TP0_Already_Reached_From_Trigger"))
-    float_rot = safe_float(row.get("Float_Rotation_Proxy"), np.nan)
-    if pd.isna(float_rot):
-        vol = safe_float(row.get("Live_Volume"), np.nan)
-        flt_m = safe_float(row.get("Float_M"), np.nan)
-        float_rot = v23_float_rotation(vol, flt_m * 1_000_000 if pd.notna(flt_m) else np.nan)
-
-    blocks = []
+def score_premarket_rocket(gap_pct, pre_vol_ratio, pre_dollar_vol, hold_quality, above_vwap, above_prev_high, pre_range_pct, source):
+    score = 0
     notes = []
-    if pd.isna(change): blocks.append("change_missing")
-    if pd.isna(dollar) or dollar < V23_MIN_DOLLAR_VOLUME: blocks.append("dollar_volume_low")
-    if pd.notna(rvol) and rvol < V23_MIN_RVOL: blocks.append("rvol_low")
-    if not above_vwap: blocks.append("below_or_unconfirmed_vwap")
-    if pd.notna(range_pos) and range_pos < V23_MIN_RANGE_POSITION: blocks.append("not_near_high")
-    if pd.notna(high_drop) and high_drop < V23_MAX_HIGH_FADE_FRESH: blocks.append("high_fade")
-    if pd.notna(late_pct) and late_pct >= V23_MAX_LATE_ENTRY_FRESH: blocks.append("late_entry_pullback_only")
-    if tp0_hit: blocks.append("tp0_already_reached")
-    if micro == "HARD_REJECT": blocks.append("microcap_hard_reject")
 
-    if pd.notna(float_rot):
-        if float_rot >= 1.0:
-            notes.append("float_rotation_1x_plus")
-        elif float_rot >= 0.5:
-            notes.append("float_rotation_0_5x_plus")
-        else:
-            notes.append("float_rotation_low")
+    if source != "REAL_PREMARKET":
+        return 0, ["Premarket veri yok"], False
 
-    # Discovery bucket: bulma/sınıflama, alım izni değildir.
-    if already:
-        bucket = "ALREADY_EXPLODED_NO_CHASE"
-        action = "+100% üstü veya aşırı uzamış; taze giriş yok, sadece pullback/reclaim izlenir."
-        tradeable = False
-    elif pd.notna(change) and change >= 60:
-        bucket = "HOT_MOVER_RISK_TAG_PULLBACK_ONLY"
-        action = "%60-95 arası sıcak hareket; kovalamak yok, VWAP/EMA pullback + reclaim gerekir."
-        tradeable = False
-    elif pd.notna(change) and V23_MIN_TRADEABLE_CHANGE <= change <= V23_MAX_TRADEABLE_CHANGE:
-        ok = (
-            above_vwap
-            and (pd.isna(range_pos) or range_pos >= V23_MIN_RANGE_POSITION)
-            and (pd.isna(high_drop) or high_drop >= V23_MAX_HIGH_FADE_FRESH)
-            and (pd.isna(dollar) or dollar >= V23_MIN_DOLLAR_VOLUME)
-            and (pd.isna(rvol) or rvol >= V23_MIN_RVOL)
-            and (pd.isna(tape) or tape >= 60)
-            and (pd.isna(late_pct) or late_pct < V23_MAX_LATE_ENTRY_FRESH)
-            and not tp0_hit
-            and micro != "HARD_REJECT"
-        )
-        if ok and micro == "PASS":
-            bucket = "PAPER_READY_SQUEEZE"
-            action = "Paper trade adayı: entry/VWAP üstünde 5-15dk tutunma + spread/stop kontrolü şart."
-            tradeable = True
-        elif ok:
-            bucket = "PAPER_READY_SQUEEZE_RISK_TAGGED"
-            action = "Risk etiketli paper adayı: micro risk/strict review; tiny paper dışında işlem yok."
-            tradeable = True
-        else:
-            bucket = "EARLY_SQUEEZE_WATCH"
-            action = "Erken hareket var ama eksik teyit var: " + "; ".join(blocks[:4])
-            tradeable = False
-    elif pd.notna(change) and 5 <= change < V23_MIN_TRADEABLE_CHANGE:
-        bucket = "PRE_IGNITION_TO_EARLY_WATCH"
-        action = "Hareket yeni başlıyor olabilir; hacim/VWAP/HOD kırılımı bekle."
-        tradeable = False
+    if 3 <= gap_pct < 15:
+        score += 12
+    elif 15 <= gap_pct < 50:
+        score += 20
+    elif 50 <= gap_pct < 150:
+        score += 12
+        notes.append("Aşırı sıcak gap")
+    elif gap_pct < 0:
+        score -= 10
+
+    if 0.8 <= pre_vol_ratio < 2:
+        score += 10
+    elif 2 <= pre_vol_ratio < 6:
+        score += 20
+    elif pre_vol_ratio >= 6:
+        score += 24
+        notes.append("Premkt vol shock")
+    elif pre_vol_ratio < 0.4:
+        score -= 8
+
+    if 150_000 <= pre_dollar_vol < 500_000:
+        score += 12
+    elif 500_000 <= pre_dollar_vol < 2_000_000:
+        score += 18
+    elif pre_dollar_vol >= 2_000_000:
+        score += 22
+    elif pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
+        score -= 12
+
+    if hold_quality >= 80:
+        score += 18
+    elif hold_quality >= 65:
+        score += 10
+    elif hold_quality < 45:
+        score -= 12
+
+    if above_vwap:
+        score += 14
     else:
-        bucket = "HOT_MOVER_RADAR"
-        action = "Radar kaydı; işlem için yeterli erken squeeze kapısı yok."
-        tradeable = False
+        score -= 12
+        notes.append("VWAP altı")
 
-    # Skor: discovery için ayrı, risk engine yerine geçmez.
-    score = 0.0
-    if pd.notna(change): score += min(28, max(0, change / 60 * 28))
-    if pd.notna(dollar): score += min(18, np.log10(max(dollar, 1)) * 4 - 10)
-    if pd.notna(rvol): score += min(16, rvol * 3)
-    if above_vwap: score += 10
-    if pd.notna(range_pos): score += min(12, range_pos * 12)
-    if pd.notna(high_drop): score += 10 if high_drop >= -5 else (5 if high_drop >= -10 else -8)
-    if pd.notna(float_rot) and float_rot >= 0.5: score += 6
-    if tp0_hit: score -= 10
-    if pd.notna(late_pct) and late_pct >= 5: score -= 12
-    if already: score -= 25
-    if micro == "HARD_REJECT": score -= 18
-    score = round(float(max(0, min(100, score))), 1)
+    if above_prev_high:
+        score += 10
+        notes.append("Prev high reclaim")
 
-    return {
-        "V23_Bucket": bucket,
-        "V23_Discovery_Score": score,
-        "V23_Tradeable_Paper": bool(tradeable),
-        "V23_Action": action,
-        "V23_Blocks": "; ".join(blocks),
-        "V23_Notes": "; ".join(notes),
-        "Float_Rotation_Proxy": round(float_rot, 3) if pd.notna(float_rot) else np.nan,
-    }
+    if pd.notna(pre_range_pct) and pre_range_pct > 60:
+        score -= 8
+        notes.append("Range çok geniş")
+
+    hard_reject = (not above_vwap) or (hold_quality < 45) or (pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL)
+    return clamp(round(score), 0, 100), notes, hard_reject
 
 
-def v23_deep_score_universe(universe_df: pd.DataFrame, top_n: int = 40, session_name: str = "auto") -> pd.DataFrame:
-    if universe_df is None or universe_df.empty:
-        return pd.DataFrame()
-    rows = []
-    work = universe_df.head(int(top_n)).copy()
-    preferred = v20_resolve_session(session_name)
-    progress = st.progress(0, text="v23 deep scoring hazırlanıyor...") if "streamlit" in str(type(st)) else None
-    total = max(1, len(work))
-    for i, (_, r) in enumerate(work.iterrows(), start=1):
-        symbol = str(r.get("symbol", r.get("Symbol", ""))).upper()
-        try:
-            if progress:
-                progress.progress(i / total, text=f"v23 deep scoring: {symbol} ({i}/{total})")
-            daily_df, intraday_df = v23_fetch_daily_intraday_for_symbol(symbol)
-            scored = v20_score_explosive_candidate(r.to_dict(), daily_df=daily_df, intraday_df=intraday_df, preferred_session=preferred)
-            # TV universe alanlarından eksik kalanları geri taşı.
-            if "Float_Rotation_Proxy" not in scored or pd.isna(scored.get("Float_Rotation_Proxy", np.nan)):
-                scored["Float_Rotation_Proxy"] = r.get("Float_Rotation_Proxy", np.nan)
-            scored["Discovery_Source"] = r.get("data_status", "V23")
-            scored.update(v23_classify_scored_candidate(scored))
-            rows.append(scored)
-        except Exception as exc:
-            rows.append({"Symbol": symbol, "V23_Bucket": "DATA_ERROR", "V23_Action": str(exc), "Discovery_Source": r.get("data_status", "V23")})
-    if progress:
-        progress.empty()
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    rank = {
-        "PAPER_READY_SQUEEZE": 0,
-        "PAPER_READY_SQUEEZE_RISK_TAGGED": 1,
-        "EARLY_SQUEEZE_WATCH": 2,
-        "PRE_IGNITION_TO_EARLY_WATCH": 3,
-        "HOT_MOVER_RISK_TAG_PULLBACK_ONLY": 4,
-        "ALREADY_EXPLODED_NO_CHASE": 5,
-        "HOT_MOVER_RADAR": 6,
-        "DATA_ERROR": 9,
-    }
-    out["V23_Rank"] = out["V23_Bucket"].map(rank).fillna(8)
-    return out.sort_values(["V23_Rank", "V23_Discovery_Score", "Change_%"], ascending=[True, False, False]).reset_index(drop=True)
+def similarity_band(value, ideal_low, ideal_high, hard_low, hard_high):
+    if pd.isna(value):
+        return 0.0
+    value = float(value)
+    if ideal_low <= value <= ideal_high:
+        return 1.0
+    if value < hard_low or value > hard_high:
+        return 0.0
+    if value < ideal_low:
+        return (value - hard_low) / (ideal_low - hard_low)
+    return (hard_high - value) / (hard_high - ideal_high)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def v23_prior_runner_scan_cached(tickers: list[str], max_tickers: int = 400, min_prior_spike_pct: float = 45.0, seed_salt: str = "") -> pd.DataFrame:
-    """Bir gün/iki gün önce aşırı yükselenleri D+1/D+2 ikinci dalga için bulur. Daily veri tabanlı watchlisttir."""
-    if not tickers:
-        return pd.DataFrame()
-    clean = _clean_ticker_list(tickers)
-    if not clean:
-        return pd.DataFrame()
-    # Günlük deterministik shuffle: her gün farklı coverage.
-    seed = int(datetime.now().strftime("%Y%m%d")) + abs(hash(seed_salt)) % 10_000
-    rng = np.random.default_rng(seed)
-    arr = np.array(clean)
-    if len(arr) > max_tickers:
-        arr = rng.choice(arr, size=int(max_tickers), replace=False)
-    symbols = list(arr)
-    rows = []
-    chunk_size = 80
-    for start in range(0, len(symbols), chunk_size):
-        chunk = symbols[start:start + chunk_size]
-        try:
-            data = yf.download(chunk, period="12d", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
-        except Exception:
-            continue
-        for sym in chunk:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if sym not in data.columns.get_level_values(0):
-                        continue
-                    df = data[sym].dropna()
-                else:
-                    df = data.dropna()
-                if df is None or df.empty or len(df) < 5:
-                    continue
-                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-                if len(df) < 5:
-                    continue
-                c = df["Close"]
-                last_ret = v23_safe_pct(c.iloc[-1], c.iloc[-2])
-                prior1 = v23_safe_pct(c.iloc[-2], c.iloc[-3])
-                prior2 = v23_safe_pct(c.iloc[-3], c.iloc[-4])
-                prior3 = v23_safe_pct(c.iloc[-4], c.iloc[-5]) if len(df) >= 5 else np.nan
-                max_prior = np.nanmax([prior1, prior2, prior3])
-                if pd.isna(max_prior) or max_prior < min_prior_spike_pct:
-                    continue
-                last_close = float(c.iloc[-1])
-                last_vol = float(df["Volume"].iloc[-1])
-                avg20 = float(df["Volume"].tail(min(10, len(df))).mean())
-                dollar = last_close * last_vol
-                hold_score = 0.0
-                # Spike sonrası tamamen çökmemişse ikinci dalga ihtimali daha yüksek.
-                recent_high = float(df["High"].tail(4).max())
-                recent_low = float(df["Low"].tail(4).min())
-                range_pos = (last_close - recent_low) / max(recent_high - recent_low, 0.01)
-                if range_pos >= 0.65: hold_score += 25
-                if last_ret >= -10: hold_score += 18
-                if last_vol >= avg20 * 1.2: hold_score += 18
-                if dollar >= 2_000_000: hold_score += 18
-                if max_prior >= 80: hold_score += 12
-                if 0 <= last_ret <= 40: hold_score += 9
-                rows.append({
-                    "Symbol": sym,
-                    "Stage": "D1_D2_SECOND_WAVE_WATCH",
-                    "Prior_Max_Spike_%": round(float(max_prior), 2),
-                    "Last_Return_%": round(float(last_ret), 2) if pd.notna(last_ret) else np.nan,
-                    "Second_Wave_Score": round(min(100, hold_score), 1),
-                    "Close": round(last_close, v17_price_round(last_close)),
-                    "Last_Volume": int(last_vol),
-                    "Dollar_Volume_M": round(dollar / 1_000_000, 2),
-                    "Recent_Range_Position": round(range_pos, 2),
-                    "Action": "D+1/D+2 takip: premarket/regular VWAP reclaim + hacim patlaması bekle",
-                })
-            except Exception:
-                continue
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(["Second_Wave_Score", "Prior_Max_Spike_%", "Dollar_Volume_M"], ascending=[False, False, False]).reset_index(drop=True)
+def compute_pattern_similarity(feature_dict):
+    results = []
+    for proto in ROCKET_PROTOTYPES:
+        weighted = 0.0
+        total = 0.0
+        for key, weight in proto["weights"].items():
+            ideal_low, ideal_high, hard_low, hard_high = proto["bands"][key]
+            val = feature_dict.get(key, np.nan)
+            if isinstance(val, bool):
+                val = 1 if val else 0
+            sim = similarity_band(val, ideal_low, ideal_high, hard_low, hard_high)
+            weighted += sim * weight
+            total += weight
+        score = (weighted / total * 100.0) if total > 0 else 0.0
+        results.append((proto["name"], round(score)))
+
+    results = sorted(results, key=lambda x: x[1], reverse=True)
+    return results[0][0], results[0][1], results[:3]
 
 
-def v23_missed_movers_audit(hot_df: pd.DataFrame, scored_df: pd.DataFrame) -> pd.DataFrame:
-    if hot_df is None or hot_df.empty:
-        return pd.DataFrame()
-    shown = set()
-    category = {}
-    if scored_df is not None and not scored_df.empty and "Symbol" in scored_df.columns:
-        for _, r in scored_df.iterrows():
-            s = str(r.get("Symbol", "")).upper()
-            if s:
-                shown.add(s)
-                category[s] = r.get("V23_Bucket", r.get("Signal", "SCORED"))
-    rows = []
-    for _, r in hot_df.iterrows():
-        s = str(r.get("symbol", "")).upper()
-        chg = safe_float(r.get("live_change_pct"), np.nan)
-        rows.append({
-            "Symbol": s,
-            "Actual_Change_%": round(chg, 2) if pd.notna(chg) else np.nan,
-            "Was_In_Hot_Universe": True,
-            "Was_Deep_Scored": s in shown,
-            "V23_Category": category.get(s, "NOT_DEEP_SCORED"),
-            "Audit_Note": "Derin skorlandı" if s in shown else "Top N dışında kaldı veya deep scoring limiti düşük",
-        })
-    return pd.DataFrame(rows).sort_values("Actual_Change_%", ascending=False).reset_index(drop=True)
+def build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time, quotes_map, super_pattern_al, super_pattern_strong):
+    ctx = get_trade_date_context(daily_df, trade_date_str)
+    if ctx is None:
+        return None
 
+    flags = get_flags(symbol)
+    last = ctx["last"]
+    prev = ctx["prev"]
 
-def render_v23_discovery_tab():
-    st.subheader("🔥 v23 Hot Mover Discovery + Early Squeeze + Second-Wave Engine")
-    st.info(
-        "Amaç: HCWB/SLXN/VIDA/GCL gibi sıcak hisseleri kaçırmamak; önce görünür yapmak, sonra early/tradeable/late/trap diye ayırmak. "
-        "Bu modül gerçek para izni vermez; v22 Risk Engine son kapı olarak kalır."
+    price = safe_float(last["Close"], np.nan)
+    prev_close = safe_float(prev["Close"], np.nan)
+    prev_day_ret = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+    prev_close_strength = closing_strength(price, safe_float(last["Low"], np.nan), safe_float(last["High"], np.nan))
+
+    hist10 = ctx["hist10"]
+    hist20 = ctx["hist20"]
+    hist60 = ctx["hist60"]
+    hist90 = ctx["hist90"]
+
+    avg_vol20 = max(avg(hist20["Volume"].iloc[:-1] if len(hist20) > 1 else hist20["Volume"]), 1)
+    prev_vol_ratio = safe_float(last["Volume"], 0) / avg_vol20
+    prev_dollar_vol = price * safe_float(last["Volume"], 0)
+
+    hist10_high = safe_float(hist10["High"].max(), np.nan)
+    hist10_low = safe_float(hist10["Low"].min(), np.nan)
+    high20_ex_last = safe_float(hist20["High"].iloc[:-1].max() if len(hist20) > 1 else hist20["High"].max(), np.nan)
+    low30 = safe_float(hist60["Low"].iloc[-30:].min() if len(hist60) >= 30 else hist60["Low"].min(), np.nan)
+    high90 = safe_float(hist90["High"].max(), np.nan)
+
+    drawdown90 = ((price / high90) - 1) * 100.0 if pd.notna(high90) and high90 > 0 else np.nan
+    rebound30 = ((price - low30) / low30) * 100.0 if pd.notna(low30) and low30 > 0 else np.nan
+    base_tightness10 = ((hist10_high - hist10_low) / price * 100.0) if pd.notna(price) and price > 0 else np.nan
+    breakout20 = bool(pd.notna(high20_ex_last) and price > high20_ex_last)
+
+    avg_range20 = max(avg([
+        range_pct(h, l, c) for h, l, c in zip(hist20["High"].iloc[:-1], hist20["Low"].iloc[:-1], hist20["Close"].iloc[:-1])
+    ]), 0.0001)
+    prev_range_pct = range_pct(safe_float(last["High"], np.nan), safe_float(last["Low"], np.nan), price)
+    range_expansion = prev_range_pct / avg_range20 if pd.notna(prev_range_pct) else np.nan
+
+    structural_score, structural_notes, struct_reject = score_structural(price, drawdown90, base_tightness10, rebound30, breakout20, flags)
+    ignition_score, ignition_notes = score_ignition(
+        prev_day_ret,
+        prev_close_strength * 100 if pd.notna(prev_close_strength) else np.nan,
+        prev_vol_ratio,
+        prev_dollar_vol,
+        range_expansion,
+        flags
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        session_choice = st.selectbox("Seans", ["auto", "regular", "premarket", "afterhours"], index=0, key="v23_session")
-        min_change = st.slider("Min canlı artış %", 1.0, 50.0, 5.0, 1.0, key="v23_min_change")
-    with c2:
-        max_records = st.number_input("Hot universe max", 50, 1500, 700, 50, key="v23_max_records")
-        deep_top_n = st.number_input("Derin teyit top N", 10, 150, 60, 5, key="v23_deep_n")
-    with c3:
-        min_volume = st.number_input("Min canlı hacim", 0, 5_000_000, 50_000, 10_000, key="v23_min_volume")
-        min_price = st.number_input("Min fiyat", 0.01, 50.0, 0.50, 0.05, key="v23_min_price")
-    with c4:
-        max_price = st.number_input("Max fiyat", 1.0, 1000.0, 80.0, 1.0, key="v23_max_price")
-        manual_symbols = st.text_input("Zorunlu sembol kontrolü", value="", placeholder="HCWB,SLXN,VIDA,GCL,PHGE,MTVA", key="v23_manual")
+    pre_ctx = get_premarket_context(minute_df, trade_date_str, cutoff_time)
+    baseline_median, _, _ = premarket_baseline_ratio(minute_df, ctx["prior_dates"], trade_date_str, cutoff_time)
+    pre_vol_ratio = pre_ctx["pre_vol"] / baseline_median if pd.notna(baseline_median) and baseline_median > 0 else np.nan
+    gap_pct = ((pre_ctx["price"] - price) / price * 100.0) if pd.notna(pre_ctx["price"]) and price > 0 else np.nan
+    pre_dollar_vol = pre_ctx["price"] * pre_ctx["pre_vol"] if pd.notna(pre_ctx["price"]) else np.nan
+    above_vwap = pd.notna(pre_ctx["pre_vwap"]) and pd.notna(pre_ctx["price"]) and pre_ctx["price"] > pre_ctx["pre_vwap"]
+    above_prev_high = pd.notna(pre_ctx["price"]) and pd.notna(last["High"]) and pre_ctx["price"] > safe_float(last["High"], np.nan)
 
-    st.caption(
-        "Early tradeable eşikler: change %12-60, VWAP üstü, range position >=0.80, high fade > -8%, RVOL>=3, dollar volume>=2M, late entry <5%. "
-        "%60-95 pullback-only; %100+ already exploded/no fresh buy."
+    premarket_score, pre_notes, pre_reject = score_premarket_rocket(
+        safe_float(gap_pct, 0), safe_float(pre_vol_ratio, 0), safe_float(pre_dollar_vol, 0),
+        safe_float(pre_ctx["hold_quality"], 0), bool(above_vwap), bool(above_prev_high),
+        safe_float(pre_ctx["pre_range_pct"], np.nan), pre_ctx["source"]
     )
 
-    st.divider()
-    d1, d2, d3 = st.columns(3)
-    with d1:
-        enable_prior = st.checkbox("D+1/D+2 prior-runner scan çalıştır", value=True, key="v23_prior_enable")
-    with d2:
-        prior_max = st.number_input("Prior scan max ticker", 100, 3000, 600, 100, key="v23_prior_max")
-    with d3:
-        prior_spike = st.slider("Min önceki spike %", 20.0, 150.0, 45.0, 5.0, key="v23_prior_spike")
-
-    prior_csv = st.file_uploader("D+1/D+2 için ticker CSV yükle (opsiyonel)", type=["csv"], key="v23_prior_csv")
-    prior_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v23_prior_col")
-
-    if st.button("🔥 v23 Discovery Çalıştır", key="v23_run"):
-        hot = v23_fetch_hot_mover_universe(
-            session_name=session_choice,
-            max_records=int(max_records),
-            min_change_pct=float(min_change),
-            min_volume=int(min_volume),
-            min_price=float(min_price),
-            max_price=float(max_price),
-        )
-        manual = v23_manual_symbol_candidates(manual_symbols)
-        universe = v23_combine_universes(hot, manual)
-
-        if universe.empty:
-            st.warning("Hot mover evreni boş döndü. Min artış/hacim/fiyat eşiğini düşür veya manuel sembol ekle.")
-        else:
-            st.markdown("### 🔥 Hot Movers Radar — önce gör, sonra sınıflandır")
-            st.dataframe(universe.head(100), use_container_width=True)
-
-            scored = v23_deep_score_universe(universe, top_n=int(deep_top_n), session_name=session_choice)
-            if scored.empty:
-                st.warning("Derin skor üretilemedi.")
-            else:
-                st.markdown("### ⚡ Early Tradeable Squeeze / Supernova adayları")
-                tradeable = scored[scored["V23_Bucket"].isin(["PAPER_READY_SQUEEZE", "PAPER_READY_SQUEEZE_RISK_TAGGED"])]
-                if tradeable.empty:
-                    st.info("Bu anda PAPER_READY_SQUEEZE yok. Hot moverlar aşağıda sınıflandırıldı; kovalamak yok.")
-                else:
-                    st.dataframe(tradeable, use_container_width=True)
-
-                st.markdown("### 📊 Tüm v23 derin sınıflandırma")
-                st.dataframe(scored, use_container_width=True)
-                st.download_button(
-                    "⬇️ v23 deep scored CSV indir",
-                    data=scored.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v23_discovery_deep_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="v23_deep_download",
-                )
-
-                audit = v23_missed_movers_audit(universe, scored)
-                st.markdown("### 🧾 Missed Movers Audit — gördük mü, skora soktuk mu?")
-                st.dataframe(audit.head(150), use_container_width=True)
-                st.download_button(
-                    "⬇️ v23 missed movers audit CSV indir",
-                    data=audit.to_csv(index=False).encode("utf-8"),
-                    file_name=f"v23_missed_movers_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="v23_audit_download",
-                )
-
-        if enable_prior:
-            try:
-                if prior_csv is not None:
-                    prior_csv.seek(0)
-                    tickers = load_tickers_from_uploaded_csv(prior_csv, prior_col.strip() or None)
-                    source_note = "Uploaded CSV"
-                else:
-                    tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", prior_col.strip() or None)
-                    source_note = "Repo nasdaq_nyse_tickers.csv"
-                if not tickers:
-                    st.warning("D+1/D+2 scan için ticker listesi yok. CSV yükle veya repo'ya nasdaq_nyse_tickers.csv ekle.")
-                else:
-                    second = v23_prior_runner_scan_cached(tickers, max_tickers=int(prior_max), min_prior_spike_pct=float(prior_spike), seed_salt=source_note)
-                    st.markdown("### 🔁 D+1 / D+2 Second-Wave Watchlist")
-                    st.caption(f"Kaynak: {source_note} | taranan yaklaşık ticker: {min(len(tickers), int(prior_max))}")
-                    if second.empty:
-                        st.info("Önceki gün/iki gün +spike sonrası ikinci dalga watchlist adayı çıkmadı.")
-                    else:
-                        st.dataframe(second.head(100), use_container_width=True)
-                        st.download_button(
-                            "⬇️ v23 second-wave CSV indir",
-                            data=second.to_csv(index=False).encode("utf-8"),
-                            file_name=f"v23_second_wave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            key="v23_second_download",
-                        )
-            except Exception as exc:
-                st.error(f"D+1/D+2 prior runner scan hata: {exc}")
-
-
-
-
-# ============================================================
-# v24 EXTREME GAINERS COLLECTOR + RUNNER DNA CALIBRATION LAB
-# ============================================================
-V24_DEFAULT_LOOKBACK_DAYS = 90
-V24_MIN_EXTREME_GAIN_PCT = 50.0
-V24_BIG_RUNNER_GAIN_PCT = 100.0
-V24_MIN_HISTORY_BARS_FOR_FEATURES = 25
-V24_DEBUG_GAIN_PCT = 20.0
-
-
-def v24_parse_date_any(x):
-    """Farklı CSV tarih formatlarını güvenli biçimde YYYY-MM-DD string'e çevirir."""
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return None
-    try:
-        dt = pd.to_datetime(x, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return None
-
-
-def v24_symbol_clean(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return ""
-    s = str(x).strip().upper()
-    s = s.replace(".", "-")
-    if s in {"", "NAN", "NONE", "NULL", "-"}:
-        return ""
-    return s
-
-
-def v24_detect_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    if df is None or df.empty:
-        return None
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    # partial fallback
-    for c in df.columns:
-        lc = str(c).lower()
-        for cand in candidates:
-            if cand.lower() in lc:
-                return c
-    return None
-
-
-def v24_normalize_extreme_gainers_csv(df: pd.DataFrame) -> pd.DataFrame:
-    """FinScreener/AInvest veya manuel extreme-gainer CSV'lerini ortak formata getirir."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    sym_col = v24_detect_col(df, ["Symbol", "Ticker", "code", "Code", "symbol", "ticker", "yahoo_symbol"])
-    date_col = v24_detect_col(df, ["date", "Date", "Trade_Date", "trade_date", "outcome_date", "Outcome_Date"])
-    pct_col = v24_detect_col(df, ["pct_change_on_day", "Actual_Change_%", "Change_%", "Percentage Change", "Percentage Change(%)", "change_pct", "Change"])
-    name_col = v24_detect_col(df, ["name", "Name", "Company", "description", "Description"])
-    mcap_col = v24_detect_col(df, ["MarketCap", "Market Cap", "latest_market_cap_usd", "Latest Market Cap(USD)", "market_cap"])
-    if sym_col is None or pct_col is None:
-        return pd.DataFrame()
-    out = pd.DataFrame()
-    out["date"] = df[date_col].apply(v24_parse_date_any) if date_col else None
-    out["Symbol"] = df[sym_col].apply(v24_symbol_clean)
-    out["Name"] = df[name_col] if name_col else ""
-    out["Actual_Change_%"] = pd.to_numeric(df[pct_col], errors="coerce")
-    out["Bucket"] = np.where(out["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
-    out["MarketCap"] = pd.to_numeric(df[mcap_col], errors="coerce") if mcap_col else np.nan
-    out["Collector_Source"] = "Uploaded_Extreme_CSV"
-    out = out[(out["Symbol"] != "") & out["Actual_Change_%"].notna()].copy()
-    return out.reset_index(drop=True)
-
-
-def v24_normalize_downloaded_df(raw: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
-    """yfinance çıktısını standart OHLCV DataFrame'e çevirir."""
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    df = raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        # Eğer tek sembol alt kolon olarak geldiyse onu seç.
-        if symbol and symbol in df.columns.get_level_values(0):
-            df = df[symbol].copy()
-        elif symbol and symbol in df.columns.get_level_values(-1):
-            df = df.xs(symbol, axis=1, level=-1, drop_level=True).copy()
-        else:
-            # Son çare: ilk level'i indir.
-            try:
-                df.columns = df.columns.get_level_values(-1)
-            except Exception:
-                pass
-    cols = {str(c).lower(): c for c in df.columns}
-    required = []
-    rename = {}
-    for k in ["open", "high", "low", "close", "volume"]:
-        c = cols.get(k)
-        if c is not None:
-            rename[c] = k.capitalize() if k != "volume" else "Volume"
-            required.append(k.capitalize() if k != "volume" else "Volume")
-    if "Close" not in rename.values() and "adj close" in cols:
-        rename[cols["adj close"]] = "Close"
-    df = df.rename(columns=rename)
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    if not keep or "Close" not in keep:
-        return pd.DataFrame()
-    df = df[keep].copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    for c in keep:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["Close"])
-    return df
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def v24_yf_download_history_cached(tickers_tuple: tuple[str, ...], start_date: str, end_date: str, chunk_size: int = 50) -> dict:
-    """Verilen ticker listesi için günlük OHLCV indirir. Cache, v24 lab'i hızlandırır."""
-    tickers = [v24_symbol_clean(t) for t in tickers_tuple if v24_symbol_clean(t)]
-    out = {}
-    if not tickers:
-        return out
-    # yfinance end exclusive olduğu için 1 gün ileri al.
-    try:
-        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    except Exception:
-        end_plus = end_date
-    for i in range(0, len(tickers), int(chunk_size)):
-        chunk = tickers[i:i + int(chunk_size)]
-        try:
-            raw = yf.download(
-                tickers=" ".join(chunk),
-                start=start_date,
-                end=end_plus,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                prepost=False,
-                progress=False,
-                threads=True,
-            )
-        except Exception:
-            raw = pd.DataFrame()
-        if raw is None or raw.empty:
-            continue
-        if len(chunk) == 1:
-            sym = chunk[0]
-            df = v24_normalize_downloaded_df(raw, sym)
-            if not df.empty:
-                out[sym] = df
-        else:
-            for sym in chunk:
-                df = pd.DataFrame()
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.get_level_values(0):
-                        df = v24_normalize_downloaded_df(raw[sym], sym)
-                    elif isinstance(raw.columns, pd.MultiIndex) and sym in raw.columns.get_level_values(-1):
-                        df = v24_normalize_downloaded_df(raw.xs(sym, axis=1, level=-1, drop_level=True), sym)
-                except Exception:
-                    df = pd.DataFrame()
-                if not df.empty:
-                    out[sym] = df
-    return out
-
-
-
-
-def v24_yahoo_chart_history(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict]:
-    """Yahoo chart endpoint fallback. yfinance bazı microcaplerde boş dönerse ham chart endpoint denenir."""
-    diag = {"Yahoo_Chart_OK": False, "Yahoo_Chart_Rows": 0, "Yahoo_Chart_Error": ""}
-    sym = v24_symbol_clean(symbol)
-    if not sym:
-        diag["Yahoo_Chart_Error"] = "empty_symbol"
-        return pd.DataFrame(), diag
-    try:
-        start_ts = int(pd.Timestamp(start_date).timestamp())
-        end_ts = int((pd.Timestamp(end_date) + pd.Timedelta(days=1)).timestamp())
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        params = {
-            "period1": start_ts,
-            "period2": end_ts,
-            "interval": "1d",
-            "events": "history",
-            "includeAdjustedClose": "true",
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, params=params, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            diag["Yahoo_Chart_Error"] = f"http_{resp.status_code}"
-            return pd.DataFrame(), diag
-        payload = resp.json()
-        result = (((payload or {}).get("chart") or {}).get("result") or [])
-        if not result:
-            diag["Yahoo_Chart_Error"] = "empty_result"
-            return pd.DataFrame(), diag
-        r0 = result[0]
-        ts = r0.get("timestamp") or []
-        quote = (((r0.get("indicators") or {}).get("quote") or [{}])[0])
-        if not ts or not quote:
-            diag["Yahoo_Chart_Error"] = "missing_quote"
-            return pd.DataFrame(), diag
-        df = pd.DataFrame({
-            "Date": pd.to_datetime(ts, unit="s"),
-            "Open": quote.get("open"),
-            "High": quote.get("high"),
-            "Low": quote.get("low"),
-            "Close": quote.get("close"),
-            "Volume": quote.get("volume"),
-        })
-        df = df.dropna(subset=["Close"]).set_index("Date").sort_index()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]]
-        diag["Yahoo_Chart_OK"] = not df.empty
-        diag["Yahoo_Chart_Rows"] = int(len(df))
-        return df, diag
-    except Exception as exc:
-        diag["Yahoo_Chart_Error"] = str(exc)[:160]
-        return pd.DataFrame(), diag
-
-
-def v24_yahoo_individual_history(symbol: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, dict]:
-    """Tek sembol için yfinance download + Ticker.history + chart endpoint fallback."""
-    sym = v24_symbol_clean(symbol)
-    diag = {
-        "Yahoo_Individual_OK": False,
-        "Yahoo_Individual_Rows": 0,
-        "Yahoo_Individual_Method": "",
-        "Yahoo_Individual_Error": "",
-        "Yahoo_Chart_OK": False,
-        "Yahoo_Chart_Rows": 0,
-        "Yahoo_Chart_Error": "",
-    }
-    if not sym:
-        diag["Yahoo_Individual_Error"] = "empty_symbol"
-        return pd.DataFrame(), diag
-    try:
-        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        raw = yf.download(
-            tickers=sym,
-            start=start_date,
-            end=end_plus,
-            interval="1d",
-            auto_adjust=False,
-            prepost=False,
-            progress=False,
-            threads=False,
-        )
-        df = v24_normalize_downloaded_df(raw, sym)
-        if not df.empty:
-            diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(df)), "Yahoo_Individual_Method": "yf.download_single"})
-            return df, diag
-    except Exception as exc:
-        diag["Yahoo_Individual_Error"] = f"download:{str(exc)[:120]}"
-    try:
-        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        raw = yf.Ticker(sym).history(start=start_date, end=end_plus, interval="1d", auto_adjust=False, actions=False)
-        df = v24_normalize_downloaded_df(raw, sym)
-        if not df.empty:
-            diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(df)), "Yahoo_Individual_Method": "ticker.history"})
-            return df, diag
-    except Exception as exc:
-        err = diag.get("Yahoo_Individual_Error") or ""
-        diag["Yahoo_Individual_Error"] = (err + " | history:" + str(exc)[:120]).strip(" |")
-    chart_df, chart_diag = v24_yahoo_chart_history(sym, start_date, end_date)
-    diag.update(chart_diag)
-    if not chart_df.empty:
-        diag.update({"Yahoo_Individual_OK": True, "Yahoo_Individual_Rows": int(len(chart_df)), "Yahoo_Individual_Method": "query1_chart"})
-        return chart_df, diag
-    return pd.DataFrame(), diag
-
-
-def v24_alpaca_daily_range(symbol: str, start_date: str, end_date: str, api_key_value: str = "", secret_key_value: str = "", feed: str = "iex") -> tuple[pd.DataFrame, dict]:
-    """Alpaca daily bars fallback. Feed IEX/SIP ayrı loglanır; SIP erişimi yoksa hata diagnostikte görünür."""
-    sym = v24_symbol_clean(symbol)
-    diag = {"Alpaca_OK": False, "Alpaca_Rows": 0, "Alpaca_Feed": feed or "iex", "Alpaca_Error": ""}
-    if not sym:
-        diag["Alpaca_Error"] = "empty_symbol"
-        return pd.DataFrame(), diag
-    if not api_key_value or not secret_key_value:
-        diag["Alpaca_Error"] = "missing_api_keys"
-        return pd.DataFrame(), diag
-    try:
-        start_ts = pd.to_datetime(start_date).strftime("%Y-%m-%dT00:00:00Z")
-        end_ts = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
-        url = f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
-        params = {
-            "timeframe": "1Day",
-            "start": start_ts,
-            "end": end_ts,
-            "adjustment": "all",
-            "limit": 10000,
-            "feed": feed or "iex",
-        }
-        resp = requests.get(url, headers=_alpaca_headers(api_key_value, secret_key_value), params=params, timeout=15)
-        if resp.status_code != 200:
-            diag["Alpaca_Error"] = f"http_{resp.status_code}:{resp.text[:120]}"
-            return pd.DataFrame(), diag
-        payload = resp.json()
-        bars = payload.get("bars", [])
-        if not bars:
-            diag["Alpaca_Error"] = "empty_bars"
-            return pd.DataFrame(), diag
-        rows = []
-        for b in bars:
-            rows.append({
-                "Date": pd.to_datetime(b.get("t"), utc=True).tz_localize(None),
-                "Open": safe_float(b.get("o"), np.nan),
-                "High": safe_float(b.get("h"), np.nan),
-                "Low": safe_float(b.get("l"), np.nan),
-                "Close": safe_float(b.get("c"), np.nan),
-                "Volume": safe_float(b.get("v"), np.nan),
-            })
-        df = pd.DataFrame(rows).dropna(subset=["Close"]).set_index("Date").sort_index()
-        if df.empty:
-            diag["Alpaca_Error"] = "empty_after_parse"
-            return df, diag
-        diag.update({"Alpaca_OK": True, "Alpaca_Rows": int(len(df))})
-        return df[["Open", "High", "Low", "Close", "Volume"]], diag
-    except Exception as exc:
-        diag["Alpaca_Error"] = str(exc)[:160]
-        return pd.DataFrame(), diag
-
-
-def v24_deep_fetch_history(symbol: str, start_date: str, end_date: str, api_key_value: str = "", secret_key_value: str = "", alpaca_feed: str = "iex") -> tuple[pd.DataFrame, str, dict]:
-    """Manual smoke / küçük evren için çok katmanlı veri sağlayıcı fallback.
-
-    Sıra:
-    1) Alpaca selected feed
-    2) Alpaca IEX/SIP alternatif feed denemesi
-    3) Yahoo individual download / Ticker.history / chart endpoint
-    """
-    diag = {
-        "Provider_Source": "",
-        "Provider_Attempts": [],
-        "Rows_Returned": 0,
-        "First_Date": "",
-        "Last_Date": "",
-        "Alpaca_OK": False,
-        "Alpaca_Rows": 0,
-        "Alpaca_Error": "",
-        "Yahoo_Individual_OK": False,
-        "Yahoo_Individual_Rows": 0,
-        "Yahoo_Individual_Method": "",
-        "Yahoo_Individual_Error": "",
-        "Yahoo_Chart_OK": False,
-        "Yahoo_Chart_Rows": 0,
-        "Yahoo_Chart_Error": "",
-    }
-    feeds = []
-    if alpaca_feed:
-        feeds.append(alpaca_feed)
-    for f in ["iex", "sip"]:
-        if f not in feeds:
-            feeds.append(f)
-    for f in feeds:
-        df, a_diag = v24_alpaca_daily_range(symbol, start_date, end_date, api_key_value, secret_key_value, f)
-        diag["Provider_Attempts"].append(f"Alpaca_{f}")
-        # Son Alpaca hata bilgisi kalsın; başarılı olursa zaten döner.
-        diag.update({k: v for k, v in a_diag.items() if k in diag or k.startswith("Alpaca")})
-        if not df.empty:
-            diag["Provider_Source"] = f"Alpaca_{f}"
-            diag["Alpaca_OK"] = True
-            diag["Alpaca_Rows"] = int(len(df))
-            diag["Rows_Returned"] = int(len(df))
-            diag["First_Date"] = df.index.min().strftime("%Y-%m-%d")
-            diag["Last_Date"] = df.index.max().strftime("%Y-%m-%d")
-            return df, diag["Provider_Source"], diag
-    ydf, ydiag = v24_yahoo_individual_history(symbol, start_date, end_date)
-    diag["Provider_Attempts"].append("Yahoo_Individual")
-    diag.update(ydiag)
-    if not ydf.empty:
-        diag["Provider_Source"] = "Yahoo_Individual_" + (ydiag.get("Yahoo_Individual_Method") or "unknown")
-        diag["Rows_Returned"] = int(len(ydf))
-        diag["First_Date"] = ydf.index.min().strftime("%Y-%m-%d")
-        diag["Last_Date"] = ydf.index.max().strftime("%Y-%m-%d")
-        return ydf, diag["Provider_Source"], diag
-    diag["Provider_Source"] = "NO_DATA_ALL_PROVIDERS"
-    diag["Provider_Attempts"] = ",".join(diag["Provider_Attempts"])
-    return pd.DataFrame(), diag["Provider_Source"], diag
-
-def v24_compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Runner günü ve bir gün öncesi için temel OHLCV feature seti.
-
-    v24.3 notu:
-    - Close_Return_%: kapanıştan kapanışa getiri.
-    - High_Return_%: gün içi tepe / önceki kapanış getirisi.
-    - Collector_Return_%: runner event tespiti için max(Close_Return_%, High_Return_%).
-
-    Bunun nedeni: birçok sıcak mover gün içinde +50/+100 görüp kapanışta eşiğin altına dönebiliyor.
-    Sadece close-to-close bakmak hot mover audit'i eksik bırakır.
-    """
-    if df is None or df.empty or "Close" not in df.columns:
-        return pd.DataFrame()
-    out = df.copy().sort_index()
-    out["Prev_Close"] = out["Close"].shift(1)
-    out["Close_Return_%"] = (out["Close"] / out["Prev_Close"] - 1.0) * 100.0
-    if "High" in out.columns:
-        out["High_Return_%"] = (out["High"] / out["Prev_Close"] - 1.0) * 100.0
-    else:
-        out["High_Return_%"] = np.nan
-    out["Collector_Return_%"] = pd.concat([out["Close_Return_%"], out["High_Return_%"]], axis=1).max(axis=1)
-    # Eski kolon geriye dönük uyumluluk için close-to-close anlamını korur.
-    out["Return_%"] = out["Close_Return_%"]
-    out["Gap_%"] = (out["Open"] / out["Prev_Close"] - 1.0) * 100.0 if "Open" in out.columns else np.nan
-    out["DollarVolume"] = out["Close"] * out.get("Volume", np.nan)
-    out["AvgVol20"] = out["Volume"].shift(1).rolling(20, min_periods=5).mean() if "Volume" in out.columns else np.nan
-    out["RVOL20"] = out["Volume"] / out["AvgVol20"]
-    rng = (out["High"] - out["Low"]).replace(0, np.nan) if all(c in out.columns for c in ["High", "Low"]) else np.nan
-    out["CloseStrength"] = (out["Close"] - out["Low"]) / rng if isinstance(rng, pd.Series) else np.nan
-    out["Range_%"] = (out["High"] - out["Low"]) / out["Prev_Close"] * 100.0 if all(c in out.columns for c in ["High", "Low"]) else np.nan
-    # ATR14
-    if all(c in out.columns for c in ["High", "Low", "Close"]):
-        prev_close = out["Close"].shift(1)
-        tr = pd.concat([
-            (out["High"] - out["Low"]).abs(),
-            (out["High"] - prev_close).abs(),
-            (out["Low"] - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        out["ATR14"] = tr.rolling(14, min_periods=5).mean()
-        out["ATR14_%"] = out["ATR14"] / out["Close"] * 100.0
-    else:
-        out["ATR14"] = np.nan
-        out["ATR14_%"] = np.nan
-    out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
-    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
-    out["Close_Above_EMA9"] = out["Close"] > out["EMA9"]
-    out["EMA9_Above_EMA20"] = out["EMA9"] > out["EMA20"]
-    if "Volume" in out.columns:
-        direction = np.sign(out["Close"].diff()).fillna(0)
-        out["OBV"] = (direction * out["Volume"].fillna(0)).cumsum()
-        out["OBV_Slope5"] = out["OBV"].diff(5)
-    else:
-        out["OBV"] = np.nan
-        out["OBV_Slope5"] = np.nan
-    return out
-
-def v24_prior_feature_row(
-    features: pd.DataFrame,
-    event_date: pd.Timestamp,
-    symbol: str,
-    actual_change: float,
-    name: str = "",
-    actual_close_change: float | None = None,
-    actual_high_change: float | None = None,
-    return_basis: str = "HIGH_OR_CLOSE",
-) -> dict:
-    """Extreme event günü için bir gün önceki feature snapshot'ını üretir."""
-    try:
-        event_date = pd.to_datetime(event_date).tz_localize(None)
-    except Exception:
-        return {}
-    if features is None or features.empty:
-        return {}
-    idx = features.index
-    if event_date not in idx:
-        before_or_equal = idx[idx <= event_date]
-        if len(before_or_equal) == 0:
-            return {}
-        event_date = before_or_equal[-1]
-    loc = features.index.get_loc(event_date)
-    if isinstance(loc, slice):
-        loc = loc.start
-    if loc <= 0:
-        return {}
-    prev = features.iloc[loc - 1]
-    cur = features.iloc[loc]
-    close_chg = safe_float(actual_close_change, safe_float(cur.get("Close_Return_%"), np.nan))
-    high_chg = safe_float(actual_high_change, safe_float(cur.get("High_Return_%"), np.nan))
-    collector_chg = safe_float(actual_change, np.nan)
-    bucket = "100_PLUS" if collector_chg >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
-    return {
-        "date": event_date.strftime("%Y-%m-%d"),
-        "Symbol": symbol,
-        "Name": name,
-        "Actual_Change_%": round(float(collector_chg), 2) if pd.notna(collector_chg) else np.nan,
-        "Actual_Close_Return_%": round(float(close_chg), 2) if pd.notna(close_chg) else np.nan,
-        "Actual_High_Return_%": round(float(high_chg), 2) if pd.notna(high_chg) else np.nan,
-        "Return_Basis": return_basis,
-        "Bucket": bucket,
-        "Prev_Date": features.index[loc - 1].strftime("%Y-%m-%d"),
-        "Prev_Close": round(safe_float(prev.get("Close"), np.nan), 4),
-        "Prev_Change_%": round(safe_float(prev.get("Close_Return_%", prev.get("Return_%")), np.nan), 2),
-        "Prev_High_Return_%": round(safe_float(prev.get("High_Return_%"), np.nan), 2),
-        "Prev_Collector_Return_%": round(safe_float(prev.get("Collector_Return_%"), np.nan), 2),
-        "Prev_Gap_%": round(safe_float(prev.get("Gap_%"), np.nan), 2),
-        "Prev_RVOL20": round(safe_float(prev.get("RVOL20"), np.nan), 2),
-        "Prev_DollarVolume": round(safe_float(prev.get("DollarVolume"), np.nan), 0),
-        "Prev_CloseStrength": round(safe_float(prev.get("CloseStrength"), np.nan), 3),
-        "Prev_Range_%": round(safe_float(prev.get("Range_%"), np.nan), 2),
-        "Prev_ATR14_%": round(safe_float(prev.get("ATR14_%"), np.nan), 2),
-        "Prev_Close_Above_EMA9": bool(prev.get("Close_Above_EMA9", False)),
-        "Prev_EMA9_Above_EMA20": bool(prev.get("EMA9_Above_EMA20", False)),
-        "Prev_OBV_Slope5": round(safe_float(prev.get("OBV_Slope5"), np.nan), 0),
-        "Event_Open": round(safe_float(cur.get("Open"), np.nan), 4),
-        "Event_High": round(safe_float(cur.get("High"), np.nan), 4),
-        "Event_Low": round(safe_float(cur.get("Low"), np.nan), 4),
-        "Event_Close": round(safe_float(cur.get("Close"), np.nan), 4),
-        "Event_Volume": round(safe_float(cur.get("Volume"), np.nan), 0),
-        "Collector_Source": "Yahoo_Daily_Collector_HighOrClose",
-    }
-
-def v24_iso_date_query_preview(min_pct: float, date_s: str) -> str:
-    """Locale bağımsız FinScreener sorgu örneği. Ay adı kullanmaz."""
-    date_s = v24_parse_date_any(date_s) or str(date_s)
-    return (
-        f"Stock with Percentage Change >= {float(min_pct):g} on {date_s}; "
-        "Last Price, Last Percentage Change, Volume, Market Cap"
-    )
-
-
-
-# v24.5 FULL-MARKET TRUTH COLLECTOR
-# ------------------------------------------------------------
-# AI Invest denetiminden çıkan mimari ayrım:
-# 1) Truth Collector: full-market FinScreener event query ile gerçek %50+/%100+ olayları toplar.
-#    Bu aşamada ticker universe, daily_shuffle, Alpaca/Yahoo, price/mcap/tradeability filtresi kullanılmaz.
-# 2) Feature Enricher: truth events bulunduktan sonra Alpaca/Yahoo barları ile önceki gün feature'larını çıkarır.
-# 3) Signal Joiner: model sinyalleri ile truth events eşleştirilir.
-
-def v24_truth_safe_float_value(x):
-    if x is None:
-        return None
-    try:
-        if isinstance(x, str):
-            x = x.replace("%", "").replace("$", "").replace(",", "").strip()
-            if x == "" or x.lower() in ["nan", "none", "null", "n/a", "-"]:
-                return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def v24_truth_clean_plain_symbol(symbol):
-    sym = v24_symbol_clean(symbol)
-    if not sym:
-        return None
-    # FinScreener/AInvest bazen AKTX.O gibi suffix döndürebilir.
-    if "." in sym:
-        sym = sym.split(".")[0]
-    return sym
-
-
-def v24_get_finscreener_callable():
-    """Ortamda FinScreener varsa döndürür; yoksa None.
-
-    Not: Standart Render/Streamlit ortamında FinScreener fonksiyonu bulunmayabilir.
-    Bu durumda kullanıcı AInvest/FinScreener CSV'sini 'Uploaded Extreme CSV' sekmesine yükleyebilir.
-    """
-    fs = globals().get("FinScreener")
-    if callable(fs):
-        return fs, "globals.FinScreener"
-    # Bazı kullanıcı ortamlarında farklı paket isimleri olabilir; hata üretmeden deneriz.
-    import_attempts = [
-        ("ainvest", "FinScreener"),
-        ("aiinvest", "FinScreener"),
-        ("fin_screener", "FinScreener"),
-        ("finscreener", "FinScreener"),
-    ]
-    for mod_name, attr in import_attempts:
-        try:
-            mod = __import__(mod_name, fromlist=[attr])
-            fn = getattr(mod, attr, None)
-            if callable(fn):
-                return fn, f"{mod_name}.{attr}"
-        except Exception:
-            continue
-    return None, "NOT_AVAILABLE"
-
-
-def v24_pick_symbol_column(df: pd.DataFrame):
-    candidates = ["code", "stock code", "symbol", "Symbol", "ticker", "Ticker"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "symbol" in col_str or "ticker" in col_str or "code" in col_str:
-            return col
-    return None
-
-
-def v24_pick_name_column(df: pd.DataFrame):
-    candidates = ["name", "stock name", "Name", "company", "Company", "description", "Description"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "name" in col_str or "company" in col_str or "description" in col_str:
-            return col
-    return None
-
-
-def v24_pick_percentage_change_column(df: pd.DataFrame, ymd: str):
-    for col in df.columns:
-        col_str = str(col)
-        if "Percentage Change[" in col_str and ymd in col_str:
-            return col
-    for col in df.columns:
-        col_str = str(col)
-        if "Percentage Change[" in col_str:
-            return col
-    for col in df.columns:
-        col_str = str(col)
-        if "Last Percentage Change" in col_str or ("Last Change" in col_str and "%" in col_str):
-            return col
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "change" in col_str and ("%" in col_str or "pct" in col_str or "percentage" in col_str):
-            return col
-    return None
-
-
-def v24_pick_last_price_column(df: pd.DataFrame):
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "last price" in col_str or "last sale" in col_str:
-            return col
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "closing price" in col_str or col_str in ["price", "last"]:
-            return col
-    return None
-
-
-def v24_pick_volume_column(df: pd.DataFrame):
-    for col in df.columns:
-        col_str = str(col).lower()
-        if "trading volume" in col_str:
-            return col
-    for col in df.columns:
-        col_str = str(col).lower()
-        if col_str == "volume" or "volume" in col_str:
-            return col
-    return None
-
-
-def v24_pick_market_cap_column(df: pd.DataFrame):
-    for col in df.columns:
-        if "market cap" in str(col).lower():
-            return col
-    return None
-
-
-def v24_collect_extreme_events_truth_finscreener(start_date, end_date, min_pct: float = 50.0):
-    """Full-market truth collector.
-
-    Verilen tarih aralığında ABD piyasasında günlük Percentage Change >= min_pct olan gerçek runner
-    olaylarını doğrudan FinScreener event query ile toplar. Bu aşamada ticker universe, max scan,
-    daily_shuffle, manual smoke, Alpaca/Yahoo veya tradeability filtresi kullanılmaz.
-    """
-    fs, fs_source = v24_get_finscreener_callable()
-    start_s = v24_parse_date_any(start_date)
-    end_s = v24_parse_date_any(end_date)
-    rows = []
-    logs = []
-
-    if fs is None:
-        return pd.DataFrame(), pd.DataFrame([{
-            "date": "",
-            "status": "finscreener_not_available",
-            "query": "",
-            "raw_rows": 0,
-            "kept_rows": 0,
-            "finscreener_source": fs_source,
-            "message": "FinScreener callable not found in this Streamlit environment. Use Uploaded Extreme CSV or install/provide FinScreener."
-        }])
-
-    cur = pd.to_datetime(start_s).date()
-    end_d = pd.to_datetime(end_s).date()
-    while cur <= end_d:
-        iso = cur.strftime("%Y-%m-%d")
-        ymd = cur.strftime("%Y%m%d")
-        if cur.weekday() >= 5:
-            logs.append({
-                "date": iso,
-                "status": "skipped_weekend",
-                "query": "",
-                "raw_rows": 0,
-                "kept_rows": 0,
-                "finscreener_source": fs_source,
-                "message": "Weekend skipped"
-            })
-            cur += pd.Timedelta(days=1).date() if False else __import__('datetime').timedelta(days=1)
-            continue
-
-        query = v24_iso_date_query_preview(float(min_pct), iso)
-        try:
-            df = fs(query)
-        except Exception as e:
-            logs.append({
-                "date": iso,
-                "status": "error",
-                "query": query,
-                "raw_rows": 0,
-                "kept_rows": 0,
-                "finscreener_source": fs_source,
-                "message": str(e)
-            })
-            cur += __import__('datetime').timedelta(days=1)
-            continue
-
-        if df is None or getattr(df, "empty", True):
-            logs.append({
-                "date": iso,
-                "status": "empty",
-                "query": query,
-                "raw_rows": 0,
-                "kept_rows": 0,
-                "finscreener_source": fs_source,
-                "message": "FinScreener returned no rows"
-            })
-            cur += __import__('datetime').timedelta(days=1)
-            continue
-
-        symbol_col = v24_pick_symbol_column(df)
-        name_col = v24_pick_name_column(df)
-        pct_col = v24_pick_percentage_change_column(df, ymd)
-        price_col = v24_pick_last_price_column(df)
-        volume_col = v24_pick_volume_column(df)
-        mcap_col = v24_pick_market_cap_column(df)
-        if symbol_col is None or pct_col is None:
-            logs.append({
-                "date": iso,
-                "status": "missing_required_columns",
-                "query": query,
-                "raw_rows": len(df),
-                "kept_rows": 0,
-                "finscreener_source": fs_source,
-                "message": f"Columns returned: {list(df.columns)}"
-            })
-            cur += __import__('datetime').timedelta(days=1)
-            continue
-
-        kept = 0
-        for _, r in df.iterrows():
-            sym = v24_truth_clean_plain_symbol(r.get(symbol_col))
-            pct_val = v24_truth_safe_float_value(r.get(pct_col))
-            if not sym or pct_val is None or pct_val < float(min_pct):
-                continue
-            bucket = "100_PLUS" if pct_val >= V24_BIG_RUNNER_GAIN_PCT else "50_99"
-            rows.append({
-                "date": iso,
-                "Symbol": sym,
-                "Name": r.get(name_col) if name_col else None,
-                "Actual_Change_%": round(float(pct_val), 4),
-                "pct_change_on_day": round(float(pct_val), 4),
-                "Bucket": bucket,
-                "bucket": bucket,
-                "Last_Price": r.get(price_col) if price_col else None,
-                "Volume": r.get(volume_col) if volume_col else None,
-                "MarketCap": r.get(mcap_col) if mcap_col else None,
-                "Truth_Source": "FinScreener_FullMarket_Event_Query",
-                "pct_col_used": pct_col,
-                "source_query": query,
-            })
-            kept += 1
-
-        logs.append({
-            "date": iso,
-            "status": "ok" if kept > 0 else "raw_rows_but_no_kept_rows",
-            "query": query,
-            "raw_rows": len(df),
-            "kept_rows": kept,
-            "finscreener_source": fs_source,
-            "message": f"Raw rows: {len(df)}, kept rows: {kept}"
-        })
-        cur += __import__('datetime').timedelta(days=1)
-
-    events_df = pd.DataFrame(rows)
-    log_df = pd.DataFrame(logs)
-    if not events_df.empty:
-        events_df = events_df.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).reset_index(drop=True)
-    return events_df, log_df
-
-
-def v24_truth_collector_diagnostics(events_df: pd.DataFrame, log_df: pd.DataFrame) -> pd.DataFrame:
-    if events_df is None or events_df.empty:
-        event_rows = unique_symbols = plus_50_99 = plus_100 = 0
-    else:
-        event_rows = len(events_df)
-        unique_symbols = events_df["Symbol"].nunique() if "Symbol" in events_df.columns else 0
-        plus_100 = int((pd.to_numeric(events_df.get("Actual_Change_%"), errors="coerce") >= V24_BIG_RUNNER_GAIN_PCT).sum())
-        plus_50_99 = int(event_rows - plus_100)
-    if log_df is None or log_df.empty or "status" not in log_df.columns:
-        statuses = {}
-    else:
-        statuses = log_df["status"].value_counts().to_dict()
-    return pd.DataFrame([{
-        "Collector_Mode": "FULL_MARKET_TRUTH_COLLECTOR",
-        "event_rows": int(event_rows),
-        "unique_symbols": int(unique_symbols),
-        "50_99_events": int(plus_50_99),
-        "100_PLUS_events": int(plus_100),
-        "ok_days": int(statuses.get("ok", 0)),
-        "empty_days": int(statuses.get("empty", 0)),
-        "error_days": int(statuses.get("error", 0)),
-        "weekend_skipped": int(statuses.get("skipped_weekend", 0)),
-        "missing_column_days": int(statuses.get("missing_required_columns", 0)),
-        "finscreener_not_available": int(statuses.get("finscreener_not_available", 0)),
-    }])
-
-
-def v24_try_enrich_truth_events_with_prior_features(events_df: pd.DataFrame, max_events: int = 200) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Truth events bulunduktan sonra opsiyonel olarak önceki gün daily feature ekler.
-
-    Bu, truth collector'ın parçası değildir; Alpaca/Yahoo hatası truth event listesini silemez.
-    """
-    if events_df is None or events_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    rows = []
-    logs = []
-    work = events_df.head(int(max_events)).copy()
-    for _, ev in work.iterrows():
-        sym = v24_symbol_clean(ev.get("Symbol"))
-        date_s = v24_parse_date_any(ev.get("date"))
-        if not sym or not date_s:
-            continue
-        # Önceki özellikler için yaklaşık 80 gün geriye bakılır.
-        start_s = (pd.to_datetime(date_s) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
-        end_s = date_s
-        try:
-            df, provider, diag = v24_deep_fetch_history(sym, start_s, end_s, api_key_value=api_key, secret_key_value=secret_key, alpaca_feed=os.getenv("ALPACA_FEED", "iex"))
-            if df is None or df.empty or len(df) < 2:
-                logs.append({"Symbol": sym, "date": date_s, "status": "no_feature_data", "provider": provider, **(diag or {})})
-                base = ev.to_dict()
-                base.update({"Feature_Enrichment_Status": "NO_DATA", "Feature_Provider": provider})
-                rows.append(base)
-                continue
-            feat = v24_compute_daily_features(df)
-            prior = v24_prior_feature_row(sym, feat, date_s)
-            base = ev.to_dict()
-            base.update(prior)
-            base.update({"Feature_Enrichment_Status": "OK", "Feature_Provider": provider})
-            rows.append(base)
-            logs.append({"Symbol": sym, "date": date_s, "status": "ok", "provider": provider, "rows": len(df)})
-        except Exception as e:
-            logs.append({"Symbol": sym, "date": date_s, "status": "error", "message": str(e)})
-            base = ev.to_dict()
-            base.update({"Feature_Enrichment_Status": "ERROR", "Feature_Error": str(e)})
-            rows.append(base)
-    return pd.DataFrame(rows), pd.DataFrame(logs)
-
-
-def v24_collect_extreme_gainers_from_history(
-    tickers: list[str],
-    start_date: str,
-    end_date: str,
-    min_pct: float = 50.0,
-    max_tickers: int = 800,
-    sample_mode: str = "daily_shuffle",
-    debug_pct: float = V24_DEBUG_GAIN_PCT,
-    manual_symbols: list[str] | None = None,
-    api_key_value: str = "",
-    secret_key_value: str = "",
-    alpaca_feed: str = "iex",
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Ticker evreninden son dönemin %50+/%100+ günlerini ve önceki gün feature'larını toplar.
-
-    v24.4 patch:
-    - Manual smoke semboller örneklemeden bağımsız şekilde ZORLA taramaya eklenir.
-    - Event tespiti sadece close-to-close değil, max(close return, intraday high return) ile yapılır.
-    - Yahoo bulk boş dönerse manual smoke semboller için Alpaca + Yahoo individual + Yahoo chart fallback denenir.
-    - Provider-level diagnostics üretir: Alpaca/Yahoo OK, rows, first/last date, hata kaynağı.
-    """
-    start_iso = v24_parse_date_any(start_date) or str(start_date)
-    end_iso = v24_parse_date_any(end_date) or str(end_date)
-    clean = [v24_symbol_clean(t) for t in tickers if v24_symbol_clean(t)]
-    clean = list(dict.fromkeys(clean))
-    manual_clean = [v24_symbol_clean(t) for t in (manual_symbols or []) if v24_symbol_clean(t)]
-    manual_clean = list(dict.fromkeys(manual_clean))
-
-    diagnostics = {
-        "Collector_Version": "v24.4_PROVIDER_FALLBACK_DEEP_SMOKE",
-        "Locale_Safe_Date_Mode": "YYYY-MM-DD",
-        "Return_Mode": "MAX_OF_CLOSE_RETURN_AND_INTRADAY_HIGH_RETURN",
-        "Start_Date_ISO": start_iso,
-        "End_Date_ISO": end_iso,
-        "Threshold_%": float(min_pct),
-        "Debug_Threshold_%": float(debug_pct),
-        "Ticker_Universe_Total": len(clean),
-        "Manual_Smoke_Symbols": ",".join(manual_clean),
-        "Manual_Smoke_Count": len(manual_clean),
-        "Sample_Mode": sample_mode,
-        "FinScreener_Query_Preview_ISO": v24_iso_date_query_preview(min_pct, end_iso),
-    }
-
-    if not clean and not manual_clean:
-        diagnostics.update({"Selected_Tickers": 0, "Scanned_Tickers": 0, "Data_OK_Tickers": 0, "Events_ThresholdPlus": 0, "Events_DebugPlus": 0})
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame([diagnostics]), pd.DataFrame(), pd.DataFrame()
-
-    # Manual smoke semboller örneklemeden bağımsız; kalan max_tickers bütçesi evrene uygulanır.
-    base_universe = [t for t in clean if t not in set(manual_clean)]
-    remaining_n = max(int(max_tickers) - len(manual_clean), 0) if max_tickers else len(base_universe)
-    if max_tickers and len(base_universe) > remaining_n:
-        if sample_mode == "first_n":
-            sampled = base_universe[:remaining_n]
-        else:
-            seed = int(pd.to_datetime(end_iso).strftime("%Y%m%d"))
-            sampled = pd.Series(base_universe).sample(n=remaining_n, random_state=seed).tolist() if remaining_n > 0 else []
-    else:
-        sampled = base_universe
-    selected = list(dict.fromkeys(manual_clean + sampled))
-
-    diagnostics["Selected_Tickers"] = len(selected)
-    diagnostics["Scanned_Tickers"] = len(selected)
-    diagnostics["Selected_First_20"] = ",".join(selected[:20])
-    diagnostics["Manual_Forced_In_Selected"] = all(t in selected for t in manual_clean) if manual_clean else True
-
-    start_buffer = (pd.to_datetime(start_iso) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-    hist_dict = v24_yf_download_history_cached(tuple(selected), start_buffer, end_iso, chunk_size=50)
-
-    rows: list[dict] = []
-    errors: list[dict] = []
-    debug_rows: list[dict] = []
-    top_rows: list[dict] = []
-    smoke_rows: list[dict] = []
-    data_ok = 0
-    insufficient = 0
-    feature_failed = 0
-    max_observed = np.nan
-    max_close_observed = np.nan
-    max_high_observed = np.nan
-
-    provider_source_counts: dict[str, int] = {}
-    deep_fetch_used = 0
-
-    for sym in selected:
-        is_manual = sym in set(manual_clean)
-        raw = hist_dict.get(sym, pd.DataFrame())
-        provider_source = "Yahoo_Bulk" if raw is not None and not raw.empty else ""
-        provider_diag = {
-            "Provider_Source": provider_source,
-            "Provider_Attempts": "Yahoo_Bulk",
-            "Rows_Returned": int(len(raw)) if raw is not None and not raw.empty else 0,
-            "First_Date": raw.index.min().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
-            "Last_Date": raw.index.max().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
-        }
-
-        # v24.4: Bulk Yahoo no_data ise manual smoke sembollerde derin provider debug yap.
-        # Küçük evrenlerde tüm sembollere de denenebilir; büyük 900+ evrende hız için manual ile sınırlı tutulur.
-        if (raw is None or raw.empty) and (is_manual or len(selected) <= 120):
-            deep_fetch_used += 1
-            raw, provider_source, provider_diag = v24_deep_fetch_history(
-                sym,
-                start_buffer,
-                end_iso,
-                api_key_value=api_key_value,
-                secret_key_value=secret_key_value,
-                alpaca_feed=alpaca_feed,
-            )
-
-        provider_source_counts[provider_source or "NO_DATA"] = provider_source_counts.get(provider_source or "NO_DATA", 0) + 1
-
-        if raw is None or raw.empty:
-            insufficient += 1
-            err = {
-                "Symbol": sym,
-                "Error": "no_data",
-                "Rows": 0,
-                "Manual_Smoke": is_manual,
-                **provider_diag,
-            }
-            errors.append(err)
-            if is_manual:
-                smoke_rows.append({
-                    "Symbol": sym,
-                    "Manual_Smoke": True,
-                    "Data_OK": False,
-                    "Error": "no_data",
-                    **provider_diag,
-                })
-            continue
-
-        # v24.4: Runner event tespiti için 2 günlük bar yeterli.
-        # 25 bar altı feature kalitesi zayıf olur; ama veri var/yok ve high-return smoke test için elenmez.
-        low_history_warning = len(raw) < V24_MIN_HISTORY_BARS_FOR_FEATURES
-        if len(raw) < 2:
-            insufficient += 1
-            err = {
-                "Symbol": sym,
-                "Error": "insufficient_history_lt2",
-                "Rows": int(len(raw)),
-                "Manual_Smoke": is_manual,
-                **provider_diag,
-            }
-            errors.append(err)
-            if is_manual:
-                smoke_rows.append({
-                    "Symbol": sym,
-                    "Manual_Smoke": True,
-                    "Data_OK": False,
-                    "Rows": int(len(raw)),
-                    "Error": "insufficient_history_lt2",
-                    **provider_diag,
-                })
-            continue
-
-        data_ok += 1
-        feat = v24_compute_daily_features(raw)
-        if feat.empty or "Collector_Return_%" not in feat.columns:
-            feature_failed += 1
-            errors.append({"Symbol": sym, "Error": "feature_calc_failed", "Rows": int(len(raw)), "Manual_Smoke": is_manual})
-            if is_manual:
-                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": True, "Error": "feature_calc_failed"})
-            continue
-
-        in_range = (feat.index >= pd.to_datetime(start_iso)) & (feat.index <= pd.to_datetime(end_iso))
-        if not in_range.any():
-            errors.append({"Symbol": sym, "Error": "no_rows_in_date_range", "Rows": int(len(raw)), "Manual_Smoke": is_manual})
-            if is_manual:
-                smoke_rows.append({"Symbol": sym, "Manual_Smoke": True, "Data_OK": True, "Rows": int(len(raw)), "Error": "no_rows_in_date_range"})
-            continue
-
-        ranged = feat.loc[in_range].copy()
-        local_max = safe_float(ranged["Collector_Return_%"].max(), np.nan)
-        local_max_close = safe_float(ranged.get("Close_Return_%", pd.Series(dtype=float)).max(), np.nan)
-        local_max_high = safe_float(ranged.get("High_Return_%", pd.Series(dtype=float)).max(), np.nan)
-        if pd.notna(local_max):
-            max_observed = np.nanmax([max_observed, local_max]) if pd.notna(max_observed) else local_max
-        if pd.notna(local_max_close):
-            max_close_observed = np.nanmax([max_close_observed, local_max_close]) if pd.notna(max_close_observed) else local_max_close
-        if pd.notna(local_max_high):
-            max_high_observed = np.nanmax([max_high_observed, local_max_high]) if pd.notna(max_high_observed) else local_max_high
-
-        if pd.notna(local_max):
-            max_idx = ranged["Collector_Return_%"].idxmax()
-            max_row = ranged.loc[max_idx]
-            top_row = {
-                "Symbol": sym,
-                "Manual_Smoke": is_manual,
-                "Date_of_Max_Return": max_idx.strftime("%Y-%m-%d"),
-                "Max_Observed_Return_%": round(safe_float(max_row.get("Collector_Return_%"), np.nan), 2),
-                "Max_Close_Return_%": round(safe_float(max_row.get("Close_Return_%"), np.nan), 2),
-                "Max_High_Return_%": round(safe_float(max_row.get("High_Return_%"), np.nan), 2),
-                "Close": round(safe_float(max_row.get("Close"), np.nan), 4),
-                "High": round(safe_float(max_row.get("High"), np.nan), 4),
-                "Prev_Close": round(safe_float(max_row.get("Prev_Close"), np.nan), 4),
-                "Volume": round(safe_float(max_row.get("Volume"), np.nan), 0),
-                "Rows": int(len(raw)),
-                "Provider_Source": provider_source,
-                "Low_History_Warning": bool(low_history_warning),
-                "First_Date": raw.index.min().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
-                "Last_Date": raw.index.max().strftime("%Y-%m-%d") if raw is not None and not raw.empty else "",
-            }
-            top_rows.append(top_row)
-            if is_manual:
-                smoke_rows.append({**top_row, "Data_OK": True, "Error": ""})
-
-        debug_events = ranged.loc[ranged["Collector_Return_%"] >= float(debug_pct)].copy()
-        for event_date, ev in debug_events.iterrows():
-            debug_rows.append({
-                "date": event_date.strftime("%Y-%m-%d"),
-                "Symbol": sym,
-                "Manual_Smoke": is_manual,
-                "Debug_Collector_Return_%": round(safe_float(ev.get("Collector_Return_%"), np.nan), 2),
-                "Debug_Close_Return_%": round(safe_float(ev.get("Close_Return_%"), np.nan), 2),
-                "Debug_High_Return_%": round(safe_float(ev.get("High_Return_%"), np.nan), 2),
-            })
-
-        events = ranged.loc[ranged["Collector_Return_%"] >= float(min_pct)]
-        for event_date, ev in events.iterrows():
-            collector_ret = safe_float(ev.get("Collector_Return_%"), np.nan)
-            close_ret = safe_float(ev.get("Close_Return_%"), np.nan)
-            high_ret = safe_float(ev.get("High_Return_%"), np.nan)
-            basis = "HIGH_RETURN" if pd.notna(high_ret) and (pd.isna(close_ret) or high_ret >= close_ret) else "CLOSE_RETURN"
-            row = v24_prior_feature_row(
-                feat,
-                event_date,
-                sym,
-                collector_ret,
-                actual_close_change=close_ret,
-                actual_high_change=high_ret,
-                return_basis=basis,
-            )
-            if row:
-                row["Collector_Date_Query_Format"] = "YYYY-MM-DD"
-                row["Manual_Smoke"] = is_manual
-                row["Provider_Source"] = provider_source
-                row["Low_History_Warning"] = bool(low_history_warning)
-                rows.append(row)
-
-    extreme = pd.DataFrame(rows)
-    if not extreme.empty:
-        extreme["Is_100Plus"] = extreme["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT
-        extreme["Is_Debug_20Plus"] = extreme["Actual_Change_%"] >= float(debug_pct)
-
-    errors_df = pd.DataFrame(errors)
-    # v24.3 SORT GUARD:
-    # Eğer bütün manual smoke semboller no_data/insufficient dönerse smoke_rows içinde
-    # Max_Observed_Return_% kolonu oluşmaz. Önceki sürüm bu kolona göre sort ederken
-    # KeyError veriyordu. Diagnostics asla collector'ı düşürmemeli; eksik kolonları
-    # NaN ile tamamlayıp sıralamayı güvenli yapıyoruz.
-    top_observed_cols = [
-        "Symbol", "Manual_Smoke", "Date_of_Max_Return", "Max_Observed_Return_%",
-        "Max_Close_Return_%", "Max_High_Return_%", "Close", "High",
-        "Prev_Close", "Volume", "Rows", "Provider_Source", "Low_History_Warning", "First_Date", "Last_Date",
-    ]
-    smoke_cols = top_observed_cols + ["Data_OK", "Error", "Provider_Attempts", "Alpaca_OK", "Alpaca_Rows", "Alpaca_Error", "Yahoo_Individual_OK", "Yahoo_Individual_Rows", "Yahoo_Individual_Method", "Yahoo_Individual_Error", "Yahoo_Chart_OK", "Yahoo_Chart_Rows", "Yahoo_Chart_Error", "Rows_Returned"]
-
-    top_observed_df = pd.DataFrame(top_rows)
-    if top_observed_df.empty:
-        top_observed_df = pd.DataFrame(columns=top_observed_cols)
-    else:
-        for col in top_observed_cols:
-            if col not in top_observed_df.columns:
-                top_observed_df[col] = np.nan if col not in {"Symbol", "Error"} else ""
-        top_observed_df["Max_Observed_Return_%"] = pd.to_numeric(top_observed_df["Max_Observed_Return_%"], errors="coerce")
-        top_observed_df = top_observed_df.sort_values("Max_Observed_Return_%", ascending=False, na_position="last")
-
-    smoke_df = pd.DataFrame(smoke_rows)
-    if smoke_df.empty:
-        smoke_df = pd.DataFrame(columns=smoke_cols)
-    else:
-        for col in smoke_cols:
-            if col not in smoke_df.columns:
-                if col == "Data_OK":
-                    smoke_df[col] = False
-                elif col == "Error":
-                    smoke_df[col] = ""
-                elif col in {"Symbol", "Date_of_Max_Return"}:
-                    smoke_df[col] = ""
-                else:
-                    smoke_df[col] = np.nan
-        smoke_df["Max_Observed_Return_%"] = pd.to_numeric(smoke_df["Max_Observed_Return_%"], errors="coerce")
-        smoke_df = smoke_df.sort_values("Max_Observed_Return_%", ascending=False, na_position="last")
-
-    debug_df = pd.DataFrame(debug_rows)
-    summary = v24_extreme_daily_summary(extreme)
-
-    diagnostics.update({
-        "Data_OK_Tickers": int(data_ok),
-        "NoData_or_Insufficient_Tickers": int(insufficient),
-        "Feature_Failed_Tickers": int(feature_failed),
-        "Skipped_Total": int(len(selected) - data_ok + feature_failed),
-        "Events_ThresholdPlus": int(len(extreme)),
-        "Events_100Plus": int((extreme.get("Actual_Change_%", pd.Series(dtype=float)) >= 100).sum()) if not extreme.empty else 0,
-        "Events_DebugPlus": int(len(debug_df)),
-        "Max_Observed_Return_%": round(float(max_observed), 2) if pd.notna(max_observed) else np.nan,
-        "Max_Close_Return_%": round(float(max_close_observed), 2) if pd.notna(max_close_observed) else np.nan,
-        "Max_High_Return_%": round(float(max_high_observed), 2) if pd.notna(max_high_observed) else np.nan,
-        "Top_Observed_Rows": int(len(top_observed_df)),
-        "Manual_Smoke_Data_OK": int(smoke_df.get("Data_OK", pd.Series(dtype=bool)).fillna(False).sum()) if not smoke_df.empty else 0,
-        "Deep_Fetch_Used_Count": int(deep_fetch_used),
-        "Provider_Source_Counts": str(provider_source_counts),
-        "Data_Source": "Yahoo_Bulk + Alpaca/Yahoo_Individual/Yahoo_Chart fallback for smoke",
-        "Diagnostic_Note": "v24.4 adds provider-level fallback and deep smoke diagnostics. If manual smoke remains no_data, check Alpaca/Yahoo individual/chart errors and first/last date columns.",
+    pattern_name, pattern_score, top_matches = compute_pattern_similarity({
+        "price": price,
+        "drawdown90": drawdown90,
+        "base_tightness10": base_tightness10,
+        "prev_day_ret": prev_day_ret,
+        "prev_vol_ratio": prev_vol_ratio,
+        "prev_close_strength": (prev_close_strength * 100) if pd.notna(prev_close_strength) else np.nan,
+        "breakout20": 1 if breakout20 else 0,
+        "gap_pct": gap_pct,
+        "pre_vol_ratio": pre_vol_ratio,
+        "hold_quality": pre_ctx["hold_quality"],
+        "pre_dollar_vol": pre_dollar_vol,
+        "above_prev_high": 1 if above_prev_high else 0
     })
-    diag_df = pd.DataFrame([diagnostics])
-    return extreme, summary, errors_df, diag_df, top_observed_df, smoke_df
 
-def v24_extreme_daily_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
-    if extreme_df is None or extreme_df.empty or "date" not in extreme_df.columns:
-        return pd.DataFrame()
-    df = extreme_df.copy()
-    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
-    out = df.groupby(["date", "Bucket"]).size().unstack(fill_value=0).reset_index()
-    if "50_99" not in out.columns:
-        out["50_99"] = 0
-    if "100_PLUS" not in out.columns:
-        out["100_PLUS"] = 0
-    out["Total_50Plus"] = out["50_99"] + out["100_PLUS"]
-    return out.sort_values("date", ascending=False).reset_index(drop=True)
-
-
-def v24_runner_dna_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
-    if extreme_df is None or extreme_df.empty or "Symbol" not in extreme_df.columns:
-        return pd.DataFrame()
-    df = extreme_df.copy()
-    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
-    grp = df.groupby("Symbol", dropna=False)
-    rows = []
-    for sym, g in grp:
-        plus50 = len(g)
-        plus100 = int((g["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT).sum())
-        max_gain = safe_float(g["Actual_Change_%"].max(), np.nan)
-        avg_gain = safe_float(g["Actual_Change_%"].mean(), np.nan)
-        last_date = str(g["date"].max()) if "date" in g.columns else ""
-        # DNA score: tekrar + 100+ + max gain; sadece öncelik skoru, al sinyali değil.
-        score = min(100.0, plus50 * 18 + plus100 * 20 + min(max_gain or 0, 200) * 0.12)
-        name = ""
-        if "Name" in g.columns:
-            vals = [x for x in g["Name"].dropna().astype(str).unique().tolist() if x.strip()]
-            name = vals[0] if vals else ""
-        rows.append({
-            "Symbol": sym,
-            "Name": name,
-            "Runner_50Plus_Count": int(plus50),
-            "Runner_100Plus_Count": int(plus100),
-            "Last_Runner_Date": last_date,
-            "Avg_Runner_Gain_%": round(avg_gain, 2) if pd.notna(avg_gain) else np.nan,
-            "Max_Runner_Gain_%": round(max_gain, 2) if pd.notna(max_gain) else np.nan,
-            "Runner_DNA_Score": round(score, 1),
-        })
-    return pd.DataFrame(rows).sort_values(["Runner_DNA_Score", "Runner_100Plus_Count", "Runner_50Plus_Count"], ascending=False).reset_index(drop=True)
-
-
-def v24_calibration_feature_summary(extreme_df: pd.DataFrame) -> pd.DataFrame:
-    """%50+ ve %100+ gruplarının bir gün önceki feature özetini verir."""
-    if extreme_df is None or extreme_df.empty:
-        return pd.DataFrame()
-    num_cols = [
-        "Prev_Change_%", "Prev_Gap_%", "Prev_RVOL20", "Prev_DollarVolume",
-        "Prev_CloseStrength", "Prev_Range_%", "Prev_ATR14_%", "Prev_OBV_Slope5",
-        "Actual_Change_%",
-    ]
-    rows = []
-    df = extreme_df.copy()
-    df["Bucket"] = np.where(df["Actual_Change_%"] >= V24_BIG_RUNNER_GAIN_PCT, "100_PLUS", "50_99")
-    for bucket, g in df.groupby("Bucket"):
-        base = {"Group": bucket, "N": len(g)}
-        for c in num_cols:
-            if c in g.columns:
-                vals = pd.to_numeric(g[c], errors="coerce")
-                base[f"{c}_median"] = round(vals.median(), 3) if vals.notna().any() else np.nan
-                base[f"{c}_mean"] = round(vals.mean(), 3) if vals.notna().any() else np.nan
-        for c in ["Prev_Close_Above_EMA9", "Prev_EMA9_Above_EMA20"]:
-            if c in g.columns:
-                base[f"{c}_rate_%"] = round(pd.Series(g[c]).astype(bool).mean() * 100, 1)
-        rows.append(base)
-    # genel grup
-    base = {"Group": "ALL_50_PLUS", "N": len(df)}
-    for c in num_cols:
-        if c in df.columns:
-            vals = pd.to_numeric(df[c], errors="coerce")
-            base[f"{c}_median"] = round(vals.median(), 3) if vals.notna().any() else np.nan
-            base[f"{c}_mean"] = round(vals.mean(), 3) if vals.notna().any() else np.nan
-    for c in ["Prev_Close_Above_EMA9", "Prev_EMA9_Above_EMA20"]:
-        if c in df.columns:
-            base[f"{c}_rate_%"] = round(pd.Series(df[c]).astype(bool).mean() * 100, 1)
-    rows.append(base)
-    return pd.DataFrame(rows)
-
-
-def v24_extract_signal_date_from_filename(name: str) -> str | None:
-    if not name:
-        return None
-    m = re.search(r"(20\d{6})", str(name))
-    if not m:
-        return None
-    try:
-        return pd.to_datetime(m.group(1), format="%Y%m%d").strftime("%Y-%m-%d")
-    except Exception:
-        return None
-
-
-def v24_load_signal_csvs(uploaded_files) -> pd.DataFrame:
-    """Geçmiş NextDay/Night/Supernova/v23 CSV'lerini tek sinyal tablosuna çevirir."""
-    if not uploaded_files:
-        return pd.DataFrame()
-    frames = []
-    for f in uploaded_files:
-        try:
-            f.seek(0)
-            df = pd.read_csv(f)
-        except UnicodeDecodeError:
-            f.seek(0)
-            df = pd.read_csv(f, encoding="latin-1")
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-        sym_col = v24_detect_col(df, ["Symbol", "Ticker", "Hisse", "code", "yahoo_symbol"])
-        if sym_col is None:
-            continue
-        sig_date = v24_extract_signal_date_from_filename(getattr(f, "name", ""))
-        date_col = v24_detect_col(df, ["Signal_Date", "signal_date", "Date", "date", "Trade_Date"])
-        mod = "UNKNOWN"
-        lname = getattr(f, "name", "").lower()
-        if "nextday" in lname:
-            mod = "NEXTDAY"
-        elif "night" in lname:
-            mod = "NIGHT"
-        elif "supernova" in lname or "tradable" in lname:
-            mod = "SUPERNOVA"
-        elif "v23" in lname or "discovery" in lname:
-            mod = "V23_DISCOVERY"
-        elif "runner" in lname:
-            mod = "RUNNER"
-        out = pd.DataFrame()
-        out["Symbol"] = df[sym_col].apply(v24_symbol_clean)
-        out["Signal_Date"] = df[date_col].apply(v24_parse_date_any) if date_col else sig_date
-        out["Model_Module"] = mod
-        out["Source_File"] = getattr(f, "name", "uploaded.csv")
-        # Useful optional columns
-        for target_col in ["Confidence", "Final_Score", "Score", "V23_Discovery_Score", "Supernova_Tradability_Score", "Trade_Readiness", "Signal", "V23_Bucket", "Trade_Status"]:
-            src_col = v24_detect_col(df, [target_col])
-            if src_col:
-                out[target_col] = df[src_col]
-        out = out[(out["Symbol"] != "") & out["Signal_Date"].notna()].copy()
-        frames.append(out)
-    if not frames:
-        return pd.DataFrame()
-    sig = pd.concat(frames, ignore_index=True, sort=False)
-    sig["Signal_Date"] = sig["Signal_Date"].apply(v24_parse_date_any)
-    sig["Outcome_Date_D1"] = (pd.to_datetime(sig["Signal_Date"]) + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
-    sig["Outcome_Date_D2"] = (pd.to_datetime(sig["Signal_Date"]) + pd.Timedelta(days=2)).dt.strftime("%Y-%m-%d")
-    return sig.reset_index(drop=True)
-
-
-def v24_join_signals_to_extremes(signals_df: pd.DataFrame, extreme_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if signals_df is None or signals_df.empty or extreme_df is None or extreme_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    ex = extreme_df.copy()
-    ex["Symbol"] = ex["Symbol"].apply(v24_symbol_clean)
-    ex["date"] = ex["date"].apply(v24_parse_date_any)
-    ex_key = ex[["Symbol", "date", "Actual_Change_%", "Bucket"]].drop_duplicates(["Symbol", "date"])
-    sig = signals_df.copy()
-    # D+1 join
-    d1 = sig.merge(ex_key.rename(columns={"date": "Outcome_Date_D1", "Actual_Change_%": "D1_Actual_Change_%", "Bucket": "D1_Bucket"}), on=["Symbol", "Outcome_Date_D1"], how="left")
-    # D+2 join
-    d2 = d1.merge(ex_key.rename(columns={"date": "Outcome_Date_D2", "Actual_Change_%": "D2_Actual_Change_%", "Bucket": "D2_Bucket"}), on=["Symbol", "Outcome_Date_D2"], how="left")
-    d2["Hit_50Plus_D1"] = d2["D1_Actual_Change_%"].notna()
-    d2["Hit_100Plus_D1"] = d2["D1_Actual_Change_%"] >= 100
-    d2["Hit_50Plus_D2"] = d2["D2_Actual_Change_%"].notna()
-    d2["Hit_100Plus_D2"] = d2["D2_Actual_Change_%"] >= 100
-    # Summary by module
-    rows = []
-    for mod, g in d2.groupby("Model_Module", dropna=False):
-        n = len(g)
-        rows.append({
-            "Model_Module": mod,
-            "Signal_Count": int(n),
-            "D1_50Plus_Hits": int(g["Hit_50Plus_D1"].sum()),
-            "D1_50Plus_HitRate_%": round(g["Hit_50Plus_D1"].mean() * 100, 2) if n else 0,
-            "D1_100Plus_Hits": int(g["Hit_100Plus_D1"].sum()),
-            "D1_100Plus_HitRate_%": round(g["Hit_100Plus_D1"].mean() * 100, 2) if n else 0,
-            "D2_50Plus_Hits": int(g["Hit_50Plus_D2"].sum()),
-            "D2_50Plus_HitRate_%": round(g["Hit_50Plus_D2"].mean() * 100, 2) if n else 0,
-            "D2_100Plus_Hits": int(g["Hit_100Plus_D2"].sum()),
-            "D2_100Plus_HitRate_%": round(g["Hit_100Plus_D2"].mean() * 100, 2) if n else 0,
-        })
-    return d2, pd.DataFrame(rows).sort_values(["D1_50Plus_HitRate_%", "D2_50Plus_HitRate_%"], ascending=False)
-
-
-def v24_event_tag_from_text(text: str) -> str:
-    s = str(text or "").lower()
-    if not s.strip():
-        return "NO_HEADLINE"
-    if any(k in s for k in ["fda", "phase", "trial", "clinical", "biotech", "orphan", "drug", "therapeutic", "pharma"]):
-        return "FDA_BIOTECH"
-    if any(k in s for k in ["merger", "acquisition", "buyout", "going private", "strategic review", "takeover"]):
-        return "M&A_BUYOUT_STRATEGIC"
-    if any(k in s for k in ["contract", "partnership", "agreement", "award", "order", "customer"]):
-        return "CONTRACT_PARTNERSHIP"
-    if any(k in s for k in ["earnings", "revenue", "eps", "profit", "guidance", "q1", "q2", "q3", "q4"]):
-        return "EARNINGS"
-    if any(k in s for k in ["offering", "registered direct", "warrant", "atm", "dilution", "convertible"]):
-        return "OFFERING_DILUTION_RISK"
-    if any(k in s for k in ["nasdaq compliance", "reverse split", "split"]):
-        return "LISTING_SPLIT_RISK"
-    return "OTHER_NEWS"
-
-
-def v24_merge_news_tags(extreme_df: pd.DataFrame, news_df: pd.DataFrame) -> pd.DataFrame:
-    if extreme_df is None or extreme_df.empty or news_df is None or news_df.empty:
-        return extreme_df
-    sym_col = v24_detect_col(news_df, ["Symbol", "Ticker", "code"])
-    date_col = v24_detect_col(news_df, ["date", "Date", "News_Date"])
-    headline_col = v24_detect_col(news_df, ["headline", "Headline", "title", "Title", "News"])
-    if sym_col is None or headline_col is None:
-        return extreme_df
-    n = pd.DataFrame()
-    n["Symbol"] = news_df[sym_col].apply(v24_symbol_clean)
-    n["date"] = news_df[date_col].apply(v24_parse_date_any) if date_col else None
-    n["Headline"] = news_df[headline_col].astype(str)
-    n["Event_Tag"] = n["Headline"].apply(v24_event_tag_from_text)
-    # date yoksa symbol bazlı son/tek haber etiketi.
-    ex = extreme_df.copy()
-    if date_col:
-        ex = ex.merge(n[["Symbol", "date", "Headline", "Event_Tag"]].drop_duplicates(["Symbol", "date"]), on=["Symbol", "date"], how="left")
+    decision = "ALMA"
+    if not struct_reject and not pre_reject:
+        composite = np.mean([structural_score, ignition_score, premarket_score, pattern_score])
+        if (
+            structural_score >= 50 and ignition_score >= 60 and
+            premarket_score >= 72 and pattern_score >= super_pattern_strong and composite >= 72
+        ):
+            decision = "GÜÇLÜ AL"
+        elif (
+            structural_score >= 40 and ignition_score >= 50 and
+            premarket_score >= 58 and pattern_score >= super_pattern_al and composite >= 60
+        ):
+            decision = "AL"
+        elif np.mean([structural_score, ignition_score, pattern_score]) >= 65:
+            decision = "İZLE"
     else:
-        ex = ex.merge(n[["Symbol", "Headline", "Event_Tag"]].drop_duplicates(["Symbol"]), on="Symbol", how="left")
-    ex["Event_Tag"] = ex["Event_Tag"].fillna("NO_OBVIOUS_NEWS")
-    return ex
+        if np.mean([structural_score, ignition_score, pattern_score]) >= 68:
+            decision = "İZLE"
 
+    entry_type = "NO_TRADE"
+    entry_idea = np.nan
+    stop = np.nan
+    tp1 = np.nan
+    tp2 = np.nan
 
-def render_v24_runner_dna_lab_tab():
-    st.subheader("📊 v24.5 Historical Runner DNA Lab — Full-Market Truth Collector")
-    st.caption(
-        "Amaç: Son 90 gündeki gerçek %50+/%100+ runner olaylarını önce full-market FinScreener event query ile toplamak; "
-        "sonra bu truth table'ı Alpaca/Yahoo ile feature enrichment ve model signal join aşamalarında kullanmak. "
-        "Bu sekme alım sinyali üretmez; v23/v22 skorlarını gerçek outcome datasıyla kalibre eder."
-    )
+    if decision in ["GÜÇLÜ AL", "AL", "İZLE"]:
+        reclaim = safe_float(last["High"], np.nan) * 1.01 if pd.notna(last["High"]) else np.nan
+        vwap_entry = pre_ctx["pre_vwap"] * 1.01 if pd.notna(pre_ctx["pre_vwap"]) else np.nan
+        entry_idea = max(reclaim, vwap_entry) if pd.notna(reclaim) and pd.notna(vwap_entry) else (reclaim if pd.notna(reclaim) else vwap_entry)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        end_date = st.date_input("Bitiş tarihi", value=datetime.now(ZoneInfo("America/New_York")).date(), key="v24_end_date")
-    with col2:
-        lookback_days = st.number_input("Geriye dönük gün", min_value=1, max_value=365, value=90, step=1, key="v24_lookback")
-    with col3:
-        min_gain = st.slider("Extreme gain eşiği %", 20.0, 150.0, 50.0, 5.0, key="v24_min_gain")
-    with col4:
-        max_tickers = st.number_input("Max ticker tarama — sadece Legacy Bar Scanner için", min_value=50, max_value=6000, value=900, step=50, key="v24_max_tickers")
-
-    start_date = (pd.to_datetime(end_date) - pd.Timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
-    end_date_s = pd.to_datetime(end_date).strftime("%Y-%m-%d")
-
-    st.info(
-        f"Tarih aralığı: {start_date} → {end_date_s}. v24.5'te önerilen ilk adım Full-Market Truth Collector'dır: "
-        "ticker universe, daily_shuffle, Alpaca/Yahoo ve trade filtreleri truth aşamasında kullanılmaz."
-    )
-
-    tab_collect, tab_upload, tab_join = st.tabs(["1️⃣ Truth Collector", "2️⃣ Uploaded Extreme CSV", "3️⃣ Model Signal Join"])
-
-    with tab_collect:
-        mode = st.radio(
-            "Collector modu",
-            [
-                "Full-Market FinScreener Truth Collector — önerilen",
-                "Legacy sampled bar scanner / provider debug — sadece veri teşhisi",
-            ],
-            index=0,
-            key="v24_collector_mode",
-            help="AI Invest önerisi: önce full-market event truth table topla; Alpaca/Yahoo ve sampled scanner sadece enrichment/debug için kullanılmalı.",
-        )
-        st.caption(f"ISO sorgu önizleme: `{v24_iso_date_query_preview(float(min_gain), end_date_s)}`")
-
-        with st.expander("Direct FinScreener sanity test — tek gün hızlı kontrol", expanded=False):
-            sanity_date = st.date_input("Sanity test tarihi", value=pd.to_datetime(end_date).date(), key="v24_sanity_date")
-            if st.button("🔎 Direct FinScreener sanity test çalıştır", key="v24_direct_fs_test"):
-                try:
-                    fs, fs_source = v24_get_finscreener_callable()
-                    q = v24_iso_date_query_preview(float(min_gain), pd.to_datetime(sanity_date).strftime("%Y-%m-%d"))
-                    st.write("FinScreener source:", fs_source)
-                    st.code(q)
-                    if fs is None:
-                        st.error("Bu Streamlit ortamında FinScreener fonksiyonu bulunamadı. Full-market truth collector için FinScreener erişimi gerekir; alternatif olarak Uploaded Extreme CSV sekmesini kullanın.")
-                    else:
-                        test_df = fs(q)
-                        if test_df is None or getattr(test_df, "empty", True):
-                            st.error("Direct FinScreener sanity test boş döndü.")
-                        else:
-                            st.success(f"Direct FinScreener sanity test satır sayısı: {len(test_df)}")
-                            st.write("Returned columns:")
-                            st.write(list(test_df.columns))
-                            st.dataframe(test_df, use_container_width=True)
-                except Exception as exc:
-                    st.error(f"Direct FinScreener sanity test hata verdi: {exc}")
-                    if DEBUG_MODE:
-                        st.code(traceback.format_exc())
-
-        if mode.startswith("Full-Market"):
-            st.markdown("### Full-Market Truth Collector")
-            st.caption(
-                "Bu buton ticker CSV, max ticker, daily_shuffle, manual smoke, Alpaca/Yahoo kullanmadan doğrudan FinScreener event query ile gerçek %50+/%100+ olayları toplar. "
-                "Trade edilebilirlik filtreleri bu aşamada uygulanmaz; nanocap/sub-$1/China riskleri sonradan kolon olarak etiketlenmelidir."
-            )
-            enrich_after_truth = st.checkbox("Truth events bulunduktan sonra önceki gün feature enrichment dene", value=False, key="v24_truth_enrich")
-            max_enrich = st.number_input("Enrichment max event", min_value=10, max_value=1000, value=200, step=10, key="v24_truth_enrich_max")
-            if st.button("📊 Full-market %50+/%100+ truth table oluştur", key="v24_truth_collect_run"):
-                try:
-                    with st.spinner("Full-market FinScreener truth collector çalışıyor..."):
-                        events_df, log_df = v24_collect_extreme_events_truth_finscreener(
-                            start_date=start_date,
-                            end_date=end_date_s,
-                            min_pct=float(min_gain),
-                        )
-                    diag = v24_truth_collector_diagnostics(events_df, log_df)
-                    st.session_state["v24_extreme_df"] = events_df
-                    st.session_state["v24_truth_log_df"] = log_df
-                    st.session_state["v24_diagnostics_df"] = diag
-                    st.markdown("### Truth collector diagnostics")
-                    st.dataframe(diag, use_container_width=True)
-                    st.markdown("### Truth collector log")
-                    st.dataframe(log_df, use_container_width=True)
-                    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    if events_df is None or events_df.empty:
-                        st.warning(
-                            "Full-market event collector bu tarih aralığında threshold üstü olay bulamadı. "
-                            "Log'da finscreener_not_available / empty / error / missing_required_columns ayrımına bakın. "
-                            "Eğer FinScreener bu ortamda yoksa AInvest/FinScreener çıktısını Uploaded Extreme CSV sekmesine yükleyin."
-                        )
-                    else:
-                        st.success(f"{len(events_df)} adet %{float(min_gain):g}+ runner olayı bulundu. Benzersiz ticker: {events_df['Symbol'].nunique()}.")
-                        daily_summary = v24_extreme_daily_summary(events_df)
-                        dna = v24_runner_dna_summary(events_df)
-                        st.session_state["v24_daily_summary_df"] = daily_summary
-                        st.markdown("### Extreme runner truth events")
-                        st.dataframe(events_df.head(500), use_container_width=True)
-                        st.markdown("### Günlük 50–99 / 100+ özeti")
-                        st.dataframe(daily_summary, use_container_width=True)
-                        st.markdown("### Runner DNA — tekrar eden runner listesi")
-                        st.dataframe(dna.head(150), use_container_width=True)
-                        st.download_button("⬇️ Truth extreme runner events CSV", events_df.to_csv(index=False).encode("utf-8-sig"), f"truth_extreme_runner_events_{start_date}_{end_date_s}_{now}.csv", "text/csv", key="v24_dl_truth_events")
-                        st.download_button("⬇️ Truth collector log CSV", log_df.to_csv(index=False).encode("utf-8-sig"), f"truth_collector_log_{start_date}_{end_date_s}_{now}.csv", "text/csv", key="v24_dl_truth_log")
-                        st.download_button("⬇️ Runner DNA CSV", dna.to_csv(index=False).encode("utf-8-sig"), f"truth_runner_dna_{now}.csv", "text/csv", key="v24_dl_truth_dna")
-                        if enrich_after_truth:
-                            with st.spinner("Truth events için önceki gün feature enrichment deneniyor..."):
-                                enriched, enrich_log = v24_try_enrich_truth_events_with_prior_features(events_df, max_events=int(max_enrich))
-                            if enriched is not None and not enriched.empty:
-                                st.session_state["v24_extreme_df"] = enriched
-                                st.markdown("### Enriched truth events + prior-day features")
-                                st.dataframe(enriched.head(500), use_container_width=True)
-                                feat_summary = v24_calibration_feature_summary(enriched)
-                                st.markdown("### Bir gün önceki feature kalibrasyon özeti")
-                                st.dataframe(feat_summary, use_container_width=True)
-                                st.download_button("⬇️ Enriched truth events CSV", enriched.to_csv(index=False).encode("utf-8-sig"), f"enriched_truth_events_{now}.csv", "text/csv", key="v24_dl_truth_enriched")
-                            st.markdown("### Enrichment log")
-                            st.dataframe(enrich_log, use_container_width=True)
-                except Exception as exc:
-                    st.error(f"v24 truth collector hata: {exc}")
-                    if DEBUG_MODE:
-                        st.code(traceback.format_exc())
+        if pd.notna(pre_ctx["price"]) and pd.notna(entry_idea) and entry_idea > 0:
+            ext = (pre_ctx["price"] - entry_idea) / entry_idea
+            if ext <= 0.04:
+                entry_type = "BUY_NEAR_ENTRY"
+            elif ext <= 0.12:
+                entry_type = "WAIT_RETEST"
+            else:
+                entry_type = "TOO_EXTENDED"
         else:
-            st.markdown("### Legacy sampled bar scanner / provider debug")
-            st.warning(
-                "Bu mod truth collector değildir. Sadece seçilen/sampled ticker evreninde Alpaca/Yahoo bar verisiyle high/close return tarar. "
-                "Sıfır dönmesi tüm piyasada runner yok anlamına gelmez."
-            )
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                ticker_csv = st.file_uploader("Ticker evren CSV yükle (opsiyonel)", type=["csv"], key="v24_ticker_csv")
-                ticker_col = st.text_input("Ticker kolon adı (boş=otomatik)", value="", key="v24_ticker_col")
-                manual_symbols_raw = st.text_area(
-                    "Manual smoke sembolleri (opsiyonel, virgülle)",
-                    value="AKTX,PCLA,RYOJ,QTEX,BIYA,LFS,VCIG",
-                    key="v24_manual_smoke_symbols",
-                    help="2026-05-22 sanity test için AI Invest'in bildirdiği runner sembolleriyle deneyebilirsiniz.",
-                )
-            with c2:
-                sample_mode = st.selectbox("Örnekleme", ["daily_shuffle", "first_n"], index=0, key="v24_sample_mode")
-                debug_gain = st.slider("Debug gain eşiği %", 10.0, 50.0, 20.0, 5.0, key="v24_debug_gain")
-
-            if st.button("📊 Legacy sampled bar scan çalıştır", key="v24_collect_run"):
-                try:
-                    if ticker_csv is not None:
-                        tickers = load_tickers_from_uploaded_csv(ticker_csv, ticker_col.strip() or None)
-                        source = "Uploaded CSV"
-                    else:
-                        tickers = load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", ticker_col.strip() or None)
-                        source = "Repo nasdaq_nyse_tickers.csv"
-                    manual_symbols = [v24_symbol_clean(x) for x in re.split(r"[,\s]+", manual_symbols_raw or "") if v24_symbol_clean(x)]
-                    if manual_symbols:
-                        tickers = list(dict.fromkeys(manual_symbols + list(tickers)))
-                        source += " + Manual smoke symbols"
-                    if not tickers:
-                        st.error("Ticker evreni bulunamadı. CSV yükleyin veya repo köküne nasdaq_nyse_tickers.csv ekleyin.")
-                    else:
-                        with st.spinner(f"Legacy sampled bar scanner çalışıyor... Kaynak: {source}; sembol: {min(len(tickers), int(max_tickers))}/{len(tickers)}"):
-                            extreme, daily_summary, errors, diagnostics, top_observed, smoke_df = v24_collect_extreme_gainers_from_history(
-                                tickers=tickers,
-                                start_date=start_date,
-                                end_date=end_date_s,
-                                min_pct=float(min_gain),
-                                max_tickers=int(max_tickers),
-                                sample_mode=sample_mode,
-                                debug_pct=float(debug_gain),
-                                manual_symbols=manual_symbols,
-                                api_key_value=api_key,
-                                secret_key_value=secret_key,
-                                alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                            )
-                        st.session_state["v24_extreme_df"] = extreme
-                        st.session_state["v24_daily_summary_df"] = daily_summary
-                        st.session_state["v24_errors_df"] = errors
-                        st.session_state["v24_diagnostics_df"] = diagnostics
-                        st.session_state["v24_top_observed_df"] = top_observed
-                        st.session_state["v24_smoke_df"] = smoke_df
-                        st.markdown("### Legacy bar scanner diagnostics")
-                        st.dataframe(diagnostics, use_container_width=True)
-                        if smoke_df is not None and not smoke_df.empty:
-                            st.markdown("### Manual smoke symbol diagnostics")
-                            st.dataframe(smoke_df.head(100), use_container_width=True)
-                        if top_observed is not None and not top_observed.empty:
-                            st.markdown("### Top observed gainers in sampled universe")
-                            st.dataframe(top_observed.head(50), use_container_width=True)
-                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        if extreme.empty:
-                            st.warning("Seçilen sınırlı ticker örnekleminde threshold üstü olay bulunamadı. Bu sonuç tüm piyasada runner yok anlamına gelmez.")
-                        else:
-                            st.success(f"Sampled evrende extreme runner olayı bulundu: {len(extreme)}")
-                            st.dataframe(extreme.sort_values(["date", "Actual_Change_%"], ascending=[False, False]).head(300), use_container_width=True)
-                            st.download_button("⬇️ sampled extreme events CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"sampled_extreme_events_{now}.csv", "text/csv", key="v24_dl_extreme")
-                        with st.expander("Legacy collector errors / skipped tickers + diagnostics"):
-                            if errors is not None and not errors.empty:
-                                st.dataframe(errors.head(500), use_container_width=True)
-                            else:
-                                st.write("Hata yok veya kayıt tutulmadı.")
-                except Exception as exc:
-                    st.error(f"v24 legacy scanner hata: {exc}")
-                    if DEBUG_MODE:
-                        st.code(traceback.format_exc())
-
-    with tab_upload:
-        st.caption("FinScreener/AInvest full-market event collector uygulama ortamında çalışmıyorsa, dışarıda üretilen truth event CSV'sini buraya yükleyin.")
-        extreme_upload = st.file_uploader("AInvest/FinScreener extreme gainer CSV yükle", type=["csv"], key="v24_extreme_upload")
-        news_upload = st.file_uploader("Opsiyonel haber/event CSV yükle (Symbol, Date, Headline)", type=["csv"], key="v24_news_upload")
-        if st.button("📥 Uploaded extreme CSV analiz et", key="v24_upload_analyze"):
-            try:
-                if extreme_upload is None:
-                    st.warning("Önce extreme gainer CSV yükleyin.")
-                else:
-                    extreme_upload.seek(0)
-                    raw = pd.read_csv(extreme_upload)
-                    extreme = v24_normalize_extreme_gainers_csv(raw)
-                    if news_upload is not None:
-                        news_upload.seek(0)
-                        news_df = pd.read_csv(news_upload)
-                        extreme = v24_merge_news_tags(extreme, news_df)
-                    st.session_state["v24_extreme_df"] = extreme
-                    daily_summary = v24_extreme_daily_summary(extreme)
-                    dna = v24_runner_dna_summary(extreme)
-                    st.success(f"Uploaded extreme runner satırı: {len(extreme)}")
-                    st.dataframe(extreme.head(300), use_container_width=True)
-                    st.markdown("### Günlük özet")
-                    st.dataframe(daily_summary, use_container_width=True)
-                    st.markdown("### Runner DNA")
-                    st.dataframe(dna.head(100), use_container_width=True)
-                    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    st.download_button("⬇️ normalized extreme CSV", extreme.to_csv(index=False).encode("utf-8-sig"), f"v24_uploaded_extreme_normalized_{now}.csv", "text/csv", key="v24_dl_uploaded_norm")
-            except Exception as exc:
-                st.error(f"Uploaded extreme analiz hata: {exc}")
-                if DEBUG_MODE:
-                    st.code(traceback.format_exc())
-
-    with tab_join:
-        st.caption("Geçmiş NextDay/Night/Supernova/v23 CSV dosyalarını yükle; v24 extreme runner truth table ile D+1/D+2 eşleştirir.")
-        signal_files = st.file_uploader("Model sinyal CSV'leri", type=["csv"], accept_multiple_files=True, key="v24_signal_files")
-        if st.button("🔗 Model sinyallerini extreme runner outcome ile eşleştir", key="v24_join_run"):
-            try:
-                extreme = st.session_state.get("v24_extreme_df", pd.DataFrame())
-                if extreme is None or extreme.empty:
-                    st.warning("Önce Collector veya Uploaded CSV sekmesinden v24 extreme runner truth table oluşturun.")
-                else:
-                    signals = v24_load_signal_csvs(signal_files)
-                    if signals.empty:
-                        st.warning("Sinyal CSV okunamadı veya Symbol/Date bulunamadı.")
-                    else:
-                        joined, summary = v24_join_signals_to_extremes(signals, extreme)
-                        st.success(f"Sinyal satırı: {len(signals)} | Join sonucu: {len(joined)}")
-                        st.markdown("### Modül bazlı D+1 / D+2 %50+ hit özeti")
-                        st.dataframe(summary, use_container_width=True)
-                        st.markdown("### Sinyal → Extreme outcome eşleşmeleri")
-                        st.dataframe(joined.sort_values(["Hit_50Plus_D1", "Hit_50Plus_D2", "Signal_Date"], ascending=[False, False, False]).head(500), use_container_width=True)
-                        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        st.download_button("⬇️ v24 signal outcome joined CSV", joined.to_csv(index=False).encode("utf-8-sig"), f"v24_signal_extreme_join_{now}.csv", "text/csv", key="v24_dl_join")
-                        st.download_button("⬇️ v24 module hit summary CSV", summary.to_csv(index=False).encode("utf-8-sig"), f"v24_module_hit_summary_{now}.csv", "text/csv", key="v24_dl_join_summary")
-            except Exception as exc:
-                st.error(f"v24 join hata: {exc}")
-                if DEBUG_MODE:
-                    st.code(traceback.format_exc())
-
-    st.warning(
-        "v24 Runner DNA Lab alım/satım tavsiyesi değildir. Amaç, %50+/%100+ runner olaylarını ve modelin bunları yakalama oranını ölçerek "
-        "v23 Discovery / NextDay / Night skorlarını gerçek outcome datasıyla kalibre etmektir."
-    )
-
-
-# ============================================================
-# EKRANLAR
-# ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
-    [
-        "⚡ Radar",
-        "🧠 Intraday",
-        "🔮 Swing",
-        "📊 VWAP",
-        "🌙 Night",
-        "🔥 Runner",
-        "🐋 v19",
-        "🚀 v21.4 Supernova",
-        "🛡️ v22 Risk",
-        "🔥 v23 Discovery",
-        "📊 v24 Runner DNA",
-    ]
-)
-
-
-# ============================================================
-# TAB 1 - CANLI GÜN İÇİ RADAR
-# ============================================================
-with tab1:
-    session_choice = st.radio(
-        "Piyasa Oturumu:",
-        ["☀️ Gün İçi (Intraday)", "🌅 Piyasa Öncesi (Pre-Market)", "🌙 Kapanış Sonrası (After-Hours)"],
-        horizontal=True,
-    )
-
-    col_btn, col_chk = st.columns([1, 3])
-
-    with col_btn:
-        st.button("🔄 Manuel Yenile", key="btn_refresh_1")
-
-    with col_chk:
-        auto_refresh = st.checkbox("⚡ 15 saniyede bir otomatik yenile", value=False)
-
-    if auto_refresh:
-        st_autorefresh(interval=15000, key="auto_refresh_gainers")
-
-    df_gainers = get_intraday_gainers(session_choice)
-
-    if not df_gainers.empty:
-        st.dataframe(df_gainers, use_container_width=True)
-    else:
-        st.info("Veri bekleniyor veya uygun hisse bulunamadı.")
-
-
-# ============================================================
-# TAB 2 - INTRADAY TRADE ENGINE
-# ============================================================
-with tab2:
-    st.subheader("🧠 Intraday Trade Engine")
-    st.write("Aynı gün canlı verilerle trade edilebilecek güçlü setup'ları bulur. Mevcut continuation motorundan ayrıdır.")
-
-    col_a, col_b, col_c, col_d = st.columns(4)
-    with col_a:
-        intraday_session = st.selectbox(
-            "Tarama seansı",
-            ["regular", "premarket", "afterhours"],
-            index=0,
-            format_func=lambda x: {"regular": "Regular", "premarket": "Pre-Market", "afterhours": "After-Hours"}[x],
-        )
-    with col_b:
-        intraday_universe = st.slider("İlk tarama genişliği", min_value=10, max_value=60, value=25, step=5)
-    with col_c:
-        intraday_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=50.0, value=1.0, step=0.5, key='intraday_min_price')
-    with col_d:
-        intraday_max_price = st.number_input("Max fiyat ($)", min_value=5.0, max_value=500.0, value=100.0, step=5.0, key='intraday_max_price')
-
-    st.caption("Open Drive Breakout, First Pullback ve VWAP Reclaim setup'larını tarar. MACD/RSI yardımcı, VWAP/EMA/hacim ana omurgadır.")
-
-    if st.button("⚡ Intraday Engine'i Çalıştır", key="btn_intraday_engine"):
-        try:
-            with st.spinner("1. Aşama: İntraday evren taranıyor..."):
-                universe_df = fetch_intraday_trade_universe(
-                    session_name=intraday_session,
-                    max_records=intraday_universe,
-                    min_price=intraday_min_price,
-                    max_price=intraday_max_price,
-                )
-
-            if universe_df.empty:
-                st.warning("İntraday evren boş döndü.")
-            else:
-                tickers = universe_df['yahoo_symbol'].dropna().unique().tolist()
-                if 'SPY' not in tickers:
-                    tickers.append('SPY')
-
-                with st.spinner("2. Aşama: Günlük referans veriler indiriliyor..."):
-                    daily_dict = download_daily_data_chunked(
-                        tickers,
-                        period='260d',
-                        chunk_size=10,
-                        pause=1.0,
-                        alpaca_key=api_key,
-                        alpaca_secret=secret_key,
-                        alpaca_feed=os.getenv('ALPACA_FEED', 'iex'),
-                    )
-
-                spy_daily_df = daily_dict.get('SPY', pd.DataFrame())
-
-                with st.spinner("3. Aşama: Intraday setup scoring yapılıyor..."):
-                    intraday_candidates, intraday_rejected = evaluate_intraday_candidates(
-                        universe_df=universe_df,
-                        daily_dict=daily_dict,
-                        spy_daily_df=spy_daily_df,
-                    )
-
-                intraday_df = pd.DataFrame(intraday_candidates)
-                if intraday_df.empty:
-                    st.warning("Trade edilebilir intraday setup bulunamadı.")
-                else:
-                    st.success(f"Trade edilebilir intraday aday sayısı: {len(intraday_df)}")
-                    st.dataframe(intraday_df, use_container_width=True)
-
-                    top_intraday = intraday_df.head(3).copy()
-                    st.subheader("🎯 En Güçlü Intraday 3")
-                    st.dataframe(top_intraday, use_container_width=True)
-
-                    csv_intraday = intraday_df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        "📥 Intraday sonuçları CSV indir",
-                        data=csv_intraday,
-                        file_name=f"intraday_engine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime='text/csv',
-                    )
-
-                with st.expander("İntraday reddedilenler"):
-                    rej = pd.DataFrame(intraday_rejected)
-                    if not rej.empty:
-                        st.dataframe(rej, use_container_width=True)
-                    else:
-                        st.write("Kayıt yok.")
-
-        except Exception as exc:
-            st.error(f"Intraday engine hatası: {exc}")
-            if DEBUG_MODE:
-                st.code(traceback.format_exc())
-
-
-# ============================================================
-# TAB 2 - SWING RADAR
-# ============================================================
-with tab3:
-    st.write("Profesyonel filtrelere göre ertesi gün potansiyeli yüksek adaylar:")
-
-    algo_choice = st.selectbox(
-        "Algoritma:",
-        [
-            "A) Keskin Nişancı Breakout (RVOL≥1.5, Kapanış>%75, VWAP Üstü, Pozitif RS, Kırılıma <%2)",
-            "B) İkinci Gün Koşusu (Gap-Up, RVOL>2, VWAP Üstü Kapanış)",
-            "C) Kurumsal Birikim (200MA Üstü, Hacimli Alışlar, Sıkışma, Pozitif OBV)",
-        ],
-    )
-
-    max_scan_records = st.slider(
-        "İlk tarama genişliği",
-        min_value=100,
-        max_value=1200,
-        value=500,
-        step=100,
-    )
-
-    if st.button("🚀 Tarayıcıyı Başlat"):
-        try:
-            with st.spinner("1. Aşama: TradingView adayları taranıyor..."):
-                tv_df = fetch_tradingview_candidates(algo_choice=algo_choice, max_records=max_scan_records)
-
-            if tv_df.empty:
-                st.warning("İlk aşamada aday bulunamadı.")
-            else:
-                st.info(f"İlk aşamada bulunan aday sayısı: {len(tv_df)}")
-
-                yahoo_tickers = tv_df["yahoo_symbol"].dropna().unique().tolist()
-                if "SPY" not in yahoo_tickers:
-                    yahoo_tickers.append("SPY")
-
-                with st.spinner("2. Aşama: Günlük veriler Alpaca/Yahoo üzerinden indiriliyor..."):
-                    data_dict = download_daily_data_chunked(
-                        yahoo_tickers,
-                        period="220d",
-                        chunk_size=10,
-                        pause=2.0,
-                        alpaca_key=api_key,
-                        alpaca_secret=secret_key,
-                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                    )
-
-                with st.spinner("3. Aşama: İkinci filtre ve scoring uygulanıyor..."):
-                    final_candidates, rejected_log = evaluate_candidates(algo_choice, tv_df, data_dict)
-
-                gc.collect()
-
-                final_df = pd.DataFrame(final_candidates)
-
-                if final_df.empty:
-                    st.warning("Kurallara uyan aday çıkmadı.")
-                else:
-                    st.success(f"Filtrelerden başarıyla geçen hisse sayısı: {len(final_df)}")
-
-                    st.subheader("🏆 Top 10 Aday")
-                    st.dataframe(final_df.head(10), use_container_width=True)
-
-                    top3_df = rank_top3(final_df)
-
-                    st.subheader("🥇 En İyi 3")
-                    if not top3_df.empty:
-                        st.dataframe(top3_df, use_container_width=True)
-                    else:
-                        st.warning("Final havuzundan entry-ready 3 hisse çıkmadı.")
-
-                    csv_all = final_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "📥 Tüm sonuçları CSV indir",
-                        data=csv_all,
-                        file_name=f"nextday_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                    )
-
-                    if not top3_df.empty:
-                        csv_top3 = top3_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            "📥 En iyi 3 CSV indir",
-                            data=csv_top3,
-                            file_name=f"nextday_top3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                        )
-
-                with st.expander("Reddedilenler / Hata kayıtları"):
-                    rej_df = pd.DataFrame(rejected_log)
-                    if not rej_df.empty:
-                        st.dataframe(rej_df, use_container_width=True)
-                    else:
-                        st.write("Kayıt yok.")
-
-        except Exception as exc:
-            st.error(f"Tarama hatası: {exc}")
-            if DEBUG_MODE:
-                st.code(traceback.format_exc())
-
-
-# ============================================================
-# TAB 4 - ÇOKLU SEANS VWAP + EMİR MERKEZİ
-# ============================================================
-with tab4:
-    st.subheader("📊 VWAP Analizi ve Emir Merkezi")
-
-    ticker_input = st.text_input("İşlem yapılacak hisse sembolü", "").upper().strip()
-    account_size = st.number_input("Hesap büyüklüğü ($)", min_value=100.0, value=2000.0, step=100.0)
-    risk_pct = st.number_input("Trade başına risk (%)", min_value=0.1, max_value=10.0, value=2.0, step=0.1) / 100
-
-    if ticker_input:
-        if st.button(f"🔍 {ticker_input} için çoklu seans VWAP analizi yap"):
-            with st.spinner("Veriler çekiliyor ve seans bazlı VWAP hesaplanıyor..."):
-                try:
-                    yahoo_symbol = normalize_symbol_for_yahoo(ticker_input)
-
-                    intraday = get_intraday_session_data(
-                        symbol=ticker_input,
-                        yahoo_symbol=yahoo_symbol,
-                        api_key_value=api_key,
-                        secret_key_value=secret_key,
-                        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                    )
-                    daily_dict = download_daily_data_chunked([yahoo_symbol], period="260d", chunk_size=1, pause=0,
-                                                           alpaca_key=api_key, alpaca_secret=secret_key,
-                                                           alpaca_feed=os.getenv("ALPACA_FEED", "iex"))
-                    daily_df = daily_dict.get(yahoo_symbol, pd.DataFrame())
-
-                    if intraday.empty or daily_df.empty:
-                        st.warning("Analiz için yeterli veri bulunamadı.")
-                    else:
-                        premarket_df, regular_df, afterhours_df = split_sessions(intraday)
-
-                        premarket_info = session_summary(premarket_df)
-                        regular_info = session_summary(regular_df)
-                        afterhours_info = session_summary(afterhours_df)
-
-                        daily_df = daily_df.copy()
-                        daily_df["ATR14"] = calc_atr(daily_df, 14)
-                        atr14 = float(daily_df["ATR14"].iloc[-1]) if not pd.isna(daily_df["ATR14"].iloc[-1]) else np.nan
-                        breakout_level = daily_df["High"].shift(1).rolling(20).max().iloc[-1]
-
-                        active_session = get_active_session_et()
-
-                        if active_session == "premarket":
-                            active_info = premarket_info
-                            session_name = "Pre-Market"
-                        elif active_session == "regular":
-                            active_info = regular_info
-                            session_name = "Regular Session"
-                        elif active_session == "afterhours":
-                            active_info = afterhours_info
-                            session_name = "After-Hours"
-                        else:
-                            active_info = regular_info
-                            session_name = "Market Closed (referans: Regular Session)"
-
-                        result = vwap_decision_engine(
-                            price=active_info["price"],
-                            vwap=active_info["vwap"],
-                            high=active_info["high"],
-                            low=active_info["low"],
-                            atr14=atr14,
-                            breakout_level=breakout_level
-                        )
-
-                        st.markdown("### 📌 Çoklu Seans VWAP Paneli")
-                        st.info(f"Aktif seans: **{session_name}**")
-
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Pre-Market VWAP", format_price(premarket_info["vwap"]))
-                        c2.metric("Regular VWAP", format_price(regular_info["vwap"]))
-                        c3.metric("After-Hours VWAP", format_price(afterhours_info["vwap"]))
-
-                        c4, c5, c6 = st.columns(3)
-                        c4.metric("Pre-Market Hacim", f"{premarket_info['volume']:,}")
-                        c5.metric("Regular Hacim", f"{regular_info['volume']:,}")
-                        c6.metric("After-Hours Hacim", f"{afterhours_info['volume']:,}")
-
-                        c7, c8, c9 = st.columns(3)
-                        c7.metric("Pre-Market Son Fiyat", format_price(premarket_info["price"]))
-                        c8.metric("Regular Son Fiyat", format_price(regular_info["price"]))
-                        c9.metric("After-Hours Son Fiyat", format_price(afterhours_info["price"]))
-
-                        st.markdown("### 🎯 Aktif Seans Kararı")
-
-                        if result["signal"].startswith("AL"):
-                            st.success(result["signal"])
-                        elif result["signal"] == "BEKLE":
-                            st.warning(result["signal"])
-                        elif result["signal"] == "UZAK DUR":
-                            st.error(result["signal"])
-                        else:
-                            st.info(result["signal"])
-
-                        st.write(result["comment"])
-
-                        if result["entry"] is not None:
-                            pos = calc_position_size(
-                                account_size=account_size,
-                                risk_per_trade_pct=risk_pct,
-                                entry=result["entry"],
-                                stop=result["stop"],
-                            )
-
-                            plan_df = pd.DataFrame([{
-                                "Ticker": ticker_input,
-                                "Aktif Seans": session_name,
-                                "Signal": result["signal"],
-                                "Entry": result["entry"],
-                                "Stop": result["stop"],
-                                "TP1": result["tp1"],
-                                "TP2": result["tp2"],
-                                "Önerilen Adet": pos["shares"],
-                                "Pozisyon Büyüklüğü ($)": pos["dollar_size"],
-                                "Risk ($)": pos["risk_dollars"],
-                            }])
-
-                            st.dataframe(plan_df, use_container_width=True)
-
-                            st.info(
-                                f"Öneri: {ticker_input} için yaklaşık {pos['shares']} adet, "
-                                f"${format_price(result['entry'])} giriş, "
-                                f"${format_price(result['stop'])} stop."
-                            )
-
-                except Exception as exc:
-                    st.error(f"VWAP analizi sırasında hata oluştu: {exc}")
-                    if DEBUG_MODE:
-                        st.code(traceback.format_exc())
-
-    st.write("---")
-    st.markdown("### 🚀 Emir Gönder")
-
-    if api_key and secret_key:
-        try:
-            api = get_api(api_key, secret_key)
-        except Exception as exc:
-            st.error(f"Alpaca bağlantı hatası: {exc}")
-            api = None
-    else:
-        api = None
-
-    if api is None:
-        st.info("Emir ekranını kullanmak için Alpaca API key bilgilerini gir.")
-    else:
-        with st.form("bracket_order_form"):
-            col1, col2 = st.columns(2)
-
-            with col1:
-                qty = st.number_input("Adet", min_value=1, value=100)
-                limit_price = st.number_input("Alış limit fiyatı ($)", min_value=0.01, value=1.00, step=0.01)
-                ext_hours = st.checkbox("🌙 After-hours çalışsın", value=False)
-
-            with col2:
-                take_profit_price = st.number_input("Kar-al fiyatı ($)", min_value=0.01, value=1.15, step=0.01)
-                stop_loss_price = st.number_input("Zarar-kes fiyatı ($)", min_value=0.01, value=0.95, step=0.01)
-
-            submit_button = st.form_submit_button("🚀 Emri Gönder")
-
-            if submit_button:
-                if not ticker_input:
-                    st.warning("Önce hisse sembolü gir.")
-                elif stop_loss_price >= limit_price:
-                    st.warning("Stop loss alış limit fiyatından küçük olmalı.")
-                elif take_profit_price <= limit_price:
-                    st.warning("Take profit alış limit fiyatından büyük olmalı.")
-                else:
-                    try:
-                        order_symbol = normalize_symbol_for_yahoo(ticker_input)
-
-                        if ext_hours:
-                            api.submit_order(
-                                symbol=order_symbol,
-                                qty=int(qty),
-                                side="buy",
-                                type="limit",
-                                time_in_force="day",
-                                limit_price=round(limit_price, 4),
-                                extended_hours=True,
-                            )
-                            st.success(
-                                f"✅ {order_symbol} için ${format_price(limit_price)} seviyesinden "
-                                f"after-hours limit emir iletildi."
-                            )
-                        else:
-                            stop_limit_price = dynamic_stop_limit(stop_loss_price)
-
-                            api.submit_order(
-                                symbol=order_symbol,
-                                qty=int(qty),
-                                side="buy",
-                                type="limit",
-                                time_in_force="day",
-                                limit_price=round(limit_price, 4),
-                                extended_hours=False,
-                                order_class="bracket",
-                                take_profit={"limit_price": round(take_profit_price, 4)},
-                                stop_loss={
-                                    "stop_price": round(stop_loss_price, 4),
-                                    "limit_price": round(stop_limit_price, 4),
-                                },
-                            )
-
-                            st.success(
-                                f"✅ {order_symbol} için bracket emir iletildi. "
-                                f"Giriş=${format_price(limit_price)} | "
-                                f"TP=${format_price(take_profit_price)} | "
-                                f"SL=${format_price(stop_loss_price)} | "
-                                f"StopLimit=${format_price(stop_limit_price)}"
-                            )
-
-                    except Exception as exc:
-                        st.error(f"❌ Alpaca emir hatası: {exc}")
-                        if DEBUG_MODE:
-                            st.code(traceback.format_exc())
-
-
-
-
-# ============================================================
-# TAB 5 - NIGHT BUY / OVERNIGHT PRESSURE ENGINE v5
-# ============================================================
-with tab5:
-    st.subheader("🚀 D+1 15% Profit Engine v14 — %15 Hard Gate + CSV Diagnostics")
-    st.info("Ana kural: ertesi gün premarket veya normal seansta +%15 modellenmiş hedef potansiyeli yoksa sistem YES_NOW / AL sinyali üretmez. Next Day ve Runner Lab çıktıları sadece watchlist/paper radar kabul edilir.")
-    st.warning("Gerçek giriş için yalnızca Trade_Allowed=True + Night_Entry_Signal=YES_NOW + D1_15_Gate_Passed=True + Expected_Target_%≥15 birlikte aranır. Diğer tüm tablolar eğitim/paper izleme amaçlıdır.")
-    st.write(
-        "Bu modül gece/after-hours alım → ertesi gün premarket veya normal seansta satış stratejisi için "
-        "talep basıncı, EMA/MACD/RSI uyumu, squeeze proxy, AH tutunma, Fibonacci/kanal alanı, günlük momentum kalitesi "
-        "ve fakeout riskini birlikte puanlar."
-    )
-
-    c0, c1, c2, c3 = st.columns(4)
-    with c0:
-        night_universe_source = st.selectbox(
-            "Evren kaynağı",
-            ["hybrid_plus", "hybrid", "tradingview", "csv"],
-            index=0,
-            format_func=lambda x: {
-                "hybrid_plus": "Hybrid Plus: TV + CSV birleşik",
-                "hybrid": "Hybrid: TV boşsa CSV fallback",
-                "tradingview": "Sadece TradingView",
-                "csv": "Sadece CSV Daily Momentum",
-            }[x],
-            key="night_universe_source",
-        )
-    with c1:
-        night_scan_mode = st.selectbox(
-            "Tarama modu",
-            ["afterhours", "premarket", "regular"],
-            index=0,
-            format_func=lambda x: {
-                "afterhours": "After-Hours / Gece",
-                "premarket": "Pre-Market",
-                "regular": "Regular Momentum",
-            }[x],
-            key="night_scan_mode_v5",
-        )
-    with c2:
-        night_universe_size = st.slider("Sonuç evreni", min_value=20, max_value=150, value=100, step=10, key="night_universe_size")
-    with c3:
-        csv_max_tickers = st.number_input(
-            "CSV max ticker tarama",
-            min_value=100,
-            max_value=8000,
-            value=600,
-            step=100,
-            key="csv_max_tickers",
-            help="CSV fallback aktifse N sembol günlük momentum için taranır. Render Starter için 300-800 güvenli aralıktır; 1000+ yavaşlayabilir.",
-        )
-
-    c4, c5, c6, c7 = st.columns(4)
-    with c4:
-        night_min_price = st.number_input("Min fiyat ($)", min_value=0.5, max_value=20.0, value=1.0, step=0.5, key="night_min_price")
-    with c5:
-        night_max_price = st.number_input("Max fiyat ($)", min_value=3.0, max_value=500.0, value=20.0, step=5.0, key="night_max_price")
-    with c6:
-        night_min_volume = st.number_input("Min regular hacim", min_value=25_000, max_value=5_000_000, value=150_000, step=25_000, key="night_min_volume")
-    with c7:
-        min_night_score = st.slider("Min Night Score", min_value=0, max_value=100, value=60, step=5, key="min_night_score")
-
-    c8, c9 = st.columns(2)
-    with c8:
-        max_fakeout = st.slider("Max Fakeout Risk", min_value=0, max_value=100, value=60, step=5, key="max_fakeout")
-    with c9:
-        csv_column_name = st.text_input(
-            "CSV sembol kolonu (boş=otomatik)",
-            value="",
-            key="csv_column_name",
-            help="CSV'de Symbol/Ticker gibi kolon varsa boş bırakabilirsin. Bulamazsa ilk kolonu kullanır.",
-        )
-
-    uploaded_ticker_csv = st.file_uploader(
-        "NASDAQ/NYSE ticker CSV yükle (opsiyonel). Repo içinde nasdaq_nyse_tickers.csv varsa yükleme yapmadan da kullanılabilir.",
-        type=["csv"],
-        key="night_ticker_csv_upload",
-    )
-
-    st.caption(
-        "v14: D+1 %15 hedef için Hybrid Plus modunda TradingView + CSV birleşik evren kullanılır; sıkı CSV filtresi boşsa Loose Daily Momentum Fallback devreye girer. "
-        "CSV fallback; Return_1D/3D/5D, VolSpike10, DollarVolume, ClosePosition, EMA9/EMA21, ATR%, Breakout metrikleriyle "
-        "ön aday üretir; sonra D+1 15% Profit Engine v14 scoring ve %15 hard gate uygulanır. "
-        "Adaylar gerçek para için değil, önce paper trading ve sonuç kaydı için kullanılmalıdır."
-    )
-
-    if st.button("🌙 Night Buy Scanner'ı Çalıştır", key="btn_night_buy"):
-        try:
-            diagnostics = {}
-            night_universe = pd.DataFrame()
-            csv_daily_dict_prefetch = {}
-            tv_count = 0
-            source_used = "-"
-
-            # 1) TradingView evreni
-            if night_universe_source in ["hybrid_plus", "hybrid", "tradingview"]:
-                with st.spinner("1. Aşama: TradingView evreni taranıyor..."):
-                    tv_universe = fetch_night_buy_universe(
-                        scan_mode=night_scan_mode,
-                        max_records=night_universe_size,
-                        min_price=night_min_price,
-                        max_price=night_max_price,
-                        min_volume=int(night_min_volume),
-                    )
-                tv_count = len(tv_universe)
-                diagnostics["tradingview_raw_count"] = tv_count
-
-                if not tv_universe.empty:
-                    tv_universe["Universe_Source"] = "TRADINGVIEW"
-                    night_universe = tv_universe.copy()
-                    source_used = "TradingView"
-
-            # 2) CSV fallback / CSV only / Hybrid Plus
-            # v6 farkı: Hybrid Plus modunda TV sonuç verse bile CSV Daily Momentum da ayrıca çalışır ve evrenler birleştirilir.
-            need_csv = (
-                night_universe_source == "csv"
-                or night_universe_source == "hybrid_plus"
-                or (night_universe_source == "hybrid" and night_universe.empty)
-            )
-
-            if need_csv:
-                csv_tickers = []
-                csv_source_note = ""
-
-                if uploaded_ticker_csv is not None:
-                    try:
-                        uploaded_ticker_csv.seek(0)
-                        csv_tickers = load_tickers_from_uploaded_csv(
-                            uploaded_ticker_csv,
-                            csv_column_name.strip() or None,
-                        )
-                        csv_source_note = "Uploaded CSV"
-                    except Exception as exc:
-                        st.error(f"CSV okuma hatası: {exc}")
-                        csv_tickers = []
-                else:
-                    csv_tickers = load_tickers_from_repo_csv(
-                        "nasdaq_nyse_tickers.csv",
-                        csv_column_name.strip() or None,
-                    )
-                    csv_source_note = "Repo nasdaq_nyse_tickers.csv"
-
-                diagnostics["csv_source"] = csv_source_note
-                diagnostics["csv_loaded_tickers"] = len(csv_tickers)
-
-                if not csv_tickers:
-                    if night_universe_source == "csv":
-                        st.warning(
-                            "CSV evreni seçildi ama ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle."
-                        )
-                    elif night_universe.empty:
-                        st.warning(
-                            "TradingView evreni boş döndü ve CSV fallback için ticker listesi bulunamadı. "
-                            "CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle."
-                        )
-                else:
-                    with st.spinner(
-                        f"CSV Daily Momentum fallback çalışıyor... İlk {min(len(csv_tickers), int(csv_max_tickers))} ticker taranıyor."
-                    ):
-                        csv_universe, csv_daily_dict_prefetch, csv_diag = build_csv_daily_momentum_universe(
-                            tuple(csv_tickers),
-                            max_records=night_universe_size,
-                            min_price=night_min_price,
-                            max_price=night_max_price,
-                            min_volume=int(night_min_volume),
-                            max_tickers_to_scan=int(csv_max_tickers),
-                        )
-                    diagnostics.update(csv_diag)
-
-                    if not csv_universe.empty:
-                        if not night_universe.empty and night_universe_source == "hybrid_plus":
-                            # TV + CSV birleşik evren. Aynı sembol iki kere gelirse tekilleştir.
-                            night_universe = pd.concat([night_universe, csv_universe], ignore_index=True)
-                            if "yahoo_symbol" in night_universe.columns:
-                                night_universe = night_universe.drop_duplicates(subset=["yahoo_symbol"], keep="first").reset_index(drop=True)
-                            else:
-                                night_universe = night_universe.drop_duplicates().reset_index(drop=True)
-                            source_used = "TradingView + CSV Daily Momentum"
-                        else:
-                            night_universe = csv_universe.copy()
-                            source_used = "CSV Daily Momentum" if night_universe_source == "csv" else "CSV Daily Momentum Fallback"
-                    elif night_universe.empty:
-                        st.warning("CSV Daily Momentum STRICT/LOOSE fallback aday üretmedi. CSV max ticker taramayı artır, min regular hacmi düşür veya premarket/regular modu dene.")
-                    elif night_universe_source == "hybrid_plus":
-                        st.info("CSV Daily Momentum bu çalıştırmada aday üretmedi; TradingView evreniyle devam ediliyor.")
-
-            if night_universe.empty:
-                st.error("⛔ BU GECE ALIM YOK — %15 hedefli Night Buy evreni oluşmadı.")
-                st.warning(
-                    "Night-buy evreni boş döndü. Bu durum aday yok anlamına değil, veri/evren oluşmadı anlamına gelebilir. "
-                    "CSV fallback için ticker CSV yüklemeyi, CSV max ticker değerini artırmayı veya regular/premarket modu denemeyi düşün."
-                )
-                st.info("Karar: Trade_Allowed=False. Sistem herhangi bir AL / YES_NOW sinyali üretmedi.")
-
-                with st.expander("🔎 Evren diagnostik", expanded=True):
-                    st.json({
-                        "decision": "NO_TRADE",
-                        "reason": "night_universe_empty",
-                        "source_used": source_used,
-                        "tradingview_raw_count": tv_count,
-                        **diagnostics,
-                    })
-            else:
-                st.info(f"Evren kaynağı: {source_used} | İlk aşama aday sayısı: {len(night_universe)}")
-
-                with st.expander("🔎 Evren diagnostik"):
-                    st.json({
-                        "source_used": source_used,
-                        "tradingview_raw_count": tv_count,
-                        "final_universe_count": len(night_universe),
-                        **diagnostics,
-                    })
-                    st.dataframe(night_universe.head(25), use_container_width=True)
-
-                tickers = night_universe["yahoo_symbol"].dropna().unique().tolist()
-
-                # CSV fallback zaten günlük veriyi indirdiyse tekrar indirme.
-                if csv_daily_dict_prefetch:
-                    night_daily_dict = dict(csv_daily_dict_prefetch)
-                    missing_tickers = [t for t in tickers if t not in night_daily_dict]
-                else:
-                    night_daily_dict = {}
-                    missing_tickers = tickers
-
-                if missing_tickers:
-                    with st.spinner("2. Aşama: Günlük veri indiriliyor..."):
-                        downloaded_dict = download_daily_data_chunked(
-                            missing_tickers,
-                            period="260d",
-                            chunk_size=10,
-                            pause=1.0,
-                            alpaca_key=api_key,
-                            alpaca_secret=secret_key,
-                            alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-                        )
-                        night_daily_dict.update(downloaded_dict)
-
-                with st.spinner("3. Aşama: Night Pressure / Squeeze / Fakeout scoring yapılıyor..."):
-                    night_candidates, night_rejected = evaluate_night_buy_candidates(night_universe, night_daily_dict)
-
-                night_all_df = pd.DataFrame(night_candidates)
-                show_cols = [
-                    "Symbol", "Grade", "Status", "Night_Entry_Signal", "Trade_Allowed", "Night_Action", "Night_Signal_Score",
-                    "Expected_Target_%", "TP15", "TP15_Required_Move_%", "TP15_R_Multiple", "Target15_Score",
-                    "D1_15_Target_Score", "D1_15_Probability_Proxy", "D1_15_Gate_Passed",
-                    "Runner_Squeeze_Contribution", "Has_15pct_Upside", "MarketCap_M", "MarketCap_Bucket",
-                    "Microcap_Guard_Decision", "Microcap_Trap_Reasons", "High_to_Current_Drop_%", "No_Trade_Reason",
-                    "AH_Confirmed", "In_Entry_Zone", "Entry_Zone_Status", "Too_Far_To_Chase", "Liquidity_OK", "Spread_Risk",
-                    "Final_Night_Score",
-                    "Demand_Pressure", "Technical_Alignment", "Daily_Momentum_Quality",
-                    "Squeeze_Proxy", "AH_Strength", "Channel_Clarity", "Liquidity_Quality", "Fakeout_Risk",
-                    "AH_Live_Price", "AH_Change_%", "Return_1D_%", "Return_3D_%", "Return_5D_%",
-                    "RVOL20", "VolSpike10", "DollarVolume_M", "ClosePosition", "AH_Vol_to_Daily_%",
-                    "EMA9_gt_EMA20", "EMA9_gt_EMA21", "EMA9_CrossUp_EMA21", "RSI14", "MACD_Rising",
-                    "Breakout_Flag", "Breakout_Pct_%", "ATR_pct",
-                    "Night_Entry_Low", "Night_Entry_High", "Stop", "Setup_Invalidation",
-                    "Follow_Through_0_5R", "Follow_Through_0_75R",
-                    "TP0_Quick", "TP1", "TP15", "Runner_TP20", "Runner_TP30",
-                    "Current_vs_Entry_Low_%", "Current_vs_Entry_High_%",
-                    "RTH_Instruction", "Why", "Risk_Notes", "Aggressive_Reason"
-                ]
-
-                if night_all_df.empty:
-                    trade_df = pd.DataFrame()
-                    watch_df = pd.DataFrame()
-                    aggressive_df = pd.DataFrame()
-                    rejected_scored_df = pd.DataFrame()
-                    st.error("⛔ BU GECE ALIM YOK — skorlanabilir %15 Night Buy adayı üretilemedi.")
-                    st.warning("Night Buy scoring üretilemedi. Veri/bağlantı reddedilenler bölümünü kontrol et.")
-                    st.info("Karar: Trade_Allowed=False. Sistem herhangi bir AL / YES_NOW sinyali üretmedi.")
-                    with st.expander("🔎 No-Trade diagnostik", expanded=True):
-                        st.json({
-                            "decision": "NO_TRADE",
-                            "reason": "night_scoring_empty",
-                            "universe_count": int(len(night_universe)),
-                            "downloaded_daily_count": int(len(night_daily_dict)),
-                            "rejected_count": int(len(night_rejected)),
-                            **diagnostics,
-                        })
-                        rej_df = pd.DataFrame(night_rejected)
-                        if not rej_df.empty:
-                            st.dataframe(rej_df.head(100), use_container_width=True)
-                else:
-                    signal_rank_map_ui = {
-                        "YES_NOW": 5,
-                        "PAPER_OR_TINY": 4,
-                        "WAIT_RECLAIM": 3,
-                        "WAIT_PULLBACK": 2,
-                        "AGGRESSIVE_WAIT_CONFIRM": 2,
-                        "NO_15_GATE": 0,
-        "NO_NIGHT_ENTRY": 0,
-                    }
-                    night_all_df["_SignalRank"] = night_all_df["Night_Entry_Signal"].map(signal_rank_map_ui).fillna(0) if "Night_Entry_Signal" in night_all_df.columns else 0
-                    night_all_df = night_all_df.sort_values(
-                        ["_SignalRank", "Night_Signal_Score", "Final_Night_Score", "Demand_Pressure", "Daily_Momentum_Quality", "Squeeze_Proxy"],
-                        ascending=False,
-                    ).copy()
-
-                    night_signal_df = night_all_df[
-                        (night_all_df["Night_Entry_Signal"] == "YES_NOW") &
-                        (night_all_df["Trade_Allowed"] == True) &
-                        (night_all_df.get("D1_15_Gate_Passed", False) == True) &
-                        (night_all_df["Hard_Reject"] == False)
-                    ].copy() if "Night_Entry_Signal" in night_all_df.columns and "Trade_Allowed" in night_all_df.columns else pd.DataFrame()
-
-                    trade_df = night_all_df[
-                        (night_all_df["Trade_Allowed"] == True) &
-                        (night_all_df["Final_Night_Score"] >= max(MIN_REAL_FINAL_SCORE, min_night_score)) &
-                        (night_all_df["Fakeout_Risk"] <= min(max_fakeout, MAX_REAL_FAKEOUT_RISK)) &
-                        (night_all_df["Has_15pct_Upside"] == True) &
-                        (night_all_df.get("D1_15_Gate_Passed", False) == True) &
-                        (night_all_df["Hard_Reject"] == False)
-                    ].copy() if "Trade_Allowed" in night_all_df.columns else pd.DataFrame()
-
-                    watch_df = night_all_df[
-                        (night_all_df["Status"].isin(["PAPER_WATCHLIST", "WATCHLIST_NO_15"])) &
-                        (night_all_df["Final_Night_Score"] >= min_night_score) &
-                        (night_all_df["Fakeout_Risk"] <= max_fakeout) &
-                        (night_all_df["Hard_Reject"] == False)
-                    ].copy()
-
-                    aggressive_df = night_all_df[
-                        (night_all_df["Status"] == "AGGRESSIVE_SQUEEZE_WATCH") &
-                        (night_all_df["Fakeout_Risk"] <= max_fakeout) &
-                        (night_all_df["Hard_Reject"] == False)
-                    ].copy()
-
-                    shown_symbols = pd.concat(
-                        [trade_df["Symbol"], watch_df["Symbol"], aggressive_df["Symbol"]],
-                        ignore_index=True
-                    )
-                    rejected_scored_df = night_all_df[
-                        ~night_all_df["Symbol"].isin(shown_symbols)
-                    ].copy()
-
-                    m0, m1, m2, m3, m4 = st.columns(5)
-                    m0.metric("Gece Giriş Sinyali", len(night_signal_df))
-                    m1.metric("A/B Night Buy", len(trade_df))
-                    m2.metric("Paper Watchlist", len(watch_df))
-                    m3.metric("Aggressive Squeeze", len(aggressive_df))
-                    m4.metric("Reject / zayıf", len(rejected_scored_df) + len(night_rejected))
-
-                    available_cols = [c for c in show_cols if c in night_all_df.columns]
-
-                    if night_signal_df.empty and trade_df.empty:
-                        st.error("⛔ BU GECE ALIM YOK — D+1 %15 hard gate + gece giriş teyidi geçen aday bulunamadı.")
-                        st.info("Bu sonuç sistem hatası değil; %15 potansiyel/teyit yetersiz olduğu için alım önerisi üretilmedi.")
-                        closest_sort_cols = [c for c in ["D1_15_Target_Score", "Target15_Score", "Expected_Target_%", "Night_Signal_Score", "Final_Night_Score"] if c in night_all_df.columns]
-                        if closest_sort_cols:
-                            closest_df = night_all_df.sort_values(closest_sort_cols, ascending=False).copy()
-                        else:
-                            closest_df = night_all_df.copy()
-                        closest_cols = [c for c in [
-                            "Symbol", "Night_Entry_Signal", "Trade_Allowed", "Expected_Target_%", "TP15",
-                            "Target15_Score", "D1_15_Target_Score", "D1_15_Gate_Passed", "Runner_Squeeze_Contribution",
-                            "Has_15pct_Upside", "MarketCap_M", "MarketCap_Bucket", "Microcap_Guard_Decision",
-                            "Microcap_Trap_Reasons", "High_to_Current_Drop_%", "No_Trade_Reason",
-                            "Final_Night_Score", "Night_Signal_Score", "Demand_Pressure",
-                            "Daily_Momentum_Quality", "Squeeze_Proxy", "AH_Strength",
-                            "Fakeout_Risk", "Hard_Reject", "Risk_Notes"
-                        ] if c in closest_df.columns]
-                        st.subheader("🔎 %15 kapısına en yakın ama reddedilen adaylar")
-                        st.caption("Burası alım listesi değildir; neden sinyal üretilmediğini görmek ve paper eğitim verisi toplamak içindir.")
-                        closest_export_df = closest_df[closest_cols].head(100).copy()
-                        st.dataframe(closest_export_df.head(30), use_container_width=True)
-                        st.download_button(
-                            "📥 %15 kapısına en yakın reddedilenleri CSV indir",
-                            data=closest_export_df.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"night_buy_closest_rejected_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            key="download_closest_rejected_v13",
-                        )
-                    elif night_signal_df.empty:
-                        st.warning("Bu gece %15 hard gate geçen doğrudan giriş sinyali yok. Aday çıksa bile alım önerilmez.")
-                    else:
-                        st.success(f"Gece giriş sinyali veren aday: {len(night_signal_df)}")
-                        st.subheader("✅ D+1 %15 Hard Gate Geçen Gece Giriş Sinyali — YES_NOW")
-                        st.caption("Bu tablo aday seçimi değil, %15 hedef + execution onayıdır. Şimdilik yalnızca paper; gerçek para için uzun başarı kaydı şart.")
-                        st.dataframe(night_signal_df[available_cols].head(10), use_container_width=True)
-
-                    if trade_df.empty:
-                        st.warning("D+1 %15 hedefli gerçek Night Buy adayı yok. Bu gece için sistem alım baskısını yeterli görmedi.")
-                    else:
-                        st.success(f"A/B kalite Night Buy adayı: {len(trade_df)}")
-                        st.subheader("🏆 D+1 %15 Hedefli Night Buy Adayları")
-                        st.dataframe(trade_df[available_cols].head(20), use_container_width=True)
-
-                        st.subheader("🥇 En Güçlü 3 D+1 %15 Night Buy")
-                        st.dataframe(trade_df[available_cols].head(3), use_container_width=True)
-
-                    if watch_df.empty:
-                        st.info("Paper Watchlist adayı yok. Min Night Score değerini 55-60 bandına çekerek eğitim amaçlı izleme yapılabilir.")
-                    else:
-                        st.subheader("📝 Paper Watchlist — işlem değil, takip/eğitim")
-                        st.caption("Bu tablo izleme/eğitim içindir. %15 hard gate geçmeyen hisseler burada kalır; alım önerisi değildir.")
-                        st.dataframe(watch_df[available_cols].head(25), use_container_width=True)
-
-                    if aggressive_df.empty:
-                        st.info("Aggressive Squeeze Watch adayı yok. Bu iyi bir şey olabilir; sistem riskli squeeze ihtimalini zorlamıyor.")
-                    else:
-                        st.subheader("🔥 Aggressive Squeeze Watch — yüksek riskli, gerçek işlem değil")
-                        st.caption(
-                            "Bu tablo final skoru 60 altı kalsa bile squeeze/talep/AH momentum basıncı yüksek olan adayları gösterir. "
-                            "Gece alım kararı değil; premarket/canlı teyit ve paper takip listesidir."
-                        )
-                        st.dataframe(aggressive_df[available_cols].head(25), use_container_width=True)
-
-                    csv_all = night_all_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "📥 Tüm Night Buy skorlarını CSV indir",
-                        data=csv_all,
-                        file_name=f"night_buy_all_scored_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                    )
-
-                    if not trade_df.empty:
-                        csv_trade = trade_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            "📥 Sadece A/B adayları CSV indir",
-                            data=csv_trade,
-                            file_name=f"night_buy_trade_candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                        )
-
-                    if not watch_df.empty:
-                        csv_watch = watch_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            "📥 Paper Watchlist CSV indir",
-                            data=csv_watch,
-                            file_name=f"night_buy_paper_watchlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                        )
-
-                    if not aggressive_df.empty:
-                        csv_aggressive = aggressive_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            "📥 Aggressive Squeeze Watch CSV indir",
-                            data=csv_aggressive,
-                            file_name=f"night_buy_aggressive_squeeze_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                        )
-
-                with st.expander("Night Buy reject / veri hatası / zayıf skor detayları"):
-                    if 'rejected_scored_df' in locals() and not rejected_scored_df.empty:
-                        reject_cols = [c for c in show_cols if c in rejected_scored_df.columns]
-                        st.write("Skorlandı ama işlem/watchlist filtresine girmedi:")
-                        rejected_export_df = rejected_scored_df[reject_cols].head(300).copy()
-                        st.dataframe(rejected_export_df.head(100), use_container_width=True)
-                        st.download_button(
-                            "📥 Skorlanıp elenenleri CSV indir",
-                            data=rejected_export_df.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"night_buy_rejected_scored_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            key="download_rejected_scored_v13",
-                        )
-
-                    rej_df = pd.DataFrame(night_rejected)
-                    if not rej_df.empty:
-                        st.write("Veri eksikliği veya hesaplama nedeniyle skorlanamayanlar:")
-                        st.dataframe(rej_df, use_container_width=True)
-                        st.download_button(
-                            "📥 Veri/hata nedeniyle skorlanamayanları CSV indir",
-                            data=rej_df.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"night_buy_data_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            key="download_night_data_errors_v13",
-                        )
-                    elif (('rejected_scored_df' not in locals()) or rejected_scored_df.empty):
-                        st.write("Kayıt yok.")
-
-        except Exception as exc:
-            st.error(f"Night Buy Scanner hatası: {exc}")
-            if DEBUG_MODE:
-                st.code(traceback.format_exc())
-
-
-
-# ============================================================
-# TAB 6 - FRESH RUNNER CATCHER v16 (ACTIVE SESSION GUARD)
-# ============================================================
-with tab6:
-    st.subheader("🔥 Fresh Runner Catcher v16 — Active Session Guard")
-    st.write(
-        "Bu modül SKK tipi ultra momentum hisselerini **hızlı canlı radar** mantığıyla izler. "
-        "v16'da Runner Lab önce aktif seansı otomatik algılar; premarket saatinde dünkü regular hareketleri fresh runner saymaz; "
-        "önce TradingView canlı mover evreninden taze runner adaylarını getirir. "
-        "Geçmiş Runner DNA havuzu ayrı ve opsiyonel bir işlemdir."
-    )
-    st.warning(
-        "Runner Lab sonuçları gerçek alım sinyali değildir. Buradaki hisseler LAB_ONLY / PAPER_ONLY kabul edilir. "
-        "Gerçek/paper işlem düşünülse bile ayrıca Night Buy YES_NOW, D+1 %15 gate veya Intraday/VWAP teyidi gerekir."
-    )
-
-    st.markdown("### 1) Hızlı canlı runner radarı")
-    active_runner_session = get_active_session_et()
-    session_labels = {
-        "auto": "Otomatik aktif seans",
-        "premarket": "Pre-Market",
-        "regular": "Regular",
-        "afterhours": "After-Hours",
+            entry_type = "WATCH_RECLAIM"
+
+        if pd.notna(entry_idea) and entry_idea > 0:
+            stop = entry_idea * 0.88
+            tp1 = entry_idea * 1.15
+            tp2 = entry_idea * 1.30
+
+    quote = quotes_map.get(symbol, {})
+    bid, ask = bid_ask_from_quote(quote)
+    risk = risk_gate(decision, pre_ctx["price"], entry_idea, stop, bid, ask, pre_dollar_vol)
+
+    return {
+        "Engine": "SUPERNOVA",
+        "Symbol": symbol,
+        "Decision": decision,
+        "Structural_Score": structural_score,
+        "Ignition_Score": ignition_score,
+        "Premarket_Score": premarket_score,
+        "Pattern_Score": pattern_score,
+        "Best_Pattern": pattern_name,
+        "Price": round_smart(pre_ctx["price"]),
+        "Prev_Close": round_smart(price),
+        "Gap_%": round_smart(gap_pct),
+        "Prev_Ret_%": round_smart(prev_day_ret),
+        "Prev_Close_Strength": round_smart(prev_close_strength * 100 if pd.notna(prev_close_strength) else np.nan),
+        "Prev_Vol_Ratio": round_smart(prev_vol_ratio),
+        "Prev_Dollar_Vol": round_smart(prev_dollar_vol),
+        "Drawdown90_%": round_smart(drawdown90),
+        "Base_Tightness10_%": round_smart(base_tightness10),
+        "Breakout20": breakout20,
+        "Pre_Vol": safe_int(pre_ctx["pre_vol"], 0),
+        "Pre_Baseline": safe_int(baseline_median, 0) if pd.notna(baseline_median) else 0,
+        "Pre_Vol_Ratio": round_smart(pre_vol_ratio),
+        "Pre_VWAP": round_smart(pre_ctx["pre_vwap"]),
+        "Hold_%": round_smart(pre_ctx["hold_quality"]),
+        "Pre_Dollar_Vol": round_smart(pre_dollar_vol),
+        "Source": pre_ctx["source"],
+        "Entry_Type": entry_type,
+        "Entry_Idea": round_smart(entry_idea),
+        "Stop": round_smart(stop),
+        "TP1": round_smart(tp1),
+        "TP2": round_smart(tp2),
+        "Top_Matches": " | ".join([f"{n}:{s}" for n, s in top_matches]),
+        "Notes": " | ".join(structural_notes + ignition_notes + pre_notes),
+        **risk
     }
-    r0, r1, r2, r3 = st.columns(4)
-    with r0:
-        runner_session_choice = st.selectbox(
-            "Tarama seansı",
-            ["auto", "premarket", "regular", "afterhours"],
-            index=0,
-            format_func=lambda x: session_labels[x],
-            key="runner_session_v16",
-        )
-        if runner_session_choice == "auto":
-            if active_runner_session in ["premarket", "regular", "afterhours"]:
-                runner_session = active_runner_session
-            else:
-                runner_session = "premarket"
+
+
+# ============================================================
+# RADAR / BUILD
+# ============================================================
+def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=None,
+                      cont_score_al=DEFAULT_CONT_SCORE_AL, cont_score_strong=DEFAULT_CONT_SCORE_STRONG,
+                      super_pattern_al=DEFAULT_SUPER_PATTERN_AL, super_pattern_strong=DEFAULT_SUPER_PATTERN_STRONG):
+    rows = []
+    live_mode = trade_date_str is None
+
+    if live_mode:
+        trade_date_str = ny_date_str()
+        session = get_session_label()
+        now_str = ny_time_str()
+        if session == "premarket":
+            cutoff_time = cutoff_time or min(now_str, "09:25:00")
+        elif session == "regular":
+            cutoff_time = "09:25:00"
+        elif session in ["afterhours", "closed", "weekend"]:
+            cutoff_time = None
         else:
-            runner_session = runner_session_choice
-    with r1:
-        runner_min_change = st.slider("Min canlı değişim (%)", 5, 100, 20, 5, key="runner_min_change_v15")
-    with r2:
-        runner_tv_records = st.slider("Canlı TV evreni", 20, 150, 150, 10, key="runner_tv_records_v15")
-    with r3:
-        runner_allow_fresh = st.checkbox(
-            "Taze intraday runnerları göster",
-            value=True,
-            help="Açık kalmalı. Geçmiş Runner DNA havuzu olmasa bile canlı % hareket edenleri LAB_ONLY olarak gösterir.",
-            key="runner_allow_fresh_v15",
-        )
+            cutoff_time = None
+    else:
+        session = "backtest"
+        cutoff_time = cutoff_time or "09:25:00"
 
-    r4, r5 = st.columns(2)
-    with r4:
-        runner_min_price = st.number_input("Min fiyat ($)", 0.3, 20.0, 1.0, 0.5, key="runner_min_price_v15")
-    with r5:
-        runner_max_price = st.number_input("Max fiyat ($)", 2.0, 100.0, 20.0, 1.0, key="runner_max_price_v15")
+    quotes_map = fetch_alpaca_latest_quotes(symbols) if have_alpaca() else {}
+    daily_lookback = 420
+    minute_lookback_days = 12
 
-    runner_exclude_stale_regular = st.checkbox(
-        "Regular kapalıyken dünkü regular hareketleri fresh sayma",
-        value=True,
-        help="Açık kalmalı. Pre-market saatinde Regular seçilirse dünkü regular gainerları taze runner diye göstermeyi engeller.",
-        key="runner_exclude_stale_regular_v16",
+    for symbol in symbols:
+        daily_df = get_daily_df(symbol, lookback_days=daily_lookback)
+
+        if cutoff_time is None:
+            minute_df = pd.DataFrame()
+        else:
+            end_dt = datetime.strptime(trade_date_str + " 23:59:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=NY_TZ).astimezone(UTC_TZ)
+            start_dt = end_dt - timedelta(days=minute_lookback_days)
+            minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="1Min")
+            if minute_df.empty and have_alpaca():
+                minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="5Min")
+
+        if engine_name == "continuation":
+            row = build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
+                                         cont_score_al, cont_score_strong, quotes_map)
+        else:
+            row = build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
+                                      quotes_map, super_pattern_al, super_pattern_strong)
+        if row is not None:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, session, cutoff_time
+
+    if engine_name == "continuation":
+        df["_rank"] = df["Decision"].map(decision_sort_key)
+        df = df.sort_values(["_rank", "Score"], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
+    else:
+        df["_rank"] = df["Decision"].map(decision_sort_key)
+        df = df.sort_values(["_rank", "Pattern_Score", "Premarket_Score", "Ignition_Score"],
+                            ascending=[True, False, False, False]).drop(columns=["_rank"]).reset_index(drop=True)
+
+    return df, session, cutoff_time
+
+
+def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
+    cont_df, session, cutoff = build_engine_rows(
+        symbols, "continuation", trade_date_str=None,
+        cont_score_al=cont_al, cont_score_strong=cont_strong,
+        super_pattern_al=super_al, super_pattern_strong=super_strong
+    )
+    super_df, _, _ = build_engine_rows(
+        symbols, "supernova", trade_date_str=None,
+        cont_score_al=cont_al, cont_score_strong=cont_strong,
+        super_pattern_al=super_al, super_pattern_strong=super_strong
     )
 
-    st.caption(
-        f"Aktif ABD seansı: **{active_runner_session.upper()}** | Kullanılan tarama seansı: **{runner_session.upper()}**"
+    if cont_df.empty and super_df.empty:
+        return pd.DataFrame(), session, cutoff
+
+    cont_cols = ["Symbol", "Decision", "Score", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
+    super_cols = ["Symbol", "Decision", "Pattern_Score", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
+
+    cont_small = cont_df[cont_cols].copy() if not cont_df.empty else pd.DataFrame(columns=cont_cols)
+    cont_small = cont_small.rename(columns={
+        "Decision": "Cont_Decision",
+        "Score": "Cont_Score",
+        "Entry_Idea": "Cont_Entry",
+        "Risk_Grade": "Cont_Risk",
+        "Real_Money_Allowed": "Cont_Allowed"
+    })
+
+    super_small = super_df[super_cols].copy() if not super_df.empty else pd.DataFrame(columns=super_cols)
+    super_small = super_small.rename(columns={
+        "Decision": "Super_Decision",
+        "Pattern_Score": "Super_Pattern",
+        "Entry_Idea": "Super_Entry",
+        "Risk_Grade": "Super_Risk",
+        "Real_Money_Allowed": "Super_Allowed"
+    })
+
+    merged = pd.merge(cont_small, super_small, on="Symbol", how="outer")
+
+    def final_pick(row):
+        cont_dec = row.get("Cont_Decision", None)
+        super_dec = row.get("Super_Decision", None)
+
+        if super_dec == "GÜÇLÜ AL":
+            return "SUPERNOVA_GÜÇLÜ_AL"
+        if cont_dec == "GÜÇLÜ AL":
+            return "CONTINUATION_GÜÇLÜ_AL"
+        if super_dec == "AL":
+            return "SUPERNOVA_AL"
+        if cont_dec == "AL":
+            return "CONTINUATION_AL"
+        if super_dec == "İZLE" or cont_dec == "İZLE":
+            return "İZLE"
+        return "ALMA"
+
+    merged["Radar_Pick"] = merged.apply(final_pick, axis=1)
+    merged["_rank"] = merged["Radar_Pick"].map({
+        "SUPERNOVA_GÜÇLÜ_AL": 0,
+        "CONTINUATION_GÜÇLÜ_AL": 1,
+        "SUPERNOVA_AL": 2,
+        "CONTINUATION_AL": 3,
+        "İZLE": 4,
+        "ALMA": 5
+    }).fillna(9)
+    merged = merged.sort_values("_rank").drop(columns=["_rank"]).reset_index(drop=True)
+
+    return merged, session, cutoff
+
+
+# ============================================================
+# JOURNAL
+# ============================================================
+def render_journal_tab():
+    st.subheader("🧾 Paper Journal / Manual Tracker")
+    st.caption("Ayrı CSV log tutman yine en sağlıklısıdır.")
+    journal_file = st.file_uploader("Journal CSV yükle (opsiyonel)", type=["csv"], key="journal_csv")
+    if journal_file is not None:
+        try:
+            df = pd.read_csv(journal_file)
+            st.dataframe(df, use_container_width=True)
+            if "PnL" in df.columns:
+                pnl = pd.to_numeric(df["PnL"], errors="coerce").fillna(0).sum()
+                st.metric("Toplam PnL", round(float(pnl), 2))
+        except Exception as e:
+            st.error(f"CSV okunamadı: {e}")
+
+    st.code("Date,Symbol,Engine,Decision,Entry,Exit,Stop,TP1,TP2,Shares,PnL,Notes", language="text")
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+with st.sidebar:
+    st.success("Final production mode aktif")
+
+    st.header("Alpaca API")
+    api_key_input = st.text_input("API Key ID", value=ALPACA_API_KEY, type="password")
+    secret_key_input = st.text_input("Secret Key", value=ALPACA_SECRET_KEY, type="password")
+    if api_key_input and secret_key_input:
+        ALPACA_API_KEY = api_key_input
+        ALPACA_SECRET_KEY = secret_key_input
+
+    st.caption(f"Feed: {ALPACA_FEED}")
+    st.divider()
+
+    st.header("Thresholds")
+    CONT_SCORE_AL = st.slider("Continuation AL skoru", 40, 90, DEFAULT_CONT_SCORE_AL, 1)
+    CONT_SCORE_STRONG = st.slider("Continuation GÜÇLÜ AL skoru", 50, 95, DEFAULT_CONT_SCORE_STRONG, 1)
+    SUPER_PATTERN_AL = st.slider("Supernova Pattern AL", 40, 90, DEFAULT_SUPER_PATTERN_AL, 1)
+    SUPER_PATTERN_STRONG = st.slider("Supernova Pattern GÜÇLÜ AL", 50, 95, DEFAULT_SUPER_PATTERN_STRONG, 1)
+    SHOW_ONLY_TRADEABLE = st.checkbox("Sadece AL / GÜÇLÜ AL / İZLE göster", value=False)
+    N_SHOW = st.slider("Gösterilecek satır", 10, 200, 50, 5)
+
+
+# ============================================================
+# TABS
+# ============================================================
+tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    "🧭 Radar",
+    "📈 Continuation Engine",
+    "🚀 Supernova Engine",
+    "🛡️ Risk Monitor",
+    "🧾 Journal"
+])
+
+with tab0:
+    st.subheader("Radar")
+    st.caption("Aynı sembol havuzunu hem continuation hem supernova açısından tarar; birleşik öncelik listesi üretir.")
+
+    radar_symbols_text = st.text_area(
+        "Radar sembol listesi",
+        value=",".join(list(dict.fromkeys(DEFAULT_CONTINUATION_SYMBOLS + DEFAULT_SUPERNOVA_SYMBOLS))),
+        height=100,
+        key="radar_symbols"
     )
-    if runner_session_choice != "auto" and active_runner_session in ["premarket", "regular", "afterhours"] and runner_session != active_runner_session:
-        st.warning(
-            "Seçtiğin seans aktif ABD seansıyla uyuşmuyor. Özellikle pre-market saatinde Regular seçersen "
-            "dünkü normal seans hareketleri fresh runner gibi görünebilir."
-        )
-    if active_runner_session == "closed":
-        st.warning("ABD piyasası şu an kapalı görünüyor. Fresh runner taraması sınırlı/boş dönebilir.")
+    radar_run = st.button("Radar çalıştır", key="radar_run")
 
-    st.info(
-        "v16 Active Session Guard: **Runner Lab'i Çalıştır** butonu önce canlı mover listesini tarar. "
-        "Bu işlem normalde kısa sürmelidir. Tarihsel DNA havuzu otomatik kurulmaz; istersen aşağıdaki opsiyonel bölümden ayrıca oluşturulur."
-    )
-
-    st.markdown("### 2) Opsiyonel geçmiş Runner DNA havuzu")
-    with st.expander("🏗 Geçmiş Runner DNA havuzu ayarları / opsiyonel", expanded=False):
-        d0, d1, d2, d3 = st.columns(4)
-        with d0:
-            runner_lookback = st.selectbox("Geçmiş tarama", ["90d", "120d", "180d", "1y"], index=3, key="runner_lookback_v15")
-        with d1:
-            runner_min_gain = st.slider("Runner günü min artış (%)", 15, 150, 25, 5, key="runner_min_gain_v15")
-        with d2:
-            runner_min_rvol = st.slider("Runner günü min RVOL20", 1.0, 20.0, 1.5, 0.5, key="runner_min_rvol_v15")
-        with d3:
-            runner_min_volume = st.number_input("Runner günü min hacim", 50_000, 10_000_000, 200_000, 50_000, key="runner_min_volume_v15")
-
-        d4, d5 = st.columns(2)
-        with d4:
-            runner_max_tickers = st.number_input("Runner pool CSV max ticker", 100, 8000, 500, 100, key="runner_max_tickers_v15")
-        with d5:
-            runner_seed_mode = st.selectbox(
-                "CSV örnekleme",
-                ["daily_random", "first_n"],
-                index=0,
-                format_func=lambda x: "Günlük rastgele örneklem" if x == "daily_random" else "İlk N sembol",
-                key="runner_seed_mode_v15",
-            )
-
-        runner_uploaded_csv = st.file_uploader(
-            "Runner DNA için ticker CSV yükle (opsiyonel). Repo içindeki nasdaq_nyse_tickers.csv otomatik kullanılabilir.",
-            type=["csv"],
-            key="runner_ticker_csv_upload_v15",
-        )
-        runner_csv_col = st.text_input("Runner CSV sembol kolonu (boş=otomatik)", value="", key="runner_csv_col_v15")
-
-        def _load_runner_tickers_for_ui_v15():
-            if runner_uploaded_csv is not None:
-                try:
-                    runner_uploaded_csv.seek(0)
-                    return load_tickers_from_uploaded_csv(runner_uploaded_csv, runner_csv_col.strip() or None), "Uploaded CSV"
-                except Exception as exc:
-                    st.error(f"Runner CSV okuma hatası: {exc}")
-                    return [], "Uploaded CSV hata"
-            return load_tickers_from_repo_csv("nasdaq_nyse_tickers.csv", runner_csv_col.strip() or None), "Repo nasdaq_nyse_tickers.csv"
-
-        if st.button("🏗 Runner DNA Havuzunu Oluştur / Güncelle", key="btn_build_runner_pool_v15"):
-            tickers, ticker_source = _load_runner_tickers_for_ui_v15()
-            if not tickers:
-                st.error("Runner Lab için ticker listesi bulunamadı. CSV yükle veya repo köküne nasdaq_nyse_tickers.csv ekle.")
-            else:
-                seed = int(datetime.now().strftime('%Y%m%d')) if runner_seed_mode == "daily_random" else None
-                sampled = _runner_sample_tickers(tickers, int(runner_max_tickers), seed=seed)
-                with st.spinner(f"Runner DNA havuzu oluşturuluyor... Kaynak: {ticker_source}; taranan sembol: {len(sampled)}"):
-                    pool_df = build_runner_pool_from_tickers_cached(
-                        tuple(sampled),
-                        lookback_period=runner_lookback,
-                        min_price=float(runner_min_price),
-                        max_price=float(runner_max_price),
-                        min_runner_gain_pct=float(runner_min_gain),
-                        min_rvol20=float(runner_min_rvol),
-                        min_volume=int(runner_min_volume),
-                        min_runner_days=1,
-                        chunk_size=25,
-                        pause=0.3,
-                    )
-                st.session_state["runner_pool_df_v15"] = pool_df
-                st.info(
-                    f"Ticker kaynağı: {ticker_source} | Toplam sembol: {len(tickers)} | Taranan: {len(sampled)} | "
-                    f"Runner DNA havuzu: {0 if pool_df is None else len(pool_df)}"
+    if radar_run:
+        syms = parse_symbols(radar_symbols_text)
+        if not syms:
+            st.warning("Sembol gir.")
+        else:
+            with st.spinner("Radar çalışıyor..."):
+                radar_df, session, cutoff = build_radar(
+                    syms, CONT_SCORE_AL, CONT_SCORE_STRONG, SUPER_PATTERN_AL, SUPER_PATTERN_STRONG
                 )
-                if pool_df is None or pool_df.empty:
-                    st.warning(
-                        "Runner DNA havuzu boş döndü. Bu kritik değil; v15 canlı taze runner radarı geçmiş DNA olmadan da çalışır. "
-                        "DNA havuzu için eşikleri düşürmek veya CSV max ticker değerini artırmak denenebilir."
+
+            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+            if radar_df.empty:
+                st.warning("Radar sonucu yok.")
+            else:
+                if SHOW_ONLY_TRADEABLE:
+                    radar_df = radar_df[radar_df["Radar_Pick"] != "ALMA"].copy()
+                st.dataframe(radar_df.head(N_SHOW), use_container_width=True)
+                csv = radar_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "📥 Radar CSV indir",
+                    data=csv,
+                    file_name=f"radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_radar"
+                )
+
+with tab1:
+    st.subheader("Continuation Engine")
+    st.caption("Amaç: önceki gün güçlü kapanan ve ertesi gün devam etme ihtimali olan hisseleri bulmak.")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        cont_symbols_text = st.text_area(
+            "Sembol listesi",
+            value=",".join(DEFAULT_CONTINUATION_SYMBOLS),
+            height=100,
+            key="cont_symbols"
+        )
+    with col2:
+        cont_mode = st.radio("Mod", ["Canlı", "Backtest"], index=0, key="cont_mode")
+        cont_date = st.date_input("Backtest tarihi", value=now_ny().date(), key="cont_date")
+        cont_run = st.button("Continuation çalıştır", key="run_cont")
+
+    if cont_run:
+        symbols = parse_symbols(cont_symbols_text)
+        if not symbols:
+            st.warning("Sembol gir.")
+        else:
+            with st.spinner("Continuation Engine çalışıyor..."):
+                if cont_mode == "Canlı":
+                    df, session, cutoff = build_engine_rows(
+                        symbols, "continuation",
+                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
                     )
                 else:
-                    st.success(f"Runner DNA havuzuna alınan hisse sayısı: {len(pool_df)}")
-                    st.dataframe(pool_df.head(50), use_container_width=True)
-                    st.download_button(
-                        "📥 Runner DNA havuzunu CSV indir",
-                        data=pool_df.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=f"runner_dna_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        key="download_runner_dna_pool_v15",
+                    df, session, cutoff = build_engine_rows(
+                        symbols, "continuation",
+                        trade_date_str=str(cont_date), cutoff_time="09:25:00",
+                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
                     )
 
-    st.divider()
-    if st.button("🔥 Runner Lab'i Çalıştır — Active Fresh", key="btn_run_runner_lab_v16"):
-        runners_frames = []
-        diagnostics = [
-            {"Aşama": "Active Session", "Aday": active_runner_session},
-            {"Aşama": "Selected Session", "Aday": runner_session},
-            {"Aşama": "Exclude Stale Regular", "Aday": bool(runner_exclude_stale_regular)},
-        ]
+            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
 
-        # 1) Fresh intraday runner first. No historical download here.
-        if runner_allow_fresh:
-            with st.spinner("Canlı TradingView mover evreni taranıyor — tarihsel DNA indirilmiyor..."):
-                fresh_df = scan_fresh_intraday_runners_cached(
-                    session_name=runner_session,
-                    max_records=int(runner_tv_records),
-                    min_price=float(runner_min_price),
-                    max_price=float(runner_max_price),
-                    min_live_change_pct=float(runner_min_change),
-                    exclude_stale_regular=bool(runner_exclude_stale_regular),
+            if df.empty:
+                st.warning("Sonuç yok.")
+            else:
+                if SHOW_ONLY_TRADEABLE:
+                    df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
+
+                tops = top_cards(df, 3)
+                cols = st.columns(3)
+                for i, item in enumerate(tops):
+                    with cols[i]:
+                        st.metric(
+                            f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                            f"Score {item['Score']}",
+                            f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                        )
+                        st.caption(item["Notes"])
+
+                st.dataframe(df.head(N_SHOW), use_container_width=True)
+                csv = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "📥 Continuation CSV indir",
+                    data=csv,
+                    file_name=f"continuation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_cont"
                 )
-            diagnostics.append({"Aşama": "Fresh Intraday Runner", "Aday": 0 if fresh_df is None else len(fresh_df)})
-            if fresh_df is not None and not fresh_df.empty:
-                runners_frames.append(fresh_df)
 
-        # 2) Optional historical DNA bonus, only if already cached/session state exists.
-        pool_df = st.session_state.get("runner_pool_df_v15", pd.DataFrame())
-        if pool_df is not None and not pool_df.empty:
-            records = tuple(pool_df.to_dict("records"))
-            with st.spinner("Cache'teki Runner DNA havuzu canlı mover listesiyle eşleştiriliyor..."):
-                dna_runners_df = scan_intraday_runners_cached(
-                    session_name=runner_session,
-                    runner_pool_records=records,
-                    max_records=int(runner_tv_records),
-                    min_price=float(runner_min_price),
-                    max_price=float(runner_max_price),
-                    min_live_change_pct=float(runner_min_change),
-                    exclude_stale_regular=bool(runner_exclude_stale_regular),
+with tab2:
+    st.subheader("Supernova Engine")
+    st.caption("Amaç: RMSG / STI tipi düşük fiyatlı, patlayıcı, erken ignition adaylarını bulmak.")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        rocket_symbols_text = st.text_area(
+            "Sembol listesi",
+            value=",".join(DEFAULT_SUPERNOVA_SYMBOLS),
+            height=100,
+            key="rocket_symbols"
+        )
+    with col2:
+        rocket_mode = st.radio("Mod", ["Canlı", "Backtest"], index=0, key="rocket_mode")
+        rocket_date = st.date_input("Backtest tarihi", value=now_ny().date(), key="rocket_date")
+        rocket_run = st.button("Supernova çalıştır", key="run_rocket")
+
+    if rocket_run:
+        symbols = parse_symbols(rocket_symbols_text)
+        if not symbols:
+            st.warning("Sembol gir.")
+        else:
+            with st.spinner("Supernova Engine çalışıyor..."):
+                if rocket_mode == "Canlı":
+                    df, session, cutoff = build_engine_rows(
+                        symbols, "supernova",
+                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                    )
+                else:
+                    df, session, cutoff = build_engine_rows(
+                        symbols, "supernova",
+                        trade_date_str=str(rocket_date), cutoff_time="09:25:00",
+                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                    )
+
+            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+
+            if df.empty:
+                st.warning("Sonuç yok.")
+            else:
+                if SHOW_ONLY_TRADEABLE:
+                    df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
+
+                tops = top_cards(df, 3)
+                cols = st.columns(3)
+                for i, item in enumerate(tops):
+                    with cols[i]:
+                        st.metric(
+                            f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                            f"Pattern {item['Pattern_Score']}",
+                            f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                        )
+                        st.caption(f"{item['Best_Pattern']} | {item['Notes']}")
+
+                st.dataframe(df.head(N_SHOW), use_container_width=True)
+                csv = df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "📥 Supernova CSV indir",
+                    data=csv,
+                    file_name=f"supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_supernova"
                 )
-            diagnostics.append({"Aşama": "Runner DNA Match", "Aday": 0 if dna_runners_df is None else len(dna_runners_df)})
-            if dna_runners_df is not None and not dna_runners_df.empty:
-                runners_frames.append(dna_runners_df)
-        else:
-            diagnostics.append({"Aşama": "Runner DNA Match", "Aday": "Havuz yok — atlandı"})
 
-        st.markdown("#### Runner Lab diagnostik")
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True)
+with tab3:
+    st.subheader("Risk Monitor")
+    st.caption("Actionable sinyallerin execution/risk filtresi.")
 
-        if not runners_frames:
-            st.warning(
-                "Runner Lab canlı aday bulamadı. Bu sistem hatası olmak zorunda değil: seçilen seansta TV mover listesinde "
-                "min canlı değişim/fiyat aralığı veya aktif seans filtresini geçen hisse olmayabilir. Pre-market saatinde Regular değil Pre-Market/Auto seç; min canlı değişimi %10–15'e düşür, "
-                "TV evrenini 150 yap veya seansı premarket/regular/afterhours olarak doğru seç."
-            )
-        else:
-            runners_df = pd.concat(runners_frames, ignore_index=True, sort=False)
-            if 'Symbol' in runners_df.columns:
-                # DNA eşleşenler fresh'ten daha değerli olsun; varsa daha yüksek skorlu kalsın.
-                if 'Runner_Lab_Score' in runners_df.columns:
-                    runners_df = runners_df.sort_values(['Runner_Lab_Score'], ascending=False)
-                runners_df = runners_df.drop_duplicates(subset=['Symbol'], keep='first')
-            if 'Runner_Lab_Score' in runners_df.columns:
-                runners_df = runners_df.sort_values(['Runner_Lab_Score'], ascending=False).reset_index(drop=True)
-            st.success(f"Runner Lab adayı: {len(runners_df)} — sadece paper / ultra risk")
-            show_runner_cols = [
-                "Symbol", "Company", "Live_Price", "Live_Change_%", "Live_Volume", "MarketCap",
-                "change_source", "data_status", "active_session_et",
-                "Runner_Lab_Score", "Runner_DNA_Score", "Runner_Action", "Risk_Label", "LAB_ONLY",
-                "runner_pool_tier", "runner_day_count", "max_runner_gain_pct", "max_runner_rvol20", "max_runner_dollar_volume_M",
-                "last_runner_date", "days_since_last_run",
-            ]
-            available_runner_cols = [c for c in show_runner_cols if c in runners_df.columns]
-            st.dataframe(runners_df[available_runner_cols].head(60), use_container_width=True)
-            st.download_button(
-                "📥 Runner Lab adaylarını CSV indir",
-                data=runners_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"fresh_runner_catcher_v16_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_runner_lab_v15",
-            )
-
-    st.info(
-        "v16 Fresh Runner Catcher: Runner Lab'i çalıştırmak artık önce 1200 sembollük tarihsel veri indirmez. "
-        "Önce canlı runnerları gösterir; geçmiş Runner DNA havuzu varsa sadece bonus eşleşme olarak kullanır. "
-        "Sonuçlar LAB_ONLY / PAPER_ONLY olup ana alım sinyali değildir."
+    risk_symbols_text = st.text_area(
+        "Risk monitor sembol listesi",
+        value=",".join(list(dict.fromkeys(DEFAULT_CONTINUATION_SYMBOLS[:8] + DEFAULT_SUPERNOVA_SYMBOLS[:8]))),
+        height=100,
+        key="risk_symbols"
     )
+    risk_run = st.button("Risk monitor çalıştır", key="risk_run")
 
+    if risk_run:
+        syms = parse_symbols(risk_symbols_text)
+        if not syms:
+            st.warning("Sembol gir.")
+        else:
+            with st.spinner("Risk monitor çalışıyor..."):
+                cont_df, _, _ = build_engine_rows(
+                    syms, "continuation",
+                    cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                    super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                )
+                super_df, _, _ = build_engine_rows(
+                    syms, "supernova",
+                    cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                    super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                )
 
+            frames = []
+            if not cont_df.empty:
+                frames.append(cont_df[[
+                    "Engine", "Symbol", "Decision", "Entry_Idea", "Stop", "TP1", "TP2",
+                    "Late_Status", "Extension_%", "Bid", "Ask", "Spread_%", "Stop_Dist_%",
+                    "Risk_Grade", "Real_Money_Allowed", "Risk_Tags"
+                ]].copy())
+            if not super_df.empty:
+                frames.append(super_df[[
+                    "Engine", "Symbol", "Decision", "Entry_Idea", "Stop", "TP1", "TP2",
+                    "Late_Status", "Extension_%", "Bid", "Ask", "Spread_%", "Stop_Dist_%",
+                    "Risk_Grade", "Real_Money_Allowed", "Risk_Tags"
+                ]].copy())
 
-# ============================================================
-# TAB 7 - v17 WHALE / CATALYST / CLEAN / AGGRESSIVE ENGINE
-# ============================================================
-with tab7:
-    render_v17_multimodule_tab(
-        st=st,
-        fetch_intraday_trade_universe=fetch_intraday_trade_universe,
-        fetch_night_buy_universe=fetch_night_buy_universe,
-        download_daily_data_chunked=download_daily_data_chunked,
-        get_recent_intraday_full_data=get_recent_intraday_full_data,
-        api_key=api_key,
-        secret_key=secret_key,
-        alpaca_feed=os.getenv("ALPACA_FEED", "iex"),
-    )
+            if not frames:
+                st.warning("Risk sonucu yok.")
+            else:
+                risk_df = pd.concat(frames, ignore_index=True)
+                risk_df["_rank"] = risk_df["Real_Money_Allowed"].map({True: 0, False: 1})
+                risk_df = risk_df.sort_values(["_rank", "Risk_Grade"]).drop(columns=["_rank"])
+                st.dataframe(risk_df.head(N_SHOW), use_container_width=True)
+                csv = risk_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "📥 Risk CSV indir",
+                    data=csv,
+                    file_name=f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="download_risk"
+                )
 
-
-# ============================================================
-# TAB 8 - v21.2 TRADABLE SUPERNOVA / PRE-IGNITION / NO-CHASE RADAR
-# ============================================================
-with tab8:
-    render_v20_explosive_runner_tab()
-
-
-# ============================================================
-# TAB 9 - v22 RISK ENGINE / PERFORMANCE TRACKER
-# ============================================================
-with tab9:
-    render_v22_risk_tracker_tab()
-
-st.write("---")
-st.caption(
-    "Bu araç yatırım tavsiyesi değildir. Önce paper trading ile test edilmesi gerekir. "
-    "Dış veri kaynaklarında rate-limit ve veri uyuşmazlığı olabilir."
-)
-
-
-# ============================================================
-# TAB 10 - v23 HOT MOVER DISCOVERY
-# ============================================================
-with tab10:
-    render_v23_discovery_tab()
-
-
-# ============================================================
-# TAB 11 - v24 RUNNER DNA CALIBRATION LAB
-# ============================================================
-with tab11:
-    render_v24_runner_dna_lab_tab()
+with tab4:
+    render_journal_tab()
