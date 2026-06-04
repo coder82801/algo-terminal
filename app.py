@@ -1,22 +1,26 @@
+
 import os
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import joblib
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
 
 
 # ============================================================
 # APP CONFIG
 # ============================================================
-st.set_page_config(page_title="Algo Terminal Final Production", layout="wide")
-st.title("🎯 Algo Terminal — Final Production")
+st.set_page_config(page_title="Algo Terminal ML Final", layout="wide")
+st.title("🎯 Algo Terminal — ML Final")
 st.caption(
-    "Nihai üretim sürümü: Continuation Engine + Supernova Engine + Radar + Risk Monitor. "
-    "Bu sürüm bilerek production-focus tasarlanmıştır; lab/research katmanları çıkarılmıştır."
+    "Nihai sürüm: Continuation Engine + Supernova Engine + ML Trainer + Radar + Risk Monitor. "
+    "Kural tabanlı motorlar korunur; varsa eğitilmiş ML modelleri olasılık katmanı olarak eklenir."
 )
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -32,20 +36,27 @@ DEFAULT_SUPERNOVA_SYMBOLS = [
     "MAXN", "CREG", "SKYQ", "SQFT", "FUSE", "GN", "CUE"
 ]
 
+DEFAULT_ML_TRAIN_SYMBOLS = sorted(list(dict.fromkeys(
+    DEFAULT_CONTINUATION_SYMBOLS + DEFAULT_SUPERNOVA_SYMBOLS +
+    ["EOSE", "CTMX", "SOPA", "RR", "TNON", "IREN", "RMSG", "STI", "MAXN"]
+)))
+
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_FEED = (os.getenv("ALPACA_FEED", "iex") or "iex").lower()
+
+MODEL_DIR = os.getenv("MODEL_DIR", "models")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 MIN_PRICE = 0.10
 MAX_PRICE_CONTINUATION = 50.0
 MAX_PRICE_SUPERNOVA = 5.0
 
-# Production-side defaults
 DEFAULT_CONT_SCORE_AL = 62
 DEFAULT_CONT_SCORE_STRONG = 78
 DEFAULT_SUPER_PATTERN_AL = 60
 DEFAULT_SUPER_PATTERN_STRONG = 72
-DEFAULT_MIN_PRE_DOLLAR_VOL = 75000
+DEFAULT_MIN_PRE_DOLLAR_VOL = 75_000
 DEFAULT_MAX_EXTENSION = 0.08
 
 SYMBOL_FLAGS = {
@@ -53,7 +64,39 @@ SYMBOL_FLAGS = {
     "STI": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": True},
     "SOPA": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": False},
     "TNON": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": False},
+    "IREN": {"recent_reverse_split": False, "recent_deficiency": False, "otc_risk": False, "catalyst_fresh": True},
 }
+
+CONT_FEATURE_COLS = [
+    "price",
+    "prev_day_ret",
+    "prev_close_strength",
+    "prev_vol_ratio",
+    "prev_dollar_vol",
+    "ema9_dist_pct",
+    "ema20_dist_pct",
+    "atr_pct",
+    "range_pct_1d",
+    "range_pct_10d_avg",
+    "base_tightness10",
+    "drawdown90",
+    "rebound30",
+]
+
+SUPER_FEATURE_COLS = [
+    "price",
+    "prev_day_ret",
+    "prev_close_strength",
+    "prev_vol_ratio",
+    "prev_dollar_vol",
+    "range_expansion",
+    "base_tightness10",
+    "drawdown90",
+    "rebound30",
+    "breakout20",
+    "ema9_dist_pct",
+    "ema20_dist_pct",
+]
 
 
 # ============================================================
@@ -122,7 +165,7 @@ def get_flags(symbol):
         "recent_deficiency": False,
         "otc_risk": False,
         "catalyst_fresh": False,
-        **SYMBOL_FLAGS.get(str(symbol).upper(), {}),
+        **SYMBOL_FLAGS.get(str(symbol).upper(), {})
     }
 
 
@@ -174,17 +217,12 @@ def decision_sort_key(decision):
     return {"GÜÇLÜ AL": 0, "AL": 1, "İZLE": 2, "ALMA": 3}.get(decision, 9)
 
 
-def decision_color(decision):
-    return {
-        "GÜÇLÜ AL": "green",
-        "AL": "blue",
-        "İZLE": "orange",
-        "ALMA": "red"
-    }.get(decision, "gray")
-
-
 def top_cards(df, n=3):
     return [] if df is None or df.empty else df.head(n).to_dict("records")
+
+
+def nz(v):
+    return 0.0 if pd.isna(v) else float(v)
 
 
 # ============================================================
@@ -230,7 +268,11 @@ def fetch_alpaca_bars(symbols, timeframe="1Day", start=None, end=None, feed=None
         if page_token:
             req_params["page_token"] = page_token
 
-        r = requests.get(url, headers=alpaca_headers(), params=req_params, timeout=30)
+        try:
+            r = requests.get(url, headers=alpaca_headers(), params=req_params, timeout=30)
+        except Exception:
+            return out
+
         if r.status_code != 200:
             return out
 
@@ -359,7 +401,7 @@ def fetch_minute_df(symbol, start_dt_utc, end_dt_utc, timeframe="1Min"):
 
 
 # ============================================================
-# INDICATORS / FEATURES
+# FEATURES / INDICATORS
 # ============================================================
 def calc_true_range(df):
     prev_close = df["Close"].shift(1)
@@ -519,6 +561,245 @@ def premarket_baseline_ratio(minute_df, prior_dates, trade_date_str, cutoff_time
     return median(vols), avg(vols), len(vols)
 
 
+def extract_snapshot_features_from_ctx(ctx):
+    last = ctx["last"]
+    prev = ctx["prev"]
+    hist10 = ctx["hist10"]
+    hist20 = ctx["hist20"]
+    hist60 = ctx["hist60"]
+    hist90 = ctx["hist90"]
+
+    price = safe_float(last["Close"], np.nan)
+    prev_close = safe_float(prev["Close"], np.nan)
+    prev_day_ret = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+    prev_close_strength = closing_strength(price, safe_float(last["Low"], np.nan), safe_float(last["High"], np.nan))
+
+    avg_vol20 = max(avg(hist20["Volume"].iloc[:-1] if len(hist20) > 1 else hist20["Volume"]), 1)
+    prev_vol_ratio = safe_float(last["Volume"], 0) / avg_vol20
+    prev_dollar_vol = price * safe_float(last["Volume"], 0)
+
+    ema9 = calc_ema(hist20["Close"], 9).iloc[-1] if len(hist20) >= 9 else np.nan
+    ema20 = calc_ema(hist20["Close"], 20).iloc[-1] if len(hist20) >= 20 else np.nan
+    atr14 = calc_atr(hist20, 14).iloc[-1] if len(hist20) >= 14 else np.nan
+
+    ema9_dist_pct = ((price - ema9) / ema9 * 100.0) if pd.notna(ema9) and ema9 > 0 else np.nan
+    ema20_dist_pct = ((price - ema20) / ema20 * 100.0) if pd.notna(ema20) and ema20 > 0 else np.nan
+    atr_pct = (atr14 / price * 100.0) if pd.notna(atr14) and price > 0 else np.nan
+
+    range_pct_1d = range_pct(safe_float(last["High"], np.nan), safe_float(last["Low"], np.nan), price)
+    range_pct_10d_avg = avg([range_pct(h, l, c) for h, l, c in zip(hist10["High"], hist10["Low"], hist10["Close"])])
+
+    hist10_high = safe_float(hist10["High"].max(), np.nan)
+    hist10_low = safe_float(hist10["Low"].min(), np.nan)
+    base_tightness10 = ((hist10_high - hist10_low) / price * 100.0) if pd.notna(price) and price > 0 else np.nan
+
+    low30 = safe_float(hist60["Low"].iloc[-30:].min() if len(hist60) >= 30 else hist60["Low"].min(), np.nan)
+    high90 = safe_float(hist90["High"].max(), np.nan)
+    drawdown90 = ((price / high90) - 1) * 100.0 if pd.notna(high90) and high90 > 0 else np.nan
+    rebound30 = ((price - low30) / low30) * 100.0 if pd.notna(low30) and low30 > 0 else np.nan
+
+    high20_ex_last = safe_float(hist20["High"].iloc[:-1].max() if len(hist20) > 1 else hist20["High"].max(), np.nan)
+    breakout20 = 1 if pd.notna(high20_ex_last) and price > high20_ex_last else 0
+
+    avg_range20 = max(avg([
+        range_pct(h, l, c) for h, l, c in zip(hist20["High"].iloc[:-1], hist20["Low"].iloc[:-1], hist20["Close"].iloc[:-1])
+    ]), 0.0001)
+    range_expansion = range_pct_1d / avg_range20 if pd.notna(range_pct_1d) else np.nan
+
+    features = {
+        "price": price,
+        "prev_day_ret": prev_day_ret,
+        "prev_close_strength": prev_close_strength * 100 if pd.notna(prev_close_strength) else np.nan,
+        "prev_vol_ratio": prev_vol_ratio,
+        "prev_dollar_vol": prev_dollar_vol,
+        "ema9_dist_pct": ema9_dist_pct,
+        "ema20_dist_pct": ema20_dist_pct,
+        "atr_pct": atr_pct,
+        "range_pct_1d": range_pct_1d,
+        "range_pct_10d_avg": range_pct_10d_avg,
+        "base_tightness10": base_tightness10,
+        "drawdown90": drawdown90,
+        "rebound30": rebound30,
+        "breakout20": breakout20,
+        "range_expansion": range_expansion,
+    }
+    return features
+
+
+# ============================================================
+# ML LAYER
+# ============================================================
+def model_paths(model_name):
+    return {
+        "model": os.path.join(MODEL_DIR, f"{model_name}.joblib"),
+        "meta": os.path.join(MODEL_DIR, f"{model_name}_meta.json"),
+    }
+
+
+def save_model_bundle(model_name, model, feature_cols, metrics):
+    paths = model_paths(model_name)
+    joblib.dump({"model": model, "feature_cols": feature_cols}, paths["model"])
+    with open(paths["meta"], "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+
+def load_model_bundle(model_name):
+    paths = model_paths(model_name)
+    if not os.path.exists(paths["model"]):
+        return None, None, None
+    payload = joblib.load(paths["model"])
+    metrics = {}
+    if os.path.exists(paths["meta"]):
+        with open(paths["meta"], "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+    return payload.get("model"), payload.get("feature_cols"), metrics
+
+
+def train_random_forest_classifier(X_train, y_train, X_test, y_test):
+    clf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=8,
+        min_samples_leaf=8,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+    )
+    clf.fit(X_train, y_train)
+
+    train_prob = clf.predict_proba(X_train)[:, 1]
+    test_prob = clf.predict_proba(X_test)[:, 1] if len(X_test) else np.array([])
+
+    def prob_metrics(y_true, probs):
+        if len(y_true) == 0:
+            return {"count": 0, "positive_rate": None, "mean_prob": None}
+        preds = (probs >= 0.5).astype(int)
+        acc = float((preds == y_true).mean())
+        precision = float(((preds == 1) & (y_true == 1)).sum() / max((preds == 1).sum(), 1))
+        recall = float(((preds == 1) & (y_true == 1)).sum() / max((y_true == 1).sum(), 1))
+        return {
+            "count": int(len(y_true)),
+            "positive_rate": round(float(y_true.mean()), 4),
+            "mean_prob": round(float(np.mean(probs)), 4),
+            "accuracy_0_5": round(acc, 4),
+            "precision_0_5": round(precision, 4),
+            "recall_0_5": round(recall, 4),
+        }
+
+    metrics = {
+        "train": prob_metrics(y_train, train_prob),
+        "test": prob_metrics(y_test, test_prob),
+    }
+    return clf, metrics
+
+
+def build_training_rows_for_symbol(symbol, daily_df, model_type):
+    rows = []
+    if daily_df is None or daily_df.empty or len(daily_df) < 120:
+        return rows
+
+    temp = daily_df.copy()
+    temp["NYDate"] = [local_date_from_iso(x) for x in temp.index]
+    ny_dates = temp["NYDate"].tolist()
+
+    for idx in range(100, len(temp) - 1):
+        trade_date_str = ny_dates[idx]
+        next_bar = temp.iloc[idx + 1]
+
+        ctx = get_trade_date_context(temp.iloc[:idx + 1].copy(), trade_date_str)
+        if ctx is None:
+            continue
+
+        feat = extract_snapshot_features_from_ctx(ctx)
+        entry_ref = feat["price"]
+
+        next_high = safe_float(next_bar["High"], np.nan)
+        next_low = safe_float(next_bar["Low"], np.nan)
+
+        if pd.isna(entry_ref) or entry_ref <= 0 or pd.isna(next_high) or pd.isna(next_low):
+            continue
+
+        # Conservative labels
+        cont_tp = entry_ref * 1.06
+        cont_stop = entry_ref * 0.95
+        cont_label = int((next_high >= cont_tp) and not (next_low <= cont_stop and next_high < cont_tp))
+
+        super_tp = entry_ref * 1.15
+        super_stop = entry_ref * 0.88
+        super_label = int(
+            (entry_ref <= MAX_PRICE_SUPERNOVA) and
+            (next_high >= super_tp) and
+            not (next_low <= super_stop and next_high < super_tp)
+        )
+
+        base = {
+            "symbol": symbol,
+            "trade_date": trade_date_str,
+            **feat
+        }
+
+        if model_type == "continuation":
+            base["label"] = cont_label
+            rows.append(base)
+        else:
+            base["label"] = super_label
+            rows.append(base)
+
+    return rows
+
+
+def build_training_dataset(symbols, model_type):
+    rows = []
+    for symbol in symbols:
+        daily_df = get_daily_df(symbol, lookback_days=520)
+        rows.extend(build_training_rows_for_symbol(symbol, daily_df, model_type))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    feature_cols = CONT_FEATURE_COLS if model_type == "continuation" else SUPER_FEATURE_COLS
+    keep = ["symbol", "trade_date", "label"] + feature_cols
+    df = df[keep].copy()
+    df = df.dropna(subset=feature_cols + ["label"]).reset_index(drop=True)
+    return df
+
+
+def train_model_from_dataset(df, model_type):
+    if df is None or df.empty:
+        raise ValueError("Dataset boş.")
+
+    feature_cols = CONT_FEATURE_COLS if model_type == "continuation" else SUPER_FEATURE_COLS
+    df = df.sort_values("trade_date").reset_index(drop=True)
+
+    split_idx = int(len(df) * 0.8)
+    split_idx = max(split_idx, 1)
+
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    X_train = train_df[feature_cols].astype(float).values
+    y_train = train_df["label"].astype(int).values
+    X_test = test_df[feature_cols].astype(float).values if not test_df.empty else np.empty((0, len(feature_cols)))
+    y_test = test_df["label"].astype(int).values if not test_df.empty else np.array([])
+
+    model, metrics = train_random_forest_classifier(X_train, y_train, X_test, y_test)
+    metrics["feature_cols"] = feature_cols
+    metrics["rows"] = int(len(df))
+    metrics["train_rows"] = int(len(train_df))
+    metrics["test_rows"] = int(len(test_df))
+    return model, feature_cols, metrics
+
+
+def predict_model_probability(model_name, feature_dict):
+    model, feature_cols, metrics = load_model_bundle(model_name)
+    if model is None or not feature_cols:
+        return np.nan, {}
+    row = [safe_float(feature_dict.get(col, np.nan), np.nan) for col in feature_cols]
+    if any(pd.isna(x) for x in row):
+        return np.nan, metrics
+    prob = float(model.predict_proba(np.array(row).reshape(1, -1))[0, 1])
+    return prob, metrics
+
+
 # ============================================================
 # QUOTE / RISK
 # ============================================================
@@ -610,7 +891,7 @@ def risk_gate(decision, price, entry_idea, stop, bid, ask, pre_dollar_vol):
 # ============================================================
 # CONTINUATION ENGINE
 # ============================================================
-def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, cont_score_al, cont_score_strong):
+def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, cont_score_al, cont_score_strong, ml_prob=np.nan):
     notes = []
     score = 0
 
@@ -669,51 +950,50 @@ def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, co
     elif pd.notna(ema20) and prev_close < ema20:
         score -= 8
 
-    if pre_ctx["source"] != "REAL_PREMARKET":
-        decision = "İZLE" if score >= cont_score_al - 4 else "ALMA"
-        return clamp(score, 0, 100), decision, notes + ["Premarket veri yok"], {
-            "prev_ret": prev_ret, "prev_cs": prev_cs, "vol_ratio": vol_ratio,
-            "dollar_vol": dollar_vol, "ema9": ema9, "ema20": ema20
-        }
+    if pre_ctx["source"] == "REAL_PREMARKET":
+        gap_pct = ((pre_ctx["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+        pre_dollar_vol = pre_ctx["price"] * pre_ctx["pre_vol"] if pd.notna(pre_ctx["price"]) else np.nan
+        above_vwap = pd.notna(pre_ctx["pre_vwap"]) and pd.notna(pre_ctx["price"]) and pre_ctx["price"] > pre_ctx["pre_vwap"]
 
-    gap_pct = ((pre_ctx["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
-    pre_dollar_vol = pre_ctx["price"] * pre_ctx["pre_vol"] if pd.notna(pre_ctx["price"]) else np.nan
-    above_vwap = pd.notna(pre_ctx["pre_vwap"]) and pd.notna(pre_ctx["price"]) and pre_ctx["price"] > pre_ctx["pre_vwap"]
+        if pd.notna(gap_pct):
+            if 2 <= gap_pct < 12:
+                score += 12
+            elif 12 <= gap_pct < 35:
+                score += 16
+            elif gap_pct >= 35:
+                score += 6
+                notes.append("Hot gap")
 
-    if pd.notna(gap_pct):
-        if 2 <= gap_pct < 12:
+        if pd.notna(pre_ratio):
+            if pre_ratio >= 0.8:
+                score += 8
+            if pre_ratio >= 1.5:
+                score += 10
+
+        if pd.notna(pre_dollar_vol):
+            if pre_dollar_vol >= 250_000:
+                score += 12
+            elif pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
+                score -= 12
+
+        if above_vwap:
             score += 12
-        elif 12 <= gap_pct < 35:
-            score += 16
-        elif gap_pct >= 35:
-            score += 6
-            notes.append("Hot gap")
+        else:
+            score -= 10
+            notes.append("Premarket VWAP altı")
 
-    if pd.notna(pre_ratio):
-        if pre_ratio >= 0.8:
-            score += 8
-        if pre_ratio >= 1.5:
-            score += 10
-
-    if pd.notna(pre_dollar_vol):
-        if pre_dollar_vol >= 250_000:
-            score += 12
-        elif pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
-            score -= 12
-
-    if above_vwap:
-        score += 12
+        if pd.notna(pre_ctx["hold_quality"]):
+            if pre_ctx["hold_quality"] >= 80:
+                score += 16
+            elif pre_ctx["hold_quality"] >= 65:
+                score += 8
+            elif pre_ctx["hold_quality"] < 45:
+                score -= 12
     else:
-        score -= 10
-        notes.append("Premarket VWAP altı")
-
-    if pd.notna(pre_ctx["hold_quality"]):
-        if pre_ctx["hold_quality"] >= 80:
-            score += 16
-        elif pre_ctx["hold_quality"] >= 65:
-            score += 8
-        elif pre_ctx["hold_quality"] < 45:
-            score -= 12
+        gap_pct = np.nan
+        pre_dollar_vol = np.nan
+        above_vwap = False
+        notes.append("Premarket veri yok")
 
     if flags["recent_reverse_split"]:
         score -= 25
@@ -725,9 +1005,16 @@ def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, co
         score -= 6
         notes.append("Deficiency")
 
-    score = clamp(score, 0, 100)
+    if pd.notna(ml_prob):
+        ml_score = ml_prob * 100.0
+        score = 0.70 * score + 0.30 * ml_score
+        notes.append(f"ML={round(ml_score,1)}")
 
-    if (
+    score = clamp(round(score), 0, 100)
+
+    if pre_ctx["source"] != "REAL_PREMARKET":
+        decision = "İZLE" if score >= cont_score_al - 4 else "ALMA"
+    elif (
         score >= cont_score_strong and above_vwap and
         pd.notna(pre_ctx["hold_quality"]) and pre_ctx["hold_quality"] >= 70 and
         pd.notna(pre_dollar_vol) and pre_dollar_vol >= 300_000
@@ -753,7 +1040,8 @@ def score_continuation(last_bar, prev_bar, hist20, pre_ctx, pre_ratio, flags, co
         "gap_pct": gap_pct,
         "pre_dollar_vol": pre_dollar_vol,
         "pre_vr": pre_ratio,
-        "above_vwap": above_vwap
+        "above_vwap": above_vwap,
+        "ml_prob": ml_prob
     }
 
 
@@ -763,6 +1051,9 @@ def build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_t
         return None
 
     flags = get_flags(symbol)
+    feat = extract_snapshot_features_from_ctx(ctx)
+    ml_prob, _ = predict_model_probability("continuation_model", feat)
+
     pre_ctx = get_premarket_context(minute_df, trade_date_str, cutoff_time)
     baseline_median, _, samples = premarket_baseline_ratio(minute_df, ctx["prior_dates"], trade_date_str, cutoff_time)
 
@@ -771,7 +1062,8 @@ def build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_t
         pre_ratio = pre_ctx["pre_vol"] / baseline_median
 
     score, decision, notes, extra = score_continuation(
-        ctx["last"], ctx["prev"], ctx["hist20"], pre_ctx, pre_ratio, flags, cont_score_al, cont_score_strong
+        ctx["last"], ctx["prev"], ctx["hist20"], pre_ctx, pre_ratio, flags,
+        cont_score_al, cont_score_strong, ml_prob=ml_prob
     )
 
     prev_high = safe_float(ctx["last"]["High"], np.nan)
@@ -816,6 +1108,7 @@ def build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_t
         "Symbol": symbol,
         "Decision": decision,
         "Score": score,
+        "ML_Prob": round_smart(ml_prob * 100 if pd.notna(ml_prob) else np.nan),
         "Price": round_smart(pre_ctx["price"]),
         "Prev_Close": round_smart(prev_close),
         "Gap_%": round_smart(gap_pct),
@@ -1097,48 +1390,18 @@ def build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time
         return None
 
     flags = get_flags(symbol)
+    feat = extract_snapshot_features_from_ctx(ctx)
+    ml_prob, _ = predict_model_probability("supernova_model", feat)
+
     last = ctx["last"]
-    prev = ctx["prev"]
-
     price = safe_float(last["Close"], np.nan)
-    prev_close = safe_float(prev["Close"], np.nan)
-    prev_day_ret = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
-    prev_close_strength = closing_strength(price, safe_float(last["Low"], np.nan), safe_float(last["High"], np.nan))
 
-    hist10 = ctx["hist10"]
-    hist20 = ctx["hist20"]
-    hist60 = ctx["hist60"]
-    hist90 = ctx["hist90"]
-
-    avg_vol20 = max(avg(hist20["Volume"].iloc[:-1] if len(hist20) > 1 else hist20["Volume"]), 1)
-    prev_vol_ratio = safe_float(last["Volume"], 0) / avg_vol20
-    prev_dollar_vol = price * safe_float(last["Volume"], 0)
-
-    hist10_high = safe_float(hist10["High"].max(), np.nan)
-    hist10_low = safe_float(hist10["Low"].min(), np.nan)
-    high20_ex_last = safe_float(hist20["High"].iloc[:-1].max() if len(hist20) > 1 else hist20["High"].max(), np.nan)
-    low30 = safe_float(hist60["Low"].iloc[-30:].min() if len(hist60) >= 30 else hist60["Low"].min(), np.nan)
-    high90 = safe_float(hist90["High"].max(), np.nan)
-
-    drawdown90 = ((price / high90) - 1) * 100.0 if pd.notna(high90) and high90 > 0 else np.nan
-    rebound30 = ((price - low30) / low30) * 100.0 if pd.notna(low30) and low30 > 0 else np.nan
-    base_tightness10 = ((hist10_high - hist10_low) / price * 100.0) if pd.notna(price) and price > 0 else np.nan
-    breakout20 = bool(pd.notna(high20_ex_last) and price > high20_ex_last)
-
-    avg_range20 = max(avg([
-        range_pct(h, l, c) for h, l, c in zip(hist20["High"].iloc[:-1], hist20["Low"].iloc[:-1], hist20["Close"].iloc[:-1])
-    ]), 0.0001)
-    prev_range_pct = range_pct(safe_float(last["High"], np.nan), safe_float(last["Low"], np.nan), price)
-    range_expansion = prev_range_pct / avg_range20 if pd.notna(prev_range_pct) else np.nan
-
-    structural_score, structural_notes, struct_reject = score_structural(price, drawdown90, base_tightness10, rebound30, breakout20, flags)
+    structural_score, structural_notes, struct_reject = score_structural(
+        feat["price"], feat["drawdown90"], feat["base_tightness10"], feat["rebound30"], bool(feat["breakout20"]), flags
+    )
     ignition_score, ignition_notes = score_ignition(
-        prev_day_ret,
-        prev_close_strength * 100 if pd.notna(prev_close_strength) else np.nan,
-        prev_vol_ratio,
-        prev_dollar_vol,
-        range_expansion,
-        flags
+        feat["prev_day_ret"], feat["prev_close_strength"], feat["prev_vol_ratio"],
+        feat["prev_dollar_vol"], feat["range_expansion"], flags
     )
 
     pre_ctx = get_premarket_context(minute_df, trade_date_str, cutoff_time)
@@ -1156,19 +1419,23 @@ def build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time
     )
 
     pattern_name, pattern_score, top_matches = compute_pattern_similarity({
-        "price": price,
-        "drawdown90": drawdown90,
-        "base_tightness10": base_tightness10,
-        "prev_day_ret": prev_day_ret,
-        "prev_vol_ratio": prev_vol_ratio,
-        "prev_close_strength": (prev_close_strength * 100) if pd.notna(prev_close_strength) else np.nan,
-        "breakout20": 1 if breakout20 else 0,
+        "price": feat["price"],
+        "drawdown90": feat["drawdown90"],
+        "base_tightness10": feat["base_tightness10"],
+        "prev_day_ret": feat["prev_day_ret"],
+        "prev_vol_ratio": feat["prev_vol_ratio"],
+        "prev_close_strength": feat["prev_close_strength"],
+        "breakout20": feat["breakout20"],
         "gap_pct": gap_pct,
         "pre_vol_ratio": pre_vol_ratio,
         "hold_quality": pre_ctx["hold_quality"],
         "pre_dollar_vol": pre_dollar_vol,
         "above_prev_high": 1 if above_prev_high else 0
     })
+
+    if pd.notna(ml_prob):
+        pattern_score = round(0.70 * pattern_score + 0.30 * (ml_prob * 100.0))
+        pre_notes.append(f"ML={round(ml_prob*100,1)}")
 
     decision = "ALMA"
     if not struct_reject and not pre_reject:
@@ -1228,17 +1495,18 @@ def build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time
         "Ignition_Score": ignition_score,
         "Premarket_Score": premarket_score,
         "Pattern_Score": pattern_score,
+        "ML_Prob": round_smart(ml_prob * 100 if pd.notna(ml_prob) else np.nan),
         "Best_Pattern": pattern_name,
         "Price": round_smart(pre_ctx["price"]),
         "Prev_Close": round_smart(price),
         "Gap_%": round_smart(gap_pct),
-        "Prev_Ret_%": round_smart(prev_day_ret),
-        "Prev_Close_Strength": round_smart(prev_close_strength * 100 if pd.notna(prev_close_strength) else np.nan),
-        "Prev_Vol_Ratio": round_smart(prev_vol_ratio),
-        "Prev_Dollar_Vol": round_smart(prev_dollar_vol),
-        "Drawdown90_%": round_smart(drawdown90),
-        "Base_Tightness10_%": round_smart(base_tightness10),
-        "Breakout20": breakout20,
+        "Prev_Ret_%": round_smart(feat["prev_day_ret"]),
+        "Prev_Close_Strength": round_smart(feat["prev_close_strength"]),
+        "Prev_Vol_Ratio": round_smart(feat["prev_vol_ratio"]),
+        "Prev_Dollar_Vol": round_smart(feat["prev_dollar_vol"]),
+        "Drawdown90_%": round_smart(feat["drawdown90"]),
+        "Base_Tightness10_%": round_smart(feat["base_tightness10"]),
+        "Breakout20": bool(feat["breakout20"]),
         "Pre_Vol": safe_int(pre_ctx["pre_vol"], 0),
         "Pre_Baseline": safe_int(baseline_median, 0) if pd.notna(baseline_median) else 0,
         "Pre_Vol_Ratio": round_smart(pre_vol_ratio),
@@ -1258,7 +1526,7 @@ def build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time
 
 
 # ============================================================
-# RADAR / BUILD
+# BUILD / RADAR
 # ============================================================
 def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=None,
                       cont_score_al=DEFAULT_CONT_SCORE_AL, cont_score_strong=DEFAULT_CONT_SCORE_STRONG,
@@ -1283,7 +1551,7 @@ def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=Non
         cutoff_time = cutoff_time or "09:25:00"
 
     quotes_map = fetch_alpaca_latest_quotes(symbols) if have_alpaca() else {}
-    daily_lookback = 420
+    daily_lookback = 520
     minute_lookback_days = 12
 
     for symbol in symbols:
@@ -1299,11 +1567,16 @@ def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=Non
                 minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="5Min")
 
         if engine_name == "continuation":
-            row = build_continuation_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
-                                         cont_score_al, cont_score_strong, quotes_map)
+            row = build_continuation_row(
+                symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
+                cont_score_al, cont_score_strong, quotes_map
+            )
         else:
-            row = build_supernova_row(symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
-                                      quotes_map, super_pattern_al, super_pattern_strong)
+            row = build_supernova_row(
+                symbol, daily_df, minute_df, trade_date_str, cutoff_time or "09:25:00",
+                quotes_map, super_pattern_al, super_pattern_strong
+            )
+
         if row is not None:
             rows.append(row)
 
@@ -1337,13 +1610,14 @@ def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
     if cont_df.empty and super_df.empty:
         return pd.DataFrame(), session, cutoff
 
-    cont_cols = ["Symbol", "Decision", "Score", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
-    super_cols = ["Symbol", "Decision", "Pattern_Score", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
+    cont_cols = ["Symbol", "Decision", "Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
+    super_cols = ["Symbol", "Decision", "Pattern_Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
 
     cont_small = cont_df[cont_cols].copy() if not cont_df.empty else pd.DataFrame(columns=cont_cols)
     cont_small = cont_small.rename(columns={
         "Decision": "Cont_Decision",
         "Score": "Cont_Score",
+        "ML_Prob": "Cont_ML_Prob",
         "Entry_Idea": "Cont_Entry",
         "Risk_Grade": "Cont_Risk",
         "Real_Money_Allowed": "Cont_Allowed"
@@ -1353,6 +1627,7 @@ def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
     super_small = super_small.rename(columns={
         "Decision": "Super_Decision",
         "Pattern_Score": "Super_Pattern",
+        "ML_Prob": "Super_ML_Prob",
         "Entry_Idea": "Super_Entry",
         "Risk_Grade": "Super_Risk",
         "Real_Money_Allowed": "Super_Allowed"
@@ -1363,7 +1638,6 @@ def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
     def final_pick(row):
         cont_dec = row.get("Cont_Decision", None)
         super_dec = row.get("Super_Decision", None)
-
         if super_dec == "GÜÇLÜ AL":
             return "SUPERNOVA_GÜÇLÜ_AL"
         if cont_dec == "GÜÇLÜ AL":
@@ -1414,7 +1688,7 @@ def render_journal_tab():
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.success("Final production mode aktif")
+    st.success("ML Final mode aktif")
 
     st.header("Alpaca API")
     api_key_input = st.text_input("API Key ID", value=ALPACA_API_KEY, type="password")
@@ -1438,18 +1712,18 @@ with st.sidebar:
 # ============================================================
 # TABS
 # ============================================================
-tab0, tab1, tab2, tab3, tab4 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🧭 Radar",
     "📈 Continuation Engine",
     "🚀 Supernova Engine",
+    "🧠 ML Trainer",
     "🛡️ Risk Monitor",
     "🧾 Journal"
 ])
 
 with tab0:
     st.subheader("Radar")
-    st.caption("Aynı sembol havuzunu hem continuation hem supernova açısından tarar; birleşik öncelik listesi üretir.")
-
+    st.caption("Aynı sembol havuzunu continuation ve supernova açısından tarar; birleşik öncelik listesi üretir.")
     radar_symbols_text = st.text_area(
         "Radar sembol listesi",
         value=",".join(list(dict.fromkeys(DEFAULT_CONTINUATION_SYMBOLS + DEFAULT_SUPERNOVA_SYMBOLS))),
@@ -1467,7 +1741,6 @@ with tab0:
                 radar_df, session, cutoff = build_radar(
                     syms, CONT_SCORE_AL, CONT_SCORE_STRONG, SUPER_PATTERN_AL, SUPER_PATTERN_STRONG
                 )
-
             st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
             if radar_df.empty:
                 st.warning("Radar sonucu yok.")
@@ -1487,8 +1760,8 @@ with tab0:
 with tab1:
     st.subheader("Continuation Engine")
     st.caption("Amaç: önceki gün güçlü kapanan ve ertesi gün devam etme ihtimali olan hisseleri bulmak.")
-
     col1, col2 = st.columns([2, 1])
+
     with col1:
         cont_symbols_text = st.text_area(
             "Sembol listesi",
@@ -1522,7 +1795,6 @@ with tab1:
                     )
 
             st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-
             if df.empty:
                 st.warning("Sonuç yok.")
             else:
@@ -1553,8 +1825,8 @@ with tab1:
 with tab2:
     st.subheader("Supernova Engine")
     st.caption("Amaç: RMSG / STI tipi düşük fiyatlı, patlayıcı, erken ignition adaylarını bulmak.")
-
     col1, col2 = st.columns([2, 1])
+
     with col1:
         rocket_symbols_text = st.text_area(
             "Sembol listesi",
@@ -1588,7 +1860,6 @@ with tab2:
                     )
 
             st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-
             if df.empty:
                 st.warning("Sonuç yok.")
             else:
@@ -1617,6 +1888,82 @@ with tab2:
                 )
 
 with tab3:
+    st.subheader("ML Trainer")
+    st.caption("Kural tabanlı motorun üstüne olasılık katmanı eklemek için supervision tabanlı model eğitir.")
+
+    ml_symbols_text = st.text_area(
+        "Eğitim sembol listesi",
+        value=",".join(DEFAULT_ML_TRAIN_SYMBOLS),
+        height=120,
+        key="ml_symbols"
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        train_cont_btn = st.button("Continuation model eğit", key="train_cont_model")
+    with c2:
+        train_super_btn = st.button("Supernova model eğit", key="train_super_model")
+
+    st.markdown("### Kayıtlı modeller")
+    cont_model, cont_cols, cont_meta = load_model_bundle("continuation_model")
+    super_model, super_cols, super_meta = load_model_bundle("supernova_model")
+
+    meta_df = pd.DataFrame([
+        {
+            "Model": "continuation_model",
+            "Loaded": cont_model is not None,
+            "Rows": cont_meta.get("rows") if cont_meta else None,
+            "Train_Rows": cont_meta.get("train_rows") if cont_meta else None,
+            "Test_Rows": cont_meta.get("test_rows") if cont_meta else None,
+            "Test_Acc@0.5": cont_meta.get("test", {}).get("accuracy_0_5") if cont_meta else None,
+            "Test_Precision@0.5": cont_meta.get("test", {}).get("precision_0_5") if cont_meta else None,
+            "Test_Recall@0.5": cont_meta.get("test", {}).get("recall_0_5") if cont_meta else None,
+        },
+        {
+            "Model": "supernova_model",
+            "Loaded": super_model is not None,
+            "Rows": super_meta.get("rows") if super_meta else None,
+            "Train_Rows": super_meta.get("train_rows") if super_meta else None,
+            "Test_Rows": super_meta.get("test_rows") if super_meta else None,
+            "Test_Acc@0.5": super_meta.get("test", {}).get("accuracy_0_5") if super_meta else None,
+            "Test_Precision@0.5": super_meta.get("test", {}).get("precision_0_5") if super_meta else None,
+            "Test_Recall@0.5": super_meta.get("test", {}).get("recall_0_5") if super_meta else None,
+        },
+    ])
+    st.dataframe(meta_df, use_container_width=True)
+
+    if train_cont_btn or train_super_btn:
+        syms = parse_symbols(ml_symbols_text)
+        if not syms:
+            st.warning("Eğitim için sembol gir.")
+        else:
+            model_type = "continuation" if train_cont_btn else "supernova"
+            with st.spinner(f"{model_type} dataset hazırlanıyor..."):
+                ds = build_training_dataset(syms, model_type)
+
+            if ds.empty:
+                st.error("Dataset oluşmadı.")
+            else:
+                st.write(f"Dataset rows: {len(ds)}")
+                st.dataframe(ds.head(20), use_container_width=True)
+
+                with st.spinner(f"{model_type} model eğitiliyor..."):
+                    model, feature_cols, metrics = train_model_from_dataset(ds, model_type)
+
+                model_name = f"{model_type}_model"
+                save_model_bundle(model_name, model, feature_cols, metrics)
+                st.success(f"{model_name} kaydedildi.")
+                st.json(metrics)
+
+                csv = ds.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    f"📥 {model_type} dataset CSV indir",
+                    data=csv,
+                    file_name=f"{model_type}_training_dataset.csv",
+                    mime="text/csv",
+                    key=f"download_{model_type}_dataset"
+                )
+
+with tab4:
     st.subheader("Risk Monitor")
     st.caption("Actionable sinyallerin execution/risk filtresi.")
 
@@ -1648,13 +1995,13 @@ with tab3:
             frames = []
             if not cont_df.empty:
                 frames.append(cont_df[[
-                    "Engine", "Symbol", "Decision", "Entry_Idea", "Stop", "TP1", "TP2",
+                    "Engine", "Symbol", "Decision", "ML_Prob", "Entry_Idea", "Stop", "TP1", "TP2",
                     "Late_Status", "Extension_%", "Bid", "Ask", "Spread_%", "Stop_Dist_%",
                     "Risk_Grade", "Real_Money_Allowed", "Risk_Tags"
                 ]].copy())
             if not super_df.empty:
                 frames.append(super_df[[
-                    "Engine", "Symbol", "Decision", "Entry_Idea", "Stop", "TP1", "TP2",
+                    "Engine", "Symbol", "Decision", "ML_Prob", "Entry_Idea", "Stop", "TP1", "TP2",
                     "Late_Status", "Extension_%", "Bid", "Ask", "Spread_%", "Stop_Dist_%",
                     "Risk_Grade", "Real_Money_Allowed", "Risk_Tags"
                 ]].copy())
@@ -1664,7 +2011,7 @@ with tab3:
             else:
                 risk_df = pd.concat(frames, ignore_index=True)
                 risk_df["_rank"] = risk_df["Real_Money_Allowed"].map({True: 0, False: 1})
-                risk_df = risk_df.sort_values(["_rank", "Risk_Grade"]).drop(columns=["_rank"])
+                risk_df = risk_df.sort_values(["_rank", "Risk_Grade", "Decision"]).drop(columns=["_rank"])
                 st.dataframe(risk_df.head(N_SHOW), use_container_width=True)
                 csv = risk_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
@@ -1675,5 +2022,5 @@ with tab3:
                     key="download_risk"
                 )
 
-with tab4:
+with tab5:
     render_journal_tab()
