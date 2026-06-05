@@ -16,10 +16,10 @@ from sklearn.ensemble import RandomForestClassifier
 # ============================================================
 # APP CONFIG
 # ============================================================
-st.set_page_config(page_title="Algo Terminal ML Final", layout="wide")
-st.title("🎯 Algo Terminal — ML Final")
+st.set_page_config(page_title="Algo Terminal Overnight + Ignition", layout="wide")
+st.title("🎯 Algo Terminal — Overnight + Ignition")
 st.caption(
-    "Nihai sürüm: Continuation Engine + Supernova Engine + ML Trainer + Radar + Risk Monitor. "
+    "Nihai sürüm: Overnight Engine + Premarket Ignition + Continuation + Supernova + ML + Risk Monitor. "
     "Kural tabanlı motorlar korunur; varsa eğitilmiş ML modelleri olasılık katmanı olarak eklenir."
 )
 
@@ -220,6 +220,53 @@ def decision_sort_key(decision):
 
 def top_cards(df, n=3):
     return [] if df is None or df.empty else df.head(n).to_dict("records")
+
+
+def apply_session_overlay(df, session):
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    if session in ["afterhours", "closed", "weekend"]:
+        out["Trade_Phase"] = "NIGHTLY_WATCHLIST"
+        out["Action_Status"] = "PREMARKET_REQUIRED"
+        if "Decision" in out.columns:
+            out["Decision"] = out["Decision"].replace({"GÜÇLÜ AL": "İZLE", "AL": "İZLE"})
+        if "Real_Money_Allowed" in out.columns:
+            out["Real_Money_Allowed"] = False
+        if "Risk_Grade" in out.columns:
+            out["Risk_Grade"] = "WATCHLIST_ONLY"
+        if "Risk_Tags" in out.columns:
+            out["Risk_Tags"] = out["Risk_Tags"].fillna("").apply(
+                lambda x: (x + " | session_closed_watchlist").strip(" |")
+            )
+        return out
+
+    if session == "premarket":
+        out["Trade_Phase"] = "PREMARKET_ACTIONABLE"
+        out["Action_Status"] = "LIVE_PREMARKET"
+        return out
+
+    if session == "regular":
+        out["Trade_Phase"] = "REGULAR_REVIEW"
+        out["Action_Status"] = "OPEN_MARKET"
+        return out
+
+    out["Trade_Phase"] = "BACKTEST"
+    out["Action_Status"] = "BACKTEST"
+    return out
+
+
+def render_session_message(session):
+    if session in ["afterhours", "closed", "weekend"]:
+        st.info("Piyasa kapalı. Bu çıktı işlem sinyali değil, Nightly Watchlist olarak okunmalı. Gerçek işlem için premarket teyidi gerekir.")
+    elif session == "premarket":
+        st.success("Premarket açık. Bu oturumda çıkan AL / GÜÇLÜ AL sinyalleri actionable kabul edilebilir.")
+    elif session == "regular":
+        st.warning("Market open modundasın. Bu çıktı açılış sonrası gözden geçirme içindir; geç kalma ve spread riskini ayrıca izle.")
+    elif session == "backtest":
+        st.caption("Backtest modunda geçmiş gün simülasyonu gösteriliyor.")
 
 
 def nz(v):
@@ -509,6 +556,10 @@ def build_fast_daily_feature_row(symbol, daily_df, trade_date_str):
 
 
 def fast_prefilter_score(engine_name, feat):
+    if engine_name == "overnight":
+        engine_name = "continuation"
+    elif engine_name == "premarket_ignition":
+        engine_name = "supernova"
     price = safe_float(feat.get("price"), np.nan)
     prev_day_ret = safe_float(feat.get("prev_day_ret"), np.nan)
     prev_close_strength = safe_float(feat.get("prev_close_strength"), np.nan)
@@ -1857,6 +1908,8 @@ def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=Non
     if df.empty:
         return df, session, cutoff_time
 
+    df = apply_session_overlay(df, session)
+
     if engine_name == "continuation":
         df["_rank"] = df["Decision"].map(decision_sort_key)
         df = df.sort_values(["_rank", "Score"], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
@@ -1886,8 +1939,8 @@ def build_radar(symbols=None, cont_symbols=None, super_symbols=None, cont_al=DEF
     if cont_df.empty and super_df.empty:
         return pd.DataFrame(), session, cutoff
 
-    cont_cols = ["Symbol", "Decision", "Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
-    super_cols = ["Symbol", "Decision", "Pattern_Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed"]
+    cont_cols = ["Symbol", "Decision", "Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed", "Trade_Phase", "Action_Status"]
+    super_cols = ["Symbol", "Decision", "Pattern_Score", "ML_Prob", "Entry_Idea", "Risk_Grade", "Real_Money_Allowed", "Trade_Phase", "Action_Status"]
 
     cont_small = cont_df[cont_cols].copy() if not cont_df.empty else pd.DataFrame(columns=cont_cols)
     cont_small = cont_small.rename(columns={
@@ -1896,7 +1949,9 @@ def build_radar(symbols=None, cont_symbols=None, super_symbols=None, cont_al=DEF
         "ML_Prob": "Cont_ML_Prob",
         "Entry_Idea": "Cont_Entry",
         "Risk_Grade": "Cont_Risk",
-        "Real_Money_Allowed": "Cont_Allowed"
+        "Real_Money_Allowed": "Cont_Allowed",
+        "Trade_Phase": "Cont_Phase",
+        "Action_Status": "Cont_Action"
     })
 
     super_small = super_df[super_cols].copy() if not super_df.empty else pd.DataFrame(columns=super_cols)
@@ -1906,7 +1961,9 @@ def build_radar(symbols=None, cont_symbols=None, super_symbols=None, cont_al=DEF
         "ML_Prob": "Super_ML_Prob",
         "Entry_Idea": "Super_Entry",
         "Risk_Grade": "Super_Risk",
-        "Real_Money_Allowed": "Super_Allowed"
+        "Real_Money_Allowed": "Super_Allowed",
+        "Trade_Phase": "Super_Phase",
+        "Action_Status": "Super_Action"
     })
 
     merged = pd.merge(cont_small, super_small, on="Symbol", how="outer")
@@ -1987,13 +2044,15 @@ with st.sidebar:
 # ============================================================
 # TABS
 # ============================================================
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🧭 Radar",
     "📈 Continuation Engine",
     "🚀 Supernova Engine",
     "🧠 ML Trainer",
     "🛡️ Risk Monitor",
-    "🧾 Journal"
+    "🧾 Journal",
+    "🌙 Overnight Engine",
+    "⚡ Premarket Ignition"
 ])
 
 with tab0:
@@ -2059,6 +2118,8 @@ with tab0:
                     )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+            render_session_message(session)
+            render_session_message(session)
                 if radar_use_full_market:
                     st.info(
                         f"Continuation evreni: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}  \n"
@@ -2147,6 +2208,8 @@ with tab1:
                         )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+            render_session_message(session)
+            render_session_message(session)
                 if cont_use_full_market:
                     st.info(f"Evren: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}")
 
@@ -2240,6 +2303,8 @@ with tab2:
                         )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+            render_session_message(session)
+            render_session_message(session)
                 if rocket_use_full_market:
                     st.info(f"Evren: {super_meta['universe_count']} | ranked: {super_meta['ranked_count']} | deep scan: {super_meta['deep_count']}")
 
@@ -2352,7 +2417,7 @@ with tab3:
 
 with tab4:
     st.subheader("Risk Monitor")
-    st.caption("Actionable sinyallerin execution/risk filtresi.")
+    st.caption("Actionable sinyallerin execution/risk filtresi. Piyasa kapalıysa sonuçlar watchlist-only olarak işaretlenir.")
 
     risk_symbols_text = st.text_area(
         "Risk monitor sembol listesi",
@@ -2411,3 +2476,170 @@ with tab4:
 
 with tab5:
     render_journal_tab()
+
+
+with tab6:
+    st.subheader("Overnight Engine")
+    st.caption("Amaç: gece alıp ertesi gün premarkette veya regular session'da satılabilecek continuation adaylarını bulmak.")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        ov_symbols_text = st.text_area(
+            "Sembol listesi",
+            value=",".join(DEFAULT_CONTINUATION_SYMBOLS),
+            height=100,
+            key="ov_symbols"
+        )
+    with col2:
+        ov_mode = st.radio("Mod", ["Canlı", "Backtest"], index=0, key="ov_mode")
+        ov_date = st.date_input("Backtest exit günü", value=now_ny().date(), key="ov_date")
+        ov_run = st.button("Overnight çalıştır", key="run_overnight")
+
+    ov_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="ov_use_full_market")
+    if ov_use_full_market:
+        st.info("Başlangıç için Evren=1500, Ön filtre=120, Detaylı scan=50 önerilir.")
+    ofm1, ofm2, ofm3, ofm4 = st.columns(4)
+    with ofm1:
+        ov_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="ov_exchanges")
+    with ofm2:
+        ov_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 120, 10, key="ov_prefilter_limit")
+    with ofm3:
+        ov_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 50, 10, key="ov_deep_scan_limit")
+    with ofm4:
+        ov_universe_limit = st.number_input("Evren sınırı (0=tamı / yavaş)", min_value=0, value=1500, step=500, key="ov_universe_limit")
+
+    if ov_run:
+        if ov_use_full_market and not have_alpaca():
+            st.warning("Tam evren taraması için Alpaca API gerekir.")
+        else:
+            trade_date_for_pref = overnight_reference_date_str(get_session_label()) if ov_mode == "Canlı" else str(ov_date)
+            symbols, ov_meta, ov_pre_df = resolve_scan_symbols(
+                ov_symbols_text, ov_use_full_market, "overnight", trade_date_for_pref,
+                ov_exchanges, ov_prefilter_limit, ov_deep_scan_limit, ov_universe_limit
+            )
+
+            if not symbols:
+                st.warning("Sembol bulunamadı.")
+            else:
+                with st.spinner("Overnight Engine çalışıyor..."):
+                    df, session, ref_date = build_overnight_rows(symbols, None if ov_mode == "Canlı" else str(ov_date))
+
+                st.write(f"**Session:** {session} | **Reference Exit Date:** {ref_date}")
+                if ov_use_full_market:
+                    st.caption(
+                        f"Source={ov_meta['source']} | Universe={ov_meta['universe_count']} | Ranked={ov_meta['ranked_count']} | Deep={ov_meta['deep_count']}"
+                    )
+
+                if df.empty:
+                    st.warning("Sonuç yok.")
+                else:
+                    if SHOW_ONLY_TRADEABLE:
+                        df = df[df["Decision"].isin(["GÜÇLÜ GECE AL", "GECE AL", "İZLE"])].copy()
+
+                    tops = top_cards(df, 3)
+                    cols = st.columns(3)
+                    for i, item in enumerate(tops):
+                        with cols[i]:
+                            st.metric(
+                                f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                                f"Night {item['Night_Score']}",
+                                f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                            )
+                            st.caption(f"{item['Trade_Phase']} | {item['Action_Status']} | {item['Notes']}")
+
+                    st.dataframe(df.head(N_SHOW), use_container_width=True)
+                    if ov_use_full_market and not ov_pre_df.empty:
+                        with st.expander("Ön filtre adayları"):
+                            st.dataframe(ov_pre_df.head(min(N_SHOW, len(ov_pre_df))), use_container_width=True)
+
+                    csv = df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Overnight CSV indir",
+                        data=csv,
+                        file_name=f"overnight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_overnight"
+                    )
+
+with tab7:
+    st.subheader("Premarket Ignition")
+    st.caption("Amaç: premarkette ateşleyen, erken giriş verip henüz çok uzamamış adayları bulmak.")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        ign_symbols_text = st.text_area(
+            "Sembol listesi",
+            value=",".join(DEFAULT_SUPERNOVA_SYMBOLS),
+            height=100,
+            key="ign_symbols"
+        )
+    with col2:
+        ign_mode = st.radio("Mod", ["Canlı", "Backtest"], index=0, key="ign_mode")
+        ign_date = st.date_input("Backtest günü", value=now_ny().date(), key="ign_date")
+        ign_run = st.button("Premarket ignition çalıştır", key="run_ignition")
+
+    ign_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="ign_use_full_market")
+    if ign_use_full_market:
+        st.info("Başlangıç için Evren=1500, Ön filtre=120, Detaylı scan=50 önerilir.")
+    ifm1, ifm2, ifm3, ifm4 = st.columns(4)
+    with ifm1:
+        ign_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="ign_exchanges")
+    with ifm2:
+        ign_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 120, 10, key="ign_prefilter_limit")
+    with ifm3:
+        ign_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 50, 10, key="ign_deep_scan_limit")
+    with ifm4:
+        ign_universe_limit = st.number_input("Evren sınırı (0=tamı / yavaş)", min_value=0, value=1500, step=500, key="ign_universe_limit")
+
+    if ign_run:
+        if ign_use_full_market and not have_alpaca():
+            st.warning("Tam evren taraması için Alpaca API gerekir.")
+        else:
+            trade_date_for_pref = ny_date_str() if ign_mode == "Canlı" else str(ign_date)
+            symbols, ign_meta, ign_pre_df = resolve_scan_symbols(
+                ign_symbols_text, ign_use_full_market, "premarket_ignition", trade_date_for_pref,
+                ign_exchanges, ign_prefilter_limit, ign_deep_scan_limit, ign_universe_limit
+            )
+
+            if not symbols:
+                st.warning("Sembol bulunamadı.")
+            else:
+                with st.spinner("Premarket Ignition çalışıyor..."):
+                    df, session, ref_date = build_premarket_ignition_rows(symbols, None if ign_mode == "Canlı" else str(ign_date))
+
+                st.write(f"**Session:** {session} | **Reference Date:** {ref_date}")
+                if ign_use_full_market:
+                    st.caption(
+                        f"Source={ign_meta['source']} | Universe={ign_meta['universe_count']} | Ranked={ign_meta['ranked_count']} | Deep={ign_meta['deep_count']}"
+                    )
+
+                if df.empty:
+                    st.warning("Sonuç yok.")
+                else:
+                    if SHOW_ONLY_TRADEABLE:
+                        df = df[df["Decision"].isin(["PREMARKET GÜÇLÜ AL", "PREMARKET AL", "İZLE", "GEÇ KALINDI"])].copy()
+
+                    tops = top_cards(df, 3)
+                    cols = st.columns(3)
+                    for i, item in enumerate(tops):
+                        with cols[i]:
+                            st.metric(
+                                f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                                f"Ignition {item['Ignition_Score']}",
+                                f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                            )
+                            st.caption(f"{item['Trade_Phase']} | {item['Action_Status']} | {item['Notes']}")
+
+                    st.dataframe(df.head(N_SHOW), use_container_width=True)
+                    if ign_use_full_market and not ign_pre_df.empty:
+                        with st.expander("Ön filtre adayları"):
+                            st.dataframe(ign_pre_df.head(min(N_SHOW, len(ign_pre_df))), use_container_width=True)
+
+                    csv = df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Premarket ignition CSV indir",
+                        data=csv,
+                        file_name=f"premarket_ignition_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_ignition"
+                    )
