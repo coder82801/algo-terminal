@@ -44,6 +44,7 @@ DEFAULT_ML_TRAIN_SYMBOLS = sorted(list(dict.fromkeys(
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_FEED = (os.getenv("ALPACA_FEED", "iex") or "iex").lower()
+ALPACA_TRADING_BASE = os.getenv("ALPACA_TRADING_BASE", "https://paper-api.alpaca.markets")
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -398,6 +399,277 @@ def fetch_minute_df(symbol, start_dt_utc, end_dt_utc, timeframe="1Min"):
         limit=10000,
     )
     return minute_bars_to_df(bars_map.get(symbol, []))
+
+
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_us_equity_universe(exchanges=("NASDAQ", "NYSE")):
+    if not have_alpaca():
+        return []
+
+    url = f"{ALPACA_TRADING_BASE}/v2/assets"
+    params = {"status": "active", "asset_class": "us_equity"}
+    exchange_set = {str(x).upper() for x in exchanges}
+
+    try:
+        r = requests.get(url, headers=alpaca_headers(), params=params, timeout=40)
+        if r.status_code != 200:
+            return []
+        payload = r.json()
+    except Exception:
+        return []
+
+    universe = []
+    for asset in payload:
+        sym = str(asset.get("symbol", "")).upper().strip()
+        exch = str(asset.get("exchange", "")).upper().strip()
+        tradable = bool(asset.get("tradable", False))
+
+        if not sym or not tradable:
+            continue
+        if exch not in exchange_set:
+            continue
+        if "/" in sym or " " in sym:
+            continue
+
+        universe.append(sym)
+
+    return sorted(list(dict.fromkeys(universe)))
+
+
+def build_fast_daily_feature_row(symbol, daily_df, trade_date_str):
+    ctx = get_trade_date_context(daily_df, trade_date_str)
+    if ctx is None:
+        return None
+
+    last = ctx["last"]
+    prev = ctx["prev"]
+    hist10 = ctx["hist10"]
+    hist20 = ctx["hist20"]
+    hist60 = ctx["hist60"]
+    hist90 = ctx["hist90"]
+
+    price = safe_float(last["Close"], np.nan)
+    prev_close = safe_float(prev["Close"], np.nan)
+    prev_day_ret = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+    prev_close_strength = closing_strength(price, safe_float(last["Low"], np.nan), safe_float(last["High"], np.nan))
+    prev_close_strength_pct = prev_close_strength * 100.0 if pd.notna(prev_close_strength) else np.nan
+
+    avg_vol20 = max(avg(hist20["Volume"].iloc[:-1] if len(hist20) > 1 else hist20["Volume"]), 1)
+    prev_vol_ratio = safe_float(last["Volume"], 0) / avg_vol20
+    prev_dollar_vol = price * safe_float(last["Volume"], 0)
+
+    ema9 = calc_ema(hist20["Close"], 9).iloc[-1] if len(hist20) >= 9 else np.nan
+    ema20 = calc_ema(hist20["Close"], 20).iloc[-1] if len(hist20) >= 20 else np.nan
+
+    atr14 = calc_atr(hist20, 14).iloc[-1] if len(hist20) >= 14 else np.nan
+    atr_pct = (atr14 / price * 100.0) if pd.notna(atr14) and price > 0 else np.nan
+
+    range_pct_1d = range_pct(safe_float(last["High"], np.nan), safe_float(last["Low"], np.nan), price)
+    range_pct_10d_avg = avg([range_pct(h, l, c) for h, l, c in zip(hist10["High"], hist10["Low"], hist10["Close"])])
+
+    hist10_high = safe_float(hist10["High"].max(), np.nan)
+    hist10_low = safe_float(hist10["Low"].min(), np.nan)
+    high20_ex_last = safe_float(hist20["High"].iloc[:-1].max() if len(hist20) > 1 else hist20["High"].max(), np.nan)
+    low30 = safe_float(hist60["Low"].iloc[-30:].min() if len(hist60) >= 30 else hist60["Low"].min(), np.nan)
+    high90 = safe_float(hist90["High"].max(), np.nan)
+
+    drawdown90 = ((price / high90) - 1) * 100.0 if pd.notna(high90) and high90 > 0 else np.nan
+    rebound30 = ((price - low30) / low30) * 100.0 if pd.notna(low30) and low30 > 0 else np.nan
+    base_tightness10 = ((hist10_high - hist10_low) / price * 100.0) if pd.notna(price) and price > 0 else np.nan
+    breakout20 = bool(pd.notna(high20_ex_last) and price > high20_ex_last)
+
+    ema9_dist_pct = ((price - ema9) / ema9 * 100.0) if pd.notna(ema9) and ema9 > 0 else np.nan
+    ema20_dist_pct = ((price - ema20) / ema20 * 100.0) if pd.notna(ema20) and ema20 > 0 else np.nan
+
+    return {
+        "Symbol": symbol,
+        "price": price,
+        "prev_day_ret": prev_day_ret,
+        "prev_close_strength": prev_close_strength_pct,
+        "prev_vol_ratio": prev_vol_ratio,
+        "prev_dollar_vol": prev_dollar_vol,
+        "ema9": ema9,
+        "ema20": ema20,
+        "ema9_dist_pct": ema9_dist_pct,
+        "ema20_dist_pct": ema20_dist_pct,
+        "atr_pct": atr_pct,
+        "range_pct_1d": range_pct_1d,
+        "range_pct_10d_avg": range_pct_10d_avg,
+        "drawdown90": drawdown90,
+        "rebound30": rebound30,
+        "base_tightness10": base_tightness10,
+        "breakout20": breakout20,
+    }
+
+
+def fast_prefilter_score(engine_name, feat):
+    price = safe_float(feat.get("price"), np.nan)
+    prev_day_ret = safe_float(feat.get("prev_day_ret"), np.nan)
+    prev_close_strength = safe_float(feat.get("prev_close_strength"), np.nan)
+    prev_vol_ratio = safe_float(feat.get("prev_vol_ratio"), np.nan)
+    prev_dollar_vol = safe_float(feat.get("prev_dollar_vol"), np.nan)
+    drawdown90 = safe_float(feat.get("drawdown90"), np.nan)
+    rebound30 = safe_float(feat.get("rebound30"), np.nan)
+    base_tightness10 = safe_float(feat.get("base_tightness10"), np.nan)
+    breakout20 = bool(feat.get("breakout20", False))
+    ema9 = safe_float(feat.get("ema9"), np.nan)
+    ema20 = safe_float(feat.get("ema20"), np.nan)
+
+    score = 0.0
+
+    if engine_name == "continuation":
+        if pd.isna(price) or price < MIN_PRICE or price > MAX_PRICE_CONTINUATION:
+            return -9999
+
+        if 2 <= prev_day_ret < 12:
+            score += 18
+        elif 12 <= prev_day_ret < 35:
+            score += 26
+        elif 35 <= prev_day_ret < 70:
+            score += 12
+        elif prev_day_ret < 0:
+            score -= 10
+
+        if prev_close_strength >= 80:
+            score += 18
+        elif prev_close_strength >= 65:
+            score += 10
+        elif prev_close_strength < 45:
+            score -= 8
+
+        if prev_vol_ratio >= 1.5:
+            score += 12
+        if prev_vol_ratio >= 3:
+            score += 8
+
+        if prev_dollar_vol >= 500_000:
+            score += 14
+        elif prev_dollar_vol < 100_000:
+            score -= 10
+
+        if pd.notna(ema9) and pd.notna(ema20) and price > ema9 > ema20:
+            score += 12
+
+        if pd.notna(base_tightness10) and 3 <= base_tightness10 <= 30:
+            score += 4
+
+        return score
+
+    if pd.isna(price) or price < MIN_PRICE or price > MAX_PRICE_SUPERNOVA:
+        return -9999
+
+    if -90 <= drawdown90 <= -20:
+        score += 18
+    elif -20 < drawdown90 <= -5:
+        score += 6
+
+    if 4 <= base_tightness10 <= 35:
+        score += 14
+    elif base_tightness10 > 70:
+        score -= 8
+
+    if 3 <= prev_day_ret < 20:
+        score += 12
+    elif 20 <= prev_day_ret < 60:
+        score += 18
+    elif 60 <= prev_day_ret < 120:
+        score += 10
+
+    if prev_close_strength >= 80:
+        score += 16
+    elif prev_close_strength >= 65:
+        score += 8
+
+    if prev_vol_ratio >= 2:
+        score += 14
+    if prev_vol_ratio >= 5:
+        score += 10
+
+    if prev_dollar_vol >= 200_000:
+        score += 12
+    elif prev_dollar_vol < 50_000:
+        score -= 10
+
+    if 0 <= rebound30 <= 150:
+        score += 6
+
+    if breakout20:
+        score += 8
+
+    return score
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def build_full_market_prefilter(engine_name, trade_date_str, exchanges=("NASDAQ", "NYSE"), prefilter_limit=180, universe_limit=0, chunk_size=120):
+    universe = fetch_us_equity_universe(exchanges)
+    if universe_limit and universe_limit > 0:
+        universe = universe[:universe_limit]
+
+    if not universe:
+        return pd.DataFrame(), 0, 0
+
+    trade_date = datetime.strptime(trade_date_str, "%Y-%m-%d").replace(tzinfo=NY_TZ)
+    end_dt = trade_date.astimezone(UTC_TZ) + timedelta(days=1)
+    start_dt = end_dt - timedelta(days=220)
+
+    results = []
+    for chunk in chunked(universe, chunk_size):
+        bars_map = fetch_alpaca_bars(
+            chunk,
+            timeframe="1Day",
+            start=start_dt.isoformat().replace("+00:00", "Z"),
+            end=end_dt.isoformat().replace("+00:00", "Z"),
+            feed=ALPACA_FEED,
+            limit=10000
+        )
+
+        for sym in chunk:
+            daily_df = daily_bars_to_df(bars_map.get(sym, []))
+            if daily_df.empty:
+                continue
+
+            feat = build_fast_daily_feature_row(sym, daily_df, trade_date_str)
+            if feat is None:
+                continue
+
+            feat["Fast_Score"] = fast_prefilter_score(engine_name, feat)
+            if feat["Fast_Score"] > -999:
+                results.append(feat)
+
+    if not results:
+        return pd.DataFrame(), len(universe), 0
+
+    out = pd.DataFrame(results).sort_values("Fast_Score", ascending=False).reset_index(drop=True)
+    total_ranked = len(out)
+    out = out.head(prefilter_limit).copy()
+    return out, len(universe), total_ranked
+
+
+def resolve_scan_symbols(manual_text, use_full_market, engine_name, trade_date_str, exchanges, prefilter_limit, deep_scan_limit, universe_limit=0):
+    if not use_full_market:
+        syms = parse_symbols(manual_text)
+        return syms, {"source": "manual", "universe_count": len(syms), "ranked_count": len(syms), "deep_count": len(syms)}, pd.DataFrame()
+
+    pre_df, universe_count, ranked_count = build_full_market_prefilter(
+        engine_name=engine_name,
+        trade_date_str=trade_date_str,
+        exchanges=tuple(exchanges),
+        prefilter_limit=max(prefilter_limit, deep_scan_limit),
+        universe_limit=universe_limit,
+    )
+    syms = pre_df["Symbol"].head(deep_scan_limit).tolist() if not pre_df.empty else []
+    meta = {
+        "source": "full_market",
+        "universe_count": universe_count,
+        "ranked_count": ranked_count,
+        "deep_count": len(syms),
+    }
+    return syms, meta, pre_df
 
 
 # ============================================================
@@ -1595,14 +1867,17 @@ def build_engine_rows(symbols, engine_name, trade_date_str=None, cutoff_time=Non
     return df, session, cutoff_time
 
 
-def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
+def build_radar(symbols=None, cont_symbols=None, super_symbols=None, cont_al=DEFAULT_CONT_SCORE_AL, cont_strong=DEFAULT_CONT_SCORE_STRONG, super_al=DEFAULT_SUPER_PATTERN_AL, super_strong=DEFAULT_SUPER_PATTERN_STRONG):
+    cont_symbols = cont_symbols if cont_symbols is not None else (symbols or [])
+    super_symbols = super_symbols if super_symbols is not None else (symbols or [])
+
     cont_df, session, cutoff = build_engine_rows(
-        symbols, "continuation", trade_date_str=None,
+        cont_symbols, "continuation", trade_date_str=None,
         cont_score_al=cont_al, cont_score_strong=cont_strong,
         super_pattern_al=super_al, super_pattern_strong=super_strong
     )
     super_df, _, _ = build_engine_rows(
-        symbols, "supernova", trade_date_str=None,
+        super_symbols, "supernova", trade_date_str=None,
         cont_score_al=cont_al, cont_score_strong=cont_strong,
         super_pattern_al=super_al, super_pattern_strong=super_strong
     )
@@ -1660,7 +1935,6 @@ def build_radar(symbols, cont_al, cont_strong, super_al, super_strong):
         "ALMA": 5
     }).fillna(9)
     merged = merged.sort_values("_rank").drop(columns=["_rank"]).reset_index(drop=True)
-
     return merged, session, cutoff
 
 
@@ -1724,38 +1998,92 @@ tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab0:
     st.subheader("Radar")
     st.caption("Aynı sembol havuzunu continuation ve supernova açısından tarar; birleşik öncelik listesi üretir.")
+
+    radar_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="radar_use_full_market")
     radar_symbols_text = st.text_area(
         "Radar sembol listesi",
         value=",".join(list(dict.fromkeys(DEFAULT_CONTINUATION_SYMBOLS + DEFAULT_SUPERNOVA_SYMBOLS))),
         height=100,
         key="radar_symbols"
     )
+
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        radar_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="radar_exchanges")
+    with r2:
+        radar_prefilter_limit = st.slider("Ön filtre", 50, 500, 180, 10, key="radar_prefilter_limit")
+    with r3:
+        radar_deep_scan_limit = st.slider("Detaylı scan", 20, 250, 80, 10, key="radar_deep_scan_limit")
+    with r4:
+        radar_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="radar_universe_limit")
+
     radar_run = st.button("Radar çalıştır", key="radar_run")
 
     if radar_run:
-        syms = parse_symbols(radar_symbols_text)
-        if not syms:
-            st.warning("Sembol gir.")
+        if radar_use_full_market and not have_alpaca():
+            st.warning("Tam evren taraması için Alpaca API gerekir.")
         else:
-            with st.spinner("Radar çalışıyor..."):
-                radar_df, session, cutoff = build_radar(
-                    syms, CONT_SCORE_AL, CONT_SCORE_STRONG, SUPER_PATTERN_AL, SUPER_PATTERN_STRONG
+            if radar_use_full_market:
+                cont_syms, cont_meta, cont_pre_df = resolve_scan_symbols(
+                    radar_symbols_text, True, "continuation", ny_date_str(), radar_exchanges,
+                    radar_prefilter_limit, radar_deep_scan_limit, radar_universe_limit
                 )
-            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            if radar_df.empty:
-                st.warning("Radar sonucu yok.")
+                super_syms, super_meta, super_pre_df = resolve_scan_symbols(
+                    radar_symbols_text, True, "supernova", ny_date_str(), radar_exchanges,
+                    radar_prefilter_limit, radar_deep_scan_limit, radar_universe_limit
+                )
+                syms = sorted(list(dict.fromkeys(cont_syms + super_syms)))
             else:
-                if SHOW_ONLY_TRADEABLE:
-                    radar_df = radar_df[radar_df["Radar_Pick"] != "ALMA"].copy()
-                st.dataframe(radar_df.head(N_SHOW), use_container_width=True)
-                csv = radar_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "📥 Radar CSV indir",
-                    data=csv,
-                    file_name=f"radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_radar"
-                )
+                syms = parse_symbols(radar_symbols_text)
+                cont_syms = syms
+                super_syms = syms
+                cont_meta = {"source": "manual", "universe_count": len(syms), "ranked_count": len(syms), "deep_count": len(syms)}
+                super_meta = cont_meta
+                cont_pre_df = pd.DataFrame()
+                super_pre_df = pd.DataFrame()
+
+            if not syms:
+                st.warning("Taranacak sembol bulunamadı.")
+            else:
+                with st.spinner("Radar çalışıyor..."):
+                    radar_df, session, cutoff = build_radar(
+                        cont_symbols=cont_syms,
+                        super_symbols=super_syms,
+                        cont_al=CONT_SCORE_AL,
+                        cont_strong=CONT_SCORE_STRONG,
+                        super_al=SUPER_PATTERN_AL,
+                        super_strong=SUPER_PATTERN_STRONG
+                    )
+
+                st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+                if radar_use_full_market:
+                    st.info(
+                        f"Continuation evreni: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}  \n"
+                        f"Supernova evreni: {super_meta['universe_count']} | ranked: {super_meta['ranked_count']} | deep scan: {super_meta['deep_count']}"
+                    )
+
+                if radar_df.empty:
+                    st.warning("Radar sonucu yok.")
+                else:
+                    if SHOW_ONLY_TRADEABLE:
+                        radar_df = radar_df[radar_df["Radar_Pick"] != "ALMA"].copy()
+                    st.dataframe(radar_df.head(N_SHOW), use_container_width=True)
+                    csv = radar_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Radar CSV indir",
+                        data=csv,
+                        file_name=f"radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_radar"
+                    )
+
+                    if radar_use_full_market:
+                        with st.expander("Ön filtre adayları"):
+                            ctab1, ctab2 = st.tabs(["Continuation Prefilter", "Supernova Prefilter"])
+                            with ctab1:
+                                st.dataframe(cont_pre_df.head(min(N_SHOW, len(cont_pre_df))), use_container_width=True)
+                            with ctab2:
+                                st.dataframe(super_pre_df.head(min(N_SHOW, len(super_pre_df))), use_container_width=True)
 
 with tab1:
     st.subheader("Continuation Engine")
@@ -1774,53 +2102,79 @@ with tab1:
         cont_date = st.date_input("Backtest tarihi", value=now_ny().date(), key="cont_date")
         cont_run = st.button("Continuation çalıştır", key="run_cont")
 
+    cont_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="cont_use_full_market")
+    cfm1, cfm2, cfm3, cfm4 = st.columns(4)
+    with cfm1:
+        cont_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="cont_exchanges")
+    with cfm2:
+        cont_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 180, 10, key="cont_prefilter_limit")
+    with cfm3:
+        cont_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 80, 10, key="cont_deep_scan_limit")
+    with cfm4:
+        cont_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="cont_universe_limit")
+
     if cont_run:
-        symbols = parse_symbols(cont_symbols_text)
-        if not symbols:
-            st.warning("Sembol gir.")
+        if cont_use_full_market and not have_alpaca():
+            st.warning("Tam evren taraması için Alpaca API gerekir.")
         else:
-            with st.spinner("Continuation Engine çalışıyor..."):
-                if cont_mode == "Canlı":
-                    df, session, cutoff = build_engine_rows(
-                        symbols, "continuation",
-                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
-                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
-                    )
-                else:
-                    df, session, cutoff = build_engine_rows(
-                        symbols, "continuation",
-                        trade_date_str=str(cont_date), cutoff_time="09:25:00",
-                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
-                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
-                    )
+            trade_date_for_pref = ny_date_str() if cont_mode == "Canlı" else str(cont_date)
+            symbols, cont_meta, cont_pre_df = resolve_scan_symbols(
+                cont_symbols_text, cont_use_full_market, "continuation", trade_date_for_pref,
+                cont_exchanges, cont_prefilter_limit, cont_deep_scan_limit, cont_universe_limit
+            )
 
-            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            if df.empty:
-                st.warning("Sonuç yok.")
+            if not symbols:
+                st.warning("Sembol bulunamadı.")
             else:
-                if SHOW_ONLY_TRADEABLE:
-                    df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
-
-                tops = top_cards(df, 3)
-                cols = st.columns(3)
-                for i, item in enumerate(tops):
-                    with cols[i]:
-                        st.metric(
-                            f"#{i+1} {item['Symbol']} — {item['Decision']}",
-                            f"Score {item['Score']}",
-                            f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                with st.spinner("Continuation Engine çalışıyor..."):
+                    if cont_mode == "Canlı":
+                        df, session, cutoff = build_engine_rows(
+                            symbols, "continuation",
+                            cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                            super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
                         )
-                        st.caption(item["Notes"])
+                    else:
+                        df, session, cutoff = build_engine_rows(
+                            symbols, "continuation",
+                            trade_date_str=str(cont_date), cutoff_time="09:25:00",
+                            cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                            super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                        )
 
-                st.dataframe(df.head(N_SHOW), use_container_width=True)
-                csv = df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "📥 Continuation CSV indir",
-                    data=csv,
-                    file_name=f"continuation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_cont"
-                )
+                st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+                if cont_use_full_market:
+                    st.info(f"Evren: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}")
+
+                if df.empty:
+                    st.warning("Sonuç yok.")
+                else:
+                    if SHOW_ONLY_TRADEABLE:
+                        df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
+
+                    tops = top_cards(df, 3)
+                    cols = st.columns(3)
+                    for i, item in enumerate(tops):
+                        with cols[i]:
+                            st.metric(
+                                f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                                f"Score {item['Score']}",
+                                f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                            )
+                            st.caption(item["Notes"])
+
+                    st.dataframe(df.head(N_SHOW), use_container_width=True)
+                    csv = df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Continuation CSV indir",
+                        data=csv,
+                        file_name=f"continuation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_cont"
+                    )
+
+                    if cont_use_full_market:
+                        with st.expander("Continuation ön filtre adayları"):
+                            st.dataframe(cont_pre_df.head(min(N_SHOW, len(cont_pre_df))), use_container_width=True)
 
 with tab2:
     st.subheader("Supernova Engine")
@@ -1839,53 +2193,79 @@ with tab2:
         rocket_date = st.date_input("Backtest tarihi", value=now_ny().date(), key="rocket_date")
         rocket_run = st.button("Supernova çalıştır", key="run_rocket")
 
+    rocket_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="rocket_use_full_market")
+    sfm1, sfm2, sfm3, sfm4 = st.columns(4)
+    with sfm1:
+        rocket_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="rocket_exchanges")
+    with sfm2:
+        rocket_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 180, 10, key="rocket_prefilter_limit")
+    with sfm3:
+        rocket_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 80, 10, key="rocket_deep_scan_limit")
+    with sfm4:
+        rocket_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="rocket_universe_limit")
+
     if rocket_run:
-        symbols = parse_symbols(rocket_symbols_text)
-        if not symbols:
-            st.warning("Sembol gir.")
+        if rocket_use_full_market and not have_alpaca():
+            st.warning("Tam evren taraması için Alpaca API gerekir.")
         else:
-            with st.spinner("Supernova Engine çalışıyor..."):
-                if rocket_mode == "Canlı":
-                    df, session, cutoff = build_engine_rows(
-                        symbols, "supernova",
-                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
-                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
-                    )
-                else:
-                    df, session, cutoff = build_engine_rows(
-                        symbols, "supernova",
-                        trade_date_str=str(rocket_date), cutoff_time="09:25:00",
-                        cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
-                        super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
-                    )
+            trade_date_for_pref = ny_date_str() if rocket_mode == "Canlı" else str(rocket_date)
+            symbols, super_meta, super_pre_df = resolve_scan_symbols(
+                rocket_symbols_text, rocket_use_full_market, "supernova", trade_date_for_pref,
+                rocket_exchanges, rocket_prefilter_limit, rocket_deep_scan_limit, rocket_universe_limit
+            )
 
-            st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            if df.empty:
-                st.warning("Sonuç yok.")
+            if not symbols:
+                st.warning("Sembol bulunamadı.")
             else:
-                if SHOW_ONLY_TRADEABLE:
-                    df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
-
-                tops = top_cards(df, 3)
-                cols = st.columns(3)
-                for i, item in enumerate(tops):
-                    with cols[i]:
-                        st.metric(
-                            f"#{i+1} {item['Symbol']} — {item['Decision']}",
-                            f"Pattern {item['Pattern_Score']}",
-                            f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                with st.spinner("Supernova Engine çalışıyor..."):
+                    if rocket_mode == "Canlı":
+                        df, session, cutoff = build_engine_rows(
+                            symbols, "supernova",
+                            cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                            super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
                         )
-                        st.caption(f"{item['Best_Pattern']} | {item['Notes']}")
+                    else:
+                        df, session, cutoff = build_engine_rows(
+                            symbols, "supernova",
+                            trade_date_str=str(rocket_date), cutoff_time="09:25:00",
+                            cont_score_al=CONT_SCORE_AL, cont_score_strong=CONT_SCORE_STRONG,
+                            super_pattern_al=SUPER_PATTERN_AL, super_pattern_strong=SUPER_PATTERN_STRONG
+                        )
 
-                st.dataframe(df.head(N_SHOW), use_container_width=True)
-                csv = df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "📥 Supernova CSV indir",
-                    data=csv,
-                    file_name=f"supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    key="download_supernova"
-                )
+                st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
+                if rocket_use_full_market:
+                    st.info(f"Evren: {super_meta['universe_count']} | ranked: {super_meta['ranked_count']} | deep scan: {super_meta['deep_count']}")
+
+                if df.empty:
+                    st.warning("Sonuç yok.")
+                else:
+                    if SHOW_ONLY_TRADEABLE:
+                        df = df[df["Decision"].isin(["GÜÇLÜ AL", "AL", "İZLE"])].copy()
+
+                    tops = top_cards(df, 3)
+                    cols = st.columns(3)
+                    for i, item in enumerate(tops):
+                        with cols[i]:
+                            st.metric(
+                                f"#{i+1} {item['Symbol']} — {item['Decision']}",
+                                f"Pattern {item['Pattern_Score']}",
+                                f"Entry {format_price(item['Entry_Idea']) if pd.notna(item['Entry_Idea']) else '-'}"
+                            )
+                            st.caption(f"{item['Best_Pattern']} | {item['Notes']}")
+
+                    st.dataframe(df.head(N_SHOW), use_container_width=True)
+                    csv = df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "📥 Supernova CSV indir",
+                        data=csv,
+                        file_name=f"supernova_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="download_supernova"
+                    )
+
+                    if rocket_use_full_market:
+                        with st.expander("Supernova ön filtre adayları"):
+                            st.dataframe(super_pre_df.head(min(N_SHOW, len(super_pre_df))), use_container_width=True)
 
 with tab3:
     st.subheader("ML Trainer")
