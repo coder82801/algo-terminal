@@ -407,6 +407,7 @@ def chunked(seq, size):
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def fetch_us_equity_universe(exchanges=("NASDAQ", "NYSE")):
     if not have_alpaca():
         return []
@@ -604,8 +605,8 @@ def fast_prefilter_score(engine_name, feat):
     return score
 
 
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def build_full_market_prefilter(engine_name, trade_date_str, exchanges=("NASDAQ", "NYSE"), prefilter_limit=180, universe_limit=0, chunk_size=120):
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def build_full_market_prefilter(engine_name, trade_date_str, exchanges=("NASDAQ", "NYSE"), prefilter_limit=120, universe_limit=1500, chunk_size=250):
     universe = fetch_us_equity_universe(exchanges)
     if universe_limit and universe_limit > 0:
         universe = universe[:universe_limit]
@@ -615,7 +616,7 @@ def build_full_market_prefilter(engine_name, trade_date_str, exchanges=("NASDAQ"
 
     trade_date = datetime.strptime(trade_date_str, "%Y-%m-%d").replace(tzinfo=NY_TZ)
     end_dt = trade_date.astimezone(UTC_TZ) + timedelta(days=1)
-    start_dt = end_dt - timedelta(days=220)
+    start_dt = end_dt - timedelta(days=140)
 
     results = []
     for chunk in chunked(universe, chunk_size):
@@ -2000,6 +2001,8 @@ with tab0:
     st.caption("Aynı sembol havuzunu continuation ve supernova açısından tarar; birleşik öncelik listesi üretir.")
 
     radar_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="radar_use_full_market")
+    if radar_use_full_market:
+        st.info("Radar tam evren modu ilk çalıştırmada yavaş olabilir. Başlangıç için Evren=1500, Ön filtre=120, Detaylı scan=50 önerilir.")
     radar_symbols_text = st.text_area(
         "Radar sembol listesi",
         value=",".join(list(dict.fromkeys(DEFAULT_CONTINUATION_SYMBOLS + DEFAULT_SUPERNOVA_SYMBOLS))),
@@ -2015,7 +2018,7 @@ with tab0:
     with r3:
         radar_deep_scan_limit = st.slider("Detaylı scan", 20, 250, 80, 10, key="radar_deep_scan_limit")
     with r4:
-        radar_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="radar_universe_limit")
+        radar_universe_limit = st.number_input("Evren sınırı (0=tamı / yavaş)", min_value=0, value=1500, step=500, key="radar_universe_limit")
 
     radar_run = st.button("Radar çalıştır", key="radar_run")
 
@@ -2103,15 +2106,17 @@ with tab1:
         cont_run = st.button("Continuation çalıştır", key="run_cont")
 
     cont_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="cont_use_full_market")
+    if cont_use_full_market:
+        st.info("İlk tam evren taraması yavaş olabilir. Başlangıç için Evren=1500, Ön filtre=120, Detaylı scan=50 önerilir.")
     cfm1, cfm2, cfm3, cfm4 = st.columns(4)
     with cfm1:
         cont_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="cont_exchanges")
     with cfm2:
-        cont_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 180, 10, key="cont_prefilter_limit")
+        cont_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 120, 10, key="cont_prefilter_limit")
     with cfm3:
-        cont_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 80, 10, key="cont_deep_scan_limit")
+        cont_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 50, 10, key="cont_deep_scan_limit")
     with cfm4:
-        cont_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="cont_universe_limit")
+        cont_universe_limit = st.number_input("Evren sınırı (0=tamı / yavaş)", min_value=0, value=1500, step=500, key="cont_universe_limit")
 
     if cont_run:
         if cont_use_full_market and not have_alpaca():
@@ -2194,15 +2199,17 @@ with tab2:
         rocket_run = st.button("Supernova çalıştır", key="run_rocket")
 
     rocket_use_full_market = st.checkbox("NASDAQ + NYSE tam evreni tara", value=False, key="rocket_use_full_market")
+    if rocket_use_full_market:
+        st.info("İlk tam evren taraması yavaş olabilir. Başlangıç için Evren=1500, Ön filtre=120, Detaylı scan=50 önerilir.")
     sfm1, sfm2, sfm3, sfm4 = st.columns(4)
     with sfm1:
         rocket_exchanges = st.multiselect("Borsalar", ["NASDAQ", "NYSE"], default=["NASDAQ", "NYSE"], key="rocket_exchanges")
     with sfm2:
-        rocket_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 180, 10, key="rocket_prefilter_limit")
+        rocket_prefilter_limit = st.slider("Ön filtre aday sayısı", 50, 500, 120, 10, key="rocket_prefilter_limit")
     with sfm3:
-        rocket_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 80, 10, key="rocket_deep_scan_limit")
+        rocket_deep_scan_limit = st.slider("Detaylı scan aday sayısı", 20, 250, 50, 10, key="rocket_deep_scan_limit")
     with sfm4:
-        rocket_universe_limit = st.number_input("Evren sınırı (0=tamı)", min_value=0, value=0, step=1000, key="rocket_universe_limit")
+        rocket_universe_limit = st.number_input("Evren sınırı (0=tamı / yavaş)", min_value=0, value=1500, step=500, key="rocket_universe_limit")
 
     if rocket_run:
         if rocket_use_full_market and not have_alpaca():
