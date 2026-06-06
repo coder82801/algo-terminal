@@ -2118,8 +2118,7 @@ with tab0:
                     )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            render_session_message(session)
-            render_session_message(session)
+                render_session_message(session)
                 if radar_use_full_market:
                     st.info(
                         f"Continuation evreni: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}  \n"
@@ -2208,8 +2207,7 @@ with tab1:
                         )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            render_session_message(session)
-            render_session_message(session)
+                render_session_message(session)
                 if cont_use_full_market:
                     st.info(f"Evren: {cont_meta['universe_count']} | ranked: {cont_meta['ranked_count']} | deep scan: {cont_meta['deep_count']}")
 
@@ -2303,8 +2301,7 @@ with tab2:
                         )
 
                 st.write(f"**Session:** {session} | **Cutoff:** {cutoff or '-'}")
-            render_session_message(session)
-            render_session_message(session)
+                render_session_message(session)
                 if rocket_use_full_market:
                     st.info(f"Evren: {super_meta['universe_count']} | ranked: {super_meta['ranked_count']} | deep scan: {super_meta['deep_count']}")
 
