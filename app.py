@@ -1996,6 +1996,434 @@ def build_radar(symbols=None, cont_symbols=None, super_symbols=None, cont_al=DEF
     return merged, session, cutoff
 
 
+def next_trading_day_str(dt=None):
+    dt = (dt or now_ny()).date() + timedelta(days=1)
+    while dt.weekday() >= 5:
+        dt = dt + timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+def overnight_reference_date_str(session):
+    today = ny_date_str()
+    if session in ["afterhours", "closed", "weekend"]:
+        return next_trading_day_str()
+    return today
+
+
+def overnight_phase_from_session(session):
+    if session in ["afterhours", "closed", "weekend"]:
+        return "TONIGHT_ENTRY", "BUY_AT_CLOSE_OR_AFTERHOURS"
+    if session == "premarket":
+        return "PREMARKET_EXIT_WINDOW", "CHECK_PREMARKET_EXIT"
+    if session == "regular":
+        return "REGULAR_EXIT_WINDOW", "MANAGE_OPEN_POSITION"
+    return "BACKTEST", "BACKTEST"
+
+
+def build_overnight_row(symbol, daily_df, minute_df, trade_date_str, session, quotes_map, score_al=64, score_strong=78):
+    ctx = get_trade_date_context(daily_df, trade_date_str)
+    if ctx is None:
+        return None
+
+    feat = extract_snapshot_features_from_ctx(ctx)
+    flags = get_flags(symbol)
+
+    price = safe_float(feat.get("price"), np.nan)
+    prev_day_ret = safe_float(feat.get("prev_day_ret"), np.nan)
+    prev_close_strength = safe_float(feat.get("prev_close_strength"), np.nan)
+    prev_vol_ratio = safe_float(feat.get("prev_vol_ratio"), np.nan)
+    prev_dollar_vol = safe_float(feat.get("prev_dollar_vol"), np.nan)
+    ema9_dist_pct = safe_float(feat.get("ema9_dist_pct"), np.nan)
+    ema20_dist_pct = safe_float(feat.get("ema20_dist_pct"), np.nan)
+    base_tightness10 = safe_float(feat.get("base_tightness10"), np.nan)
+    breakout20 = bool(feat.get("breakout20", 0))
+    atr_pct = safe_float(feat.get("atr_pct"), np.nan)
+
+    if pd.isna(price) or price < MIN_PRICE or price > MAX_PRICE_CONTINUATION:
+        return None
+
+    score = 0.0
+    notes = []
+
+    if 3 <= prev_day_ret < 12:
+        score += 16
+    elif 12 <= prev_day_ret < 28:
+        score += 24
+    elif 28 <= prev_day_ret < 45:
+        score += 14
+    elif prev_day_ret < 0:
+        score -= 12
+
+    if prev_close_strength >= 82:
+        score += 18
+    elif prev_close_strength >= 68:
+        score += 10
+    elif prev_close_strength < 45:
+        score -= 10
+        notes.append("Weak close")
+
+    if prev_vol_ratio >= 1.5:
+        score += 12
+    if prev_vol_ratio >= 3:
+        score += 10
+        notes.append("Volume expansion")
+
+    if prev_dollar_vol >= 500000:
+        score += 12
+    elif prev_dollar_vol < 100000:
+        score -= 10
+
+    if pd.notna(ema9_dist_pct) and pd.notna(ema20_dist_pct) and ema9_dist_pct > 0 and ema20_dist_pct > 0:
+        score += 12
+        notes.append("EMA structure")
+    elif pd.notna(ema20_dist_pct) and ema20_dist_pct < 0:
+        score -= 8
+
+    if pd.notna(base_tightness10) and 3 <= base_tightness10 <= 30:
+        score += 6
+    if breakout20:
+        score += 8
+        notes.append("20d breakout")
+
+    if flags["recent_reverse_split"]:
+        score -= 25
+        notes.append("Recent reverse split")
+    if flags["otc_risk"]:
+        score -= 35
+        notes.append("OTC risk")
+    if flags["recent_deficiency"]:
+        score -= 6
+        notes.append("Deficiency")
+
+    ml_prob, _ = predict_model_probability("continuation_model", feat)
+    if pd.notna(ml_prob):
+        score += max(0.0, (ml_prob - 0.50) * 40.0)
+        notes.append(f"ML:{ml_prob:.2f}")
+
+    score = clamp(round(score), 0, 100)
+
+    if score >= score_strong:
+        decision = "GÜÇLÜ GECE AL"
+    elif score >= score_al:
+        decision = "GECE AL"
+    elif score >= score_al - 6:
+        decision = "İZLE"
+    else:
+        decision = "ALMA"
+
+    entry_idea = price
+    stop_pct = 0.05
+    if pd.notna(atr_pct):
+        stop_pct = float(np.clip(max(atr_pct * 0.7, 4.0), 4.0, 8.0)) / 100.0
+
+    stop = entry_idea * (1 - stop_pct) if pd.notna(entry_idea) else np.nan
+    premarket_sell_low = entry_idea * 1.06 if pd.notna(entry_idea) else np.nan
+    premarket_sell_high = entry_idea * 1.10 if pd.notna(entry_idea) else np.nan
+    regular_sell_low = entry_idea * 1.10 if pd.notna(entry_idea) else np.nan
+    regular_sell_high = entry_idea * 1.15 if pd.notna(entry_idea) else np.nan
+
+    pre_ctx = get_premarket_context(minute_df, trade_date_str, "09:25:00")
+    current_pre_price = pre_ctx["price"] if pre_ctx["source"] == "REAL_PREMARKET" else np.nan
+
+    exit_signal = "WAIT_NEXT_SESSION"
+    if session == "premarket" and pd.notna(current_pre_price):
+        if current_pre_price >= premarket_sell_low:
+            exit_signal = "SELL_PREMARKET_ZONE"
+        elif current_pre_price <= entry_idea * 0.97:
+            exit_signal = "PROTECTIVE_EXIT"
+        else:
+            exit_signal = "HOLD_FOR_OPEN"
+    elif session == "regular":
+        exit_signal = "MANAGE_OPEN_POSITION"
+
+    quote = quotes_map.get(symbol, {})
+    bid, ask = bid_ask_from_quote(quote)
+    mapped_decision = "GÜÇLÜ AL" if decision == "GÜÇLÜ GECE AL" else ("AL" if decision == "GECE AL" else "ALMA")
+    risk = risk_gate(mapped_decision, current_pre_price if pd.notna(current_pre_price) else price, entry_idea, stop, bid, ask, prev_dollar_vol)
+
+    trade_phase, action_status = overnight_phase_from_session(session)
+    if session in ["afterhours", "closed", "weekend"] and decision in ["GÜÇLÜ GECE AL", "GECE AL"]:
+        risk["Real_Money_Allowed"] = True
+        if risk.get("Risk_Grade") == "BLOCKED":
+            risk["Risk_Grade"] = "OVERNIGHT_REVIEW"
+
+    return {
+        "Engine": "OVERNIGHT",
+        "Symbol": symbol,
+        "Decision": decision,
+        "Night_Score": score,
+        "ML_Prob": round_smart(ml_prob),
+        "Entry_Idea": round_smart(entry_idea),
+        "Stop": round_smart(stop),
+        "Premarket_Sell_Low": round_smart(premarket_sell_low),
+        "Premarket_Sell_High": round_smart(premarket_sell_high),
+        "Regular_Sell_Low": round_smart(regular_sell_low),
+        "Regular_Sell_High": round_smart(regular_sell_high),
+        "Current_Premarket_Price": round_smart(current_pre_price),
+        "Exit_Signal": exit_signal,
+        "Prev_Ret_%": round_smart(prev_day_ret),
+        "Prev_Close_Strength": round_smart(prev_close_strength),
+        "Prev_Vol_Ratio": round_smart(prev_vol_ratio),
+        "Prev_Dollar_Vol": round_smart(prev_dollar_vol),
+        "EMA9_Dist_%": round_smart(ema9_dist_pct),
+        "EMA20_Dist_%": round_smart(ema20_dist_pct),
+        "Base_Tightness10_%": round_smart(base_tightness10),
+        "Breakout20": breakout20,
+        "Trade_Phase": trade_phase,
+        "Action_Status": action_status,
+        "Notes": " | ".join(notes),
+        **risk
+    }
+
+
+def build_overnight_rows(symbols, trade_date_str=None, score_al=64, score_strong=78):
+    live_mode = trade_date_str is None
+    session = get_session_label() if live_mode else "backtest"
+    reference_date = trade_date_str if trade_date_str else overnight_reference_date_str(session)
+
+    rows = []
+    quotes_map = fetch_alpaca_latest_quotes(symbols) if have_alpaca() else {}
+
+    for symbol in symbols:
+        daily_df = get_daily_df(symbol, lookback_days=420)
+
+        minute_df = pd.DataFrame()
+        if session in ["premarket", "regular"]:
+            end_dt = datetime.strptime(reference_date + " 23:59:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=NY_TZ).astimezone(UTC_TZ)
+            start_dt = end_dt - timedelta(days=12)
+            minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="1Min")
+            if minute_df.empty and have_alpaca():
+                minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="5Min")
+
+        row = build_overnight_row(symbol, daily_df, minute_df, reference_date, session, quotes_map, score_al, score_strong)
+        if row is not None:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, session, reference_date
+
+    rank_map = {"GÜÇLÜ GECE AL": 0, "GECE AL": 1, "İZLE": 2, "ALMA": 3}
+    df["_rank"] = df["Decision"].map(rank_map).fillna(9)
+    df = df.sort_values(["_rank", "Night_Score"], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
+    return df, session, reference_date
+
+
+def build_premarket_ignition_row(symbol, daily_df, minute_df, trade_date_str, session, quotes_map):
+    ctx = get_trade_date_context(daily_df, trade_date_str)
+    if ctx is None:
+        return None
+
+    pre_ctx = get_premarket_context(minute_df, trade_date_str, "09:25:00")
+    if pre_ctx["source"] != "REAL_PREMARKET":
+        return {
+            "Engine": "PREMARKET_IGNITION",
+            "Symbol": symbol,
+            "Decision": "PREMARKET_BEKLENIYOR" if session in ["afterhours", "closed", "weekend"] else "ALMA",
+            "Ignition_Score": 0,
+            "ML_Prob": np.nan,
+            "Entry_Idea": np.nan,
+            "Stop": np.nan,
+            "TP1": np.nan,
+            "TP2": np.nan,
+            "Gap_%": np.nan,
+            "Pre_Vol_Ratio": np.nan,
+            "Hold_%": np.nan,
+            "Pre_Dollar_Vol": np.nan,
+            "Above_VWAP": False,
+            "Above_Prev_High": False,
+            "Trade_Phase": "WAIT_PREMARKET",
+            "Action_Status": "NO_LIVE_PREMARKET_DATA",
+            "Notes": "Premarket veri yok",
+            "Bid": np.nan,
+            "Ask": np.nan,
+            "Spread_%": np.nan,
+            "Stop_Dist_%": np.nan,
+            "Late_Status": "UNKNOWN",
+            "Extension_%": np.nan,
+            "Risk_Grade": "WATCHLIST_ONLY",
+            "Real_Money_Allowed": False,
+            "Risk_Tags": "premarket_data_missing"
+        }
+
+    baseline_median, _, _ = premarket_baseline_ratio(minute_df, ctx["prior_dates"], trade_date_str, "09:25:00")
+    pre_vol_ratio = pre_ctx["pre_vol"] / baseline_median if pd.notna(baseline_median) and baseline_median > 0 else np.nan
+
+    prev_close = safe_float(ctx["last"]["Close"], np.nan)
+    prev_high = safe_float(ctx["last"]["High"], np.nan)
+    gap_pct = ((pre_ctx["price"] - prev_close) / prev_close * 100.0) if prev_close > 0 else np.nan
+    pre_dollar_vol = pre_ctx["price"] * pre_ctx["pre_vol"] if pd.notna(pre_ctx["price"]) else np.nan
+    above_vwap = pd.notna(pre_ctx["pre_vwap"]) and pd.notna(pre_ctx["price"]) and pre_ctx["price"] > pre_ctx["pre_vwap"]
+    above_prev_high = pd.notna(pre_ctx["price"]) and pd.notna(prev_high) and pre_ctx["price"] > prev_high
+
+    feat = extract_snapshot_features_from_ctx(ctx)
+    ml_prob, _ = predict_model_probability("supernova_model", feat)
+
+    score = 0.0
+    notes = []
+
+    prev_day_ret = safe_float(feat.get("prev_day_ret"), np.nan)
+    prev_vol_ratio_hist = safe_float(feat.get("prev_vol_ratio"), np.nan)
+    prev_close_strength = safe_float(feat.get("prev_close_strength"), np.nan)
+
+    if 5 <= gap_pct < 15:
+        score += 12
+    elif 15 <= gap_pct < 40:
+        score += 20
+    elif 40 <= gap_pct < 120:
+        score += 10
+        notes.append("Hot gap")
+
+    if pd.notna(pre_vol_ratio):
+        if 1.0 <= pre_vol_ratio < 2:
+            score += 10
+        elif 2 <= pre_vol_ratio < 6:
+            score += 20
+        elif pre_vol_ratio >= 6:
+            score += 26
+            notes.append("Premarket vol shock")
+
+    if pd.notna(pre_dollar_vol):
+        if 150000 <= pre_dollar_vol < 500000:
+            score += 10
+        elif 500000 <= pre_dollar_vol < 2000000:
+            score += 18
+        elif pre_dollar_vol >= 2000000:
+            score += 24
+        elif pre_dollar_vol < DEFAULT_MIN_PRE_DOLLAR_VOL:
+            score -= 12
+
+    if pd.notna(pre_ctx["hold_quality"]):
+        if pre_ctx["hold_quality"] >= 82:
+            score += 18
+        elif pre_ctx["hold_quality"] >= 68:
+            score += 10
+        elif pre_ctx["hold_quality"] < 45:
+            score -= 12
+
+    if above_vwap:
+        score += 14
+    else:
+        score -= 12
+        notes.append("VWAP altı")
+
+    if above_prev_high:
+        score += 10
+        notes.append("Prev high reclaim")
+
+    if pd.notna(prev_day_ret):
+        if 3 <= prev_day_ret < 20:
+            score += 8
+        elif 20 <= prev_day_ret < 60:
+            score += 12
+
+    if pd.notna(prev_vol_ratio_hist) and prev_vol_ratio_hist >= 2:
+        score += 8
+
+    if pd.notna(prev_close_strength) and prev_close_strength >= 75:
+        score += 8
+
+    if pd.notna(ml_prob):
+        score += max(0.0, (ml_prob - 0.50) * 40.0)
+        notes.append(f"ML:{ml_prob:.2f}")
+
+    score = clamp(round(score), 0, 100)
+
+    reclaim = prev_high * 1.01 if pd.notna(prev_high) else np.nan
+    vwap_entry = pre_ctx["pre_vwap"] * 1.01 if pd.notna(pre_ctx["pre_vwap"]) else np.nan
+    entry_idea = max(reclaim, vwap_entry) if pd.notna(reclaim) and pd.notna(vwap_entry) else (reclaim if pd.notna(reclaim) else vwap_entry)
+
+    ext = np.nan
+    if pd.notna(entry_idea) and pd.notna(pre_ctx["price"]) and entry_idea > 0:
+        ext = ((pre_ctx["price"] - entry_idea) / entry_idea) * 100.0
+
+    if pd.notna(ext) and ext > 12:
+        decision = "GEÇ KALINDI"
+        notes.append("Too extended")
+    else:
+        if score >= 78 and above_vwap and pd.notna(pre_ctx["hold_quality"]) and pre_ctx["hold_quality"] >= 70:
+            decision = "PREMARKET GÜÇLÜ AL"
+        elif score >= 64 and above_vwap and pd.notna(pre_ctx["hold_quality"]) and pre_ctx["hold_quality"] >= 58:
+            decision = "PREMARKET AL"
+        elif score >= 56:
+            decision = "İZLE"
+        else:
+            decision = "ALMA"
+
+    stop = entry_idea * 0.90 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+    tp1 = entry_idea * 1.12 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+    tp2 = entry_idea * 1.20 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+
+    quote = quotes_map.get(symbol, {})
+    bid, ask = bid_ask_from_quote(quote)
+    mapped_decision = "GÜÇLÜ AL" if decision == "PREMARKET GÜÇLÜ AL" else ("AL" if decision == "PREMARKET AL" else "ALMA")
+    risk = risk_gate(mapped_decision, pre_ctx["price"], entry_idea, stop, bid, ask, pre_dollar_vol)
+
+    trade_phase = "PREMARKET_IGNITION"
+    action_status = "LIVE_PREMARKET" if session in ["premarket", "regular"] else "WAIT_PREMARKET"
+
+    return {
+        "Engine": "PREMARKET_IGNITION",
+        "Symbol": symbol,
+        "Decision": decision,
+        "Ignition_Score": score,
+        "ML_Prob": round_smart(ml_prob),
+        "Entry_Idea": round_smart(entry_idea),
+        "Stop": round_smart(stop),
+        "TP1": round_smart(tp1),
+        "TP2": round_smart(tp2),
+        "Gap_%": round_smart(gap_pct),
+        "Pre_Vol_Ratio": round_smart(pre_vol_ratio),
+        "Hold_%": round_smart(pre_ctx["hold_quality"]),
+        "Pre_Dollar_Vol": round_smart(pre_dollar_vol),
+        "Above_VWAP": bool(above_vwap),
+        "Above_Prev_High": bool(above_prev_high),
+        "Trade_Phase": trade_phase,
+        "Action_Status": action_status,
+        "Notes": " | ".join(notes),
+        **risk
+    }
+
+
+def build_premarket_ignition_rows(symbols, trade_date_str=None):
+    live_mode = trade_date_str is None
+    session = get_session_label() if live_mode else "backtest"
+    reference_date = trade_date_str if trade_date_str else ny_date_str()
+
+    rows = []
+    quotes_map = fetch_alpaca_latest_quotes(symbols) if have_alpaca() else {}
+
+    end_dt = datetime.strptime(reference_date + " 23:59:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=NY_TZ).astimezone(UTC_TZ)
+    start_dt = end_dt - timedelta(days=12)
+
+    for symbol in symbols:
+        daily_df = get_daily_df(symbol, lookback_days=420)
+        minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="1Min")
+        if minute_df.empty and have_alpaca():
+            minute_df = fetch_minute_df(symbol, start_dt, end_dt, timeframe="5Min")
+
+        row = build_premarket_ignition_row(symbol, daily_df, minute_df, reference_date, session, quotes_map)
+        if row is not None:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, session, reference_date
+
+    rank_map = {
+        "PREMARKET GÜÇLÜ AL": 0,
+        "PREMARKET AL": 1,
+        "İZLE": 2,
+        "GEÇ KALINDI": 3,
+        "PREMARKET_BEKLENIYOR": 4,
+        "ALMA": 5
+    }
+    df["_rank"] = df["Decision"].map(rank_map).fillna(9)
+    df = df.sort_values(["_rank", "Ignition_Score"], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
+    return df, session, reference_date
+
+
+
 # ============================================================
 # JOURNAL
 # ============================================================
