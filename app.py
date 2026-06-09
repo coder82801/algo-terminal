@@ -2209,6 +2209,73 @@ def build_overnight_rows(symbols, trade_date_str=None, score_al=64, score_strong
     return df, session, reference_date
 
 
+
+def score_premarket_watchlist_candidate(ctx):
+    feat = extract_snapshot_features_from_ctx(ctx)
+
+    prev_day_ret = safe_float(feat.get("prev_day_ret"), np.nan)
+    prev_vol_ratio = safe_float(feat.get("prev_vol_ratio"), np.nan)
+    prev_close_strength = safe_float(feat.get("prev_close_strength"), np.nan)
+    prev_dollar_vol = safe_float(feat.get("prev_dollar_vol"), np.nan)
+    breakout20 = bool(feat.get("breakout20", 0))
+    base_tightness10 = safe_float(feat.get("base_tightness10"), np.nan)
+
+    ml_prob, _ = predict_model_probability("supernova_model", feat)
+
+    score = 0.0
+    notes = []
+
+    if pd.notna(prev_day_ret):
+        if 4 <= prev_day_ret < 15:
+            score += 14
+        elif 15 <= prev_day_ret < 40:
+            score += 20
+        elif 40 <= prev_day_ret < 80:
+            score += 10
+            notes.append("Hot prior day")
+
+    if pd.notna(prev_vol_ratio):
+        if 1.5 <= prev_vol_ratio < 3:
+            score += 12
+        elif 3 <= prev_vol_ratio < 8:
+            score += 20
+        elif prev_vol_ratio >= 8:
+            score += 24
+            notes.append("Prior vol shock")
+
+    if pd.notna(prev_close_strength):
+        if prev_close_strength >= 82:
+            score += 16
+        elif prev_close_strength >= 68:
+            score += 8
+        elif prev_close_strength < 45:
+            score -= 8
+
+    if pd.notna(prev_dollar_vol):
+        if 150000 <= prev_dollar_vol < 500000:
+            score += 10
+        elif 500000 <= prev_dollar_vol < 2000000:
+            score += 16
+        elif prev_dollar_vol >= 2000000:
+            score += 20
+        elif prev_dollar_vol < 75000:
+            score -= 12
+
+    if breakout20:
+        score += 8
+        notes.append("20d breakout")
+
+    if pd.notna(base_tightness10) and 3 <= base_tightness10 <= 30:
+        score += 6
+
+    if pd.notna(ml_prob):
+        score += max(0.0, (ml_prob - 0.50) * 40.0)
+        notes.append(f"ML:{ml_prob:.2f}")
+
+    score = clamp(round(score), 0, 100)
+    return score, feat, ml_prob, notes
+
+
 def build_premarket_ignition_row(symbol, daily_df, minute_df, trade_date_str, session, quotes_map):
     ctx = get_trade_date_context(daily_df, trade_date_str)
     if ctx is None:
@@ -2216,16 +2283,27 @@ def build_premarket_ignition_row(symbol, daily_df, minute_df, trade_date_str, se
 
     pre_ctx = get_premarket_context(minute_df, trade_date_str, "09:25:00")
     if pre_ctx["source"] != "REAL_PREMARKET":
+        watch_score, feat, ml_prob, watch_notes = score_premarket_watchlist_candidate(ctx)
+
+        prev_high = safe_float(ctx["last"]["High"], np.nan)
+        prev_close = safe_float(ctx["last"]["Close"], np.nan)
+        entry_idea = prev_high * 1.01 if pd.notna(prev_high) else prev_close
+        stop = entry_idea * 0.90 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+        tp1 = entry_idea * 1.12 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+        tp2 = entry_idea * 1.20 if pd.notna(entry_idea) and entry_idea > 0 else np.nan
+
+        decision = "PREMARKET WATCHLIST" if watch_score >= 60 else ("PREMARKET_BEKLENIYOR" if session in ["afterhours", "closed", "weekend"] else "ALMA")
+
         return {
             "Engine": "PREMARKET_IGNITION",
             "Symbol": symbol,
-            "Decision": "PREMARKET_BEKLENIYOR" if session in ["afterhours", "closed", "weekend"] else "ALMA",
-            "Ignition_Score": 0,
-            "ML_Prob": np.nan,
-            "Entry_Idea": np.nan,
-            "Stop": np.nan,
-            "TP1": np.nan,
-            "TP2": np.nan,
+            "Decision": decision,
+            "Ignition_Score": watch_score,
+            "ML_Prob": round_smart(ml_prob),
+            "Entry_Idea": round_smart(entry_idea),
+            "Stop": round_smart(stop),
+            "TP1": round_smart(tp1),
+            "TP2": round_smart(tp2),
             "Gap_%": np.nan,
             "Pre_Vol_Ratio": np.nan,
             "Hold_%": np.nan,
@@ -2233,17 +2311,17 @@ def build_premarket_ignition_row(symbol, daily_df, minute_df, trade_date_str, se
             "Above_VWAP": False,
             "Above_Prev_High": False,
             "Trade_Phase": "WAIT_PREMARKET",
-            "Action_Status": "NO_LIVE_PREMARKET_DATA",
-            "Notes": "Premarket veri yok",
+            "Action_Status": "PREMARKET_REQUIRED",
+            "Notes": "Premarket veri yok | " + " | ".join(watch_notes),
             "Bid": np.nan,
             "Ask": np.nan,
             "Spread_%": np.nan,
-            "Stop_Dist_%": np.nan,
+            "Stop_Dist_%": round_smart(((entry_idea - stop) / entry_idea * 100.0) if pd.notna(entry_idea) and pd.notna(stop) and entry_idea > 0 else np.nan),
             "Late_Status": "UNKNOWN",
             "Extension_%": np.nan,
             "Risk_Grade": "WATCHLIST_ONLY",
             "Real_Money_Allowed": False,
-            "Risk_Tags": "premarket_data_missing"
+            "Risk_Tags": "premarket_data_missing | premarket_watchlist_candidate"
         }
 
     baseline_median, _, _ = premarket_baseline_ratio(minute_df, ctx["prior_dates"], trade_date_str, "09:25:00")
@@ -2415,8 +2493,9 @@ def build_premarket_ignition_rows(symbols, trade_date_str=None):
         "PREMARKET AL": 1,
         "İZLE": 2,
         "GEÇ KALINDI": 3,
-        "PREMARKET_BEKLENIYOR": 4,
-        "ALMA": 5
+        "PREMARKET WATCHLIST": 4,
+        "PREMARKET_BEKLENIYOR": 5,
+        "ALMA": 6
     }
     df["_rank"] = df["Decision"].map(rank_map).fillna(9)
     df = df.sort_values(["_rank", "Ignition_Score"], ascending=[True, False]).drop(columns=["_rank"]).reset_index(drop=True)
@@ -2988,7 +3067,7 @@ with tab6:
 
 with tab7:
     st.subheader("Premarket Ignition")
-    st.caption("Amaç: premarkette ateşleyen, erken giriş verip henüz çok uzamamış adayları bulmak.")
+    st.caption("Amaç: premarkette ateşleyen, erken giriş verip henüz çok uzamamış adayları bulmak. Canlı premarket veri yoksa watchlist fallback üretir.")
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -3042,7 +3121,7 @@ with tab7:
                     st.warning("Sonuç yok.")
                 else:
                     if SHOW_ONLY_TRADEABLE:
-                        df = df[df["Decision"].isin(["PREMARKET GÜÇLÜ AL", "PREMARKET AL", "İZLE", "GEÇ KALINDI"])].copy()
+                        df = df[df["Decision"].isin(["PREMARKET GÜÇLÜ AL", "PREMARKET AL", "İZLE", "GEÇ KALINDI", "PREMARKET WATCHLIST"])].copy()
 
                     tops = top_cards(df, 3)
                     cols = st.columns(3)
